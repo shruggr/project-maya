@@ -8,5 +8,7 @@ add_executable(inkling2-dspark-test tests/inkling2_dspark_test.cpp src/inkling2/
                                     src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
 target_include_directories(inkling2-dspark-test PRIVATE ${_strata_gpu_include_directories} include src/inkling2 src/hy4
                                                         src/mm3 third_party/ggml)
-target_link_libraries(inkling2-dspark-test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} Threads::Threads)
+# (the attention's GEMM form: the BLAS the engine links)
+target_link_libraries(inkling2-dspark-test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target}
+                                                   Threads::Threads)
 target_compile_definitions(inkling2-dspark-test PRIVATE MAYA_DS4_IQ_ONLY)

@@ -41,6 +41,11 @@ struct DsparkOptions {
     int attn_tile = 8;         // keys a tile of the block's attention (4 .. 64).  An R9700 at 300 / 2.7K / 16K
                                // positions: 8 keys 0.44 / 1.60 / 4.54 ms a block, 16 keys 0.57 / 2.25 / 6.02, 24 keys
                                // 0.77 / 3.13 / 8.08; the scratch is 50 KB a tile (max_ctx / attn_tile tiles)
+    int attn_gemm_min = 1024;  // a layer's attention as BLAS GEMMs from this many keys on (0: always, < 0: never, and
+                               // no BLAS handle).  An R9700: the GEMMs cost ~0.2-0.3 ms a layer at any length, the
+                               // tiles 0.09 ms at 300 keys, 0.24 at 1,032 (a full window), 3.6 at 16K
+    bool own_gemv = false;     // the block's Q8_0 GEMVs through this file's 8-column kernel instead of ds4_iq's:
+                               // measured the same within 3% (FFN 3.87 against 4.01 ms, Q/K/V 0.98 against 0.94)
     bool profile = false;      // a synchronisation after each phase of draft(): Stats' split (slows a draft a little)
     bool verbose = false;
 };

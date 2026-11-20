@@ -13,6 +13,7 @@
 #include "hy4_kernels.cuh"
 #include "../ds4/ds4_iq.cuh"
 
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -247,6 +248,63 @@ __global__ void attn_combine_kernel(const float* __restrict__ st, const float* _
     float v = 0.0f;
     for (int b = 0; b < ntile; ++b) v = fmaf(pq[(size_t) b * D], w[b], v);
     out[(size_t) qi * D + tid] = v / sum;
+}
+
+// The GEMM form's middle step: block = a query's row of raw dots over the nk keys -> its softmax of scale s, as F16
+__global__ void soft_f16_kernel(const float* __restrict__ S, int nk, float scale, __half* __restrict__ P) {
+    __shared__ float sh[256];
+    const float* s = S + (size_t) blockIdx.x * nk;
+    __half* p = P + (size_t) blockIdx.x * nk;
+    float mx = -INFINITY;
+    for (int j = threadIdx.x; j < nk; j += blockDim.x) mx = fmaxf(mx, s[j]);
+    mx = block_max(mx, sh);
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < nk; j += blockDim.x) sum += expf((s[j] - mx) * scale);
+    sum = block_sum(sum, sh);
+    const float inv = 1.0f / sum;
+    for (int j = threadIdx.x; j < nk; j += blockDim.x) p[j] = __float2half(expf((s[j] - mx) * scale) * inv);
+}
+
+// ---- a Q8_0 GEMV for exactly NC columns (ds4_iq's mv_kernel - a warp a row, a lane a 32-value block of it, each block
+// read once and dotted with every column's int8 row - without its 16 accumulators and its column test a block)
+template <int NC>
+__global__ void q8mv_kernel(const uint8_t* __restrict__ w, size_t ld, int k, int n, const int8_t* __restrict__ xq,
+                            const float* __restrict__ xd, float* __restrict__ y, size_t ycs) {
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= n) return;
+    const uint8_t* wr = w + (size_t) row * ld;
+    const int nsb = k / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        const uint16_t* b = (const uint16_t*) (wr + (size_t) kb * 34);   // (an F16 step, 32 int8: 2-byte aligned)
+        const float d = __half2float(*(const __half*) b);
+        int q[8];
+#pragma unroll
+        for (int t = 0; t < 8; ++t) q[t] = (int) ((uint32_t) b[1 + 2 * t] | ((uint32_t) b[2 + 2 * t] << 16));
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const int4* xp = (const int4*) (xq + (size_t) c * k + (size_t) kb * 32);
+            const int4 xa = xp[0], xb = xp[1];
+            int dot = __dp4a(q[0], xa.x, 0);
+            dot = __dp4a(q[1], xa.y, dot);
+            dot = __dp4a(q[2], xa.z, dot);
+            dot = __dp4a(q[3], xa.w, dot);
+            dot = __dp4a(q[4], xb.x, dot);
+            dot = __dp4a(q[5], xb.y, dot);
+            dot = __dp4a(q[6], xb.z, dot);
+            dot = __dp4a(q[7], xb.w, dot);
+            acc[c] = fmaf(xd[(size_t) c * nsb + kb] * d, (float) dot, acc[c]);
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        float v = acc[c];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (lane == 0) y[(size_t) c * ycs + row] = v;
+    }
 }
 
 // ---- the markov head ----------------------------------------------------------------------------------------------------
@@ -547,6 +605,9 @@ struct Dspark::Impl {
     int *tok = nullptr, *bidx = nullptr;
     float *bmax = nullptr, *bsum = nullptr, *x0 = nullptr, *cumd = nullptr;
     int max_tiles = 0, tile = 16;
+    cublasHandle_t blas = nullptr;
+    float *Sg = nullptr, *qp = nullptr, *op = nullptr;
+    uint16_t *P16 = nullptr, *xh16 = nullptr, *kb16 = nullptr, *vb16 = nullptr;
     // the anchor's embedding row
     const uint8_t* tok_embd = nullptr;
     size_t tok_row = 0;
@@ -559,6 +620,7 @@ struct Dspark::Impl {
         if (s != nullptr || !allocs.empty()) {
             (void) cudaSetDevice(dev);
             for (void* p : allocs) (void) cudaFree(p);
+            if (blas != nullptr) (void) cublasDestroy(blas);
             if (s != nullptr) (void) cudaStreamDestroy(s);
         }
     }
@@ -687,6 +749,50 @@ struct Dspark::Impl {
             err = "dspark: a GEMV ds4_iq does not take";
             return false;
         }
+        return true;
+    }
+    // the block's 8 rows through a Q8_0 matrix: this file's 8-column kernel, or ds4_iq's
+    bool mv8(std::initializer_list<iq::MvJob> jobs, std::string& err) {
+        if (!o.own_gemv || B != 8) return mv(jobs, err);
+        for (const iq::MvJob& j : jobs) {
+            if (j.type != iq::kQ8_0 || j.ncol != 8) return mv(jobs, err);
+            q8mv_kernel<8><<<(unsigned) ((j.n + 7) / 8), 256, 0, s>>>(j.w, j.ld, j.k, j.n, j.xq, j.xd, j.y, j.ycs);
+        }
+        check("q8mv");
+        return true;
+    }
+    // The attention as GEMMs over each kv head's keys (the engine's attention_rows): S = K^T Q, the softmax, O = V P -
+    // the caches' F16 rows as they lie (a key a column, kv heads D apart), the block's own rows a third product
+    bool attention_gemm(DLayer& l, int64_t lo, int nctx, float scale, std::string& err) {
+        const int per = H / Hkv, Q = B * per, KD = Hkv * D, nk = nctx + B;
+        const float one = 1.0f, zero = 0.0f;
+        inkling2::k::perm_heads(qv, qp, B, Hkv, per, D, true, s);
+        hk::to_f16(qp, (size_t) D, Hkv * Q, D, xh16, (size_t) D, s);
+        hk::to_f16(kv, (size_t) KD, B, KD, kb16, (size_t) KD, s);
+        hk::to_f16(vv, (size_t) KD, B, KD, vb16, (size_t) KD, s);
+        const size_t slot0 = (size_t) (l.ring > 0 ? lo % l.ring : lo);
+        const int n1 = l.ring > 0 ? (int) std::min<int64_t>(nctx, (int64_t) l.ring - (int64_t) slot0) : nctx, n2 = nctx - n1;
+        auto bg = [&](decltype(CUBLAS_OP_T) ta, int mm, int kk, const uint16_t* A, const uint16_t* Bm, int ldb, long long sb,
+                      const float* beta, float* C, int ldc, long long sc) {
+            return cublasGemmStridedBatchedEx(blas, ta, CUBLAS_OP_N, mm, Q, kk, &one, A, CUDA_R_16F, KD, D, Bm, CUDA_R_16F,
+                                              ldb, sb, beta, C, CUDA_R_32F, ldc, sc, Hkv, CUBLAS_COMPUTE_32F,
+                                              CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+        };
+        const long long sq = (long long) Q * D, ss = (long long) Q * nk;
+        bool ok = true;
+        if (n1 > 0) ok = ok && bg(CUBLAS_OP_T, n1, D, l.K + slot0 * KD, xh16, D, sq, &zero, Sg, nk, ss);
+        if (n2 > 0) ok = ok && bg(CUBLAS_OP_T, n2, D, l.K, xh16, D, sq, &zero, Sg + n1, nk, ss);
+        ok = ok && bg(CUBLAS_OP_T, B, D, kb16, xh16, D, sq, &zero, Sg + nctx, nk, ss);
+        soft_f16_kernel<<<(unsigned) (Hkv * Q), 256, 0, s>>>(Sg, nk, scale, (__half*) P16);
+        check("soft_f16");
+        ok = ok && bg(CUBLAS_OP_N, D, B, vb16, P16 + nctx, nk, ss, &zero, op, D, sq);
+        if (n1 > 0) ok = ok && bg(CUBLAS_OP_N, D, n1, l.V + slot0 * KD, P16, nk, ss, &one, op, D, sq);
+        if (n2 > 0) ok = ok && bg(CUBLAS_OP_N, D, n2, l.V, P16 + n1, nk, ss, &one, op, D, sq);
+        if (!ok) {
+            err = "dspark: an attention GEMM failed";
+            return false;
+        }
+        inkling2::k::perm_heads(op, ao, B, Hkv, per, D, false, s);
         return true;
     }
     bool sync(std::string& err) {
@@ -852,6 +958,39 @@ struct Dspark::Impl {
             return false;
         for (int i = 0; i < B; ++i)   // (a block's rows before the anchor's: the mask embedding)
             CK(cudaMemcpy(x0 + (size_t) i * E, mask_x, (size_t) E * 4, cudaMemcpyDeviceToDevice));
+        if (o.attn_gemm_min >= 0) {   // (the GEMM form of the attention: the long contexts')
+            const size_t nkm = (size_t) o.max_ctx + (size_t) B;
+            if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas, s) != CUBLAS_STATUS_SUCCESS) {
+                err = "dspark: no BLAS handle on GPU " + std::to_string(dev);
+                return false;
+            }
+            if (!alloc(Sg, (size_t) B * H * nkm, err) || !alloc(P16, (size_t) B * H * nkm, err) ||
+                !alloc(qp, (size_t) B * HD, err) || !alloc(op, (size_t) B * HD, err) || !alloc(xh16, (size_t) B * HD, err) ||
+                !alloc(kb16, (size_t) B * KD, err) || !alloc(vb16, (size_t) B * KD, err))
+                return false;
+            // (the BLAS sets itself up at its first product - a quarter of a second here: not in a draft)
+            {
+                const float one = 1.0f, zero = 0.0f;
+                CK(cudaMemset(xh16, 0, (size_t) B * HD * 2));
+                CK(cudaMemset(kb16, 0, (size_t) B * KD * 2));
+                const int Q = B * (H / Hkv);
+                if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, B, Q, D, &one, kb16, CUDA_R_16F, KD, D, xh16,
+                                               CUDA_R_16F, D, (long long) Q * D, &zero, Sg, CUDA_R_32F, (int) nkm, (long long) Q * nkm, Hkv,
+                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
+                    err = "dspark: the BLAS does not take the attention's F16 products";
+                    return false;
+                }
+                CK(cudaMemset(P16, 0, (size_t) B * H * nkm * 2));   // (and the other product's form)
+                if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, Q, B, &one, kb16, CUDA_R_16F, KD, D, P16,
+                                               CUDA_R_16F, (int) nkm, (long long) Q * nkm, &zero, op, CUDA_R_32F, D,
+                                               (long long) Q * D, Hkv, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                    CUBLAS_STATUS_SUCCESS) {
+                    err = "dspark: the BLAS does not take the attention's F16 products";
+                    return false;
+                }
+                CK(cudaStreamSynchronize(s));
+            }
+        }
         FR = (int) std::min<int64_t>(o.max_ctx, (int64_t) std::max(0, o.rewind) + 2 * kFeed);
         if (!alloc(fring, (size_t) FR * E, err)) return false;
 
@@ -1011,7 +1150,7 @@ struct Dspark::Impl {
             DLayer& l = L[(size_t) il];
             inkling2::k::rms(x, (size_t) E, B, E, l.attn_norm, eps, a, (size_t) E, s);
             hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
-            if (!mv({job(l.q, xq, xd, B, qv, (size_t) HD), job(l.kk, xq, xd, B, kv, (size_t) KD),
+            if (!mv8({job(l.q, xq, xd, B, qv, (size_t) HD), job(l.kk, xq, xd, B, kv, (size_t) KD),
                      job(l.v, xq, xd, B, vv, (size_t) KD)}, err))
                 return false;
             inkling2::k::rms(qv, (size_t) D, B * H, D, l.qn, eps, qv, (size_t) D, s);
@@ -1021,30 +1160,34 @@ struct Dspark::Impl {
             if (!phase(st.qkv_ms)) return false;
             const int64_t lo = l.swa ? lo_swa : 0;
             const int nctx = (int) (n - lo);
-            // (attn_tile keys a tile; more only where a context needs more than kMaxTiles tiles)
-            const int nk = nctx + B;
-            int TK = tile;
-            while ((nk + TK - 1) / TK > max_tiles) TK *= 2;
-            const int ntile = (nk + TK - 1) / TK;
-            // (256 threads a tile: 512 / 1024 - a thread a (query, key) pair - measured slower on an R9700)
-            attn_tile_kernel<<<dim3((unsigned) ntile, (unsigned) Hkv), 256,
-                               ((size_t) TK * D + (size_t) B * (H / Hkv) * TK + (size_t) B * (H / Hkv)) * sizeof(float), s>>>(
-                qv, kv, vv, (const __half*) l.K, (const __half*) l.V, l.ring, (long long) (l.ring > 0 ? lo % l.ring : lo), nctx, B,
-                H, Hkv, D, TK, scale, ast, apart);
-            attn_combine_kernel<<<(unsigned) (B * H), 256, 0, s>>>(ast, apart, ntile, D, ao);
+            if (blas != nullptr && nctx + B >= o.attn_gemm_min) {
+                if (!attention_gemm(l, lo, nctx, scale, err)) return false;
+            } else {
+                // (attn_tile keys a tile; more only where a context needs more than kMaxTiles tiles)
+                const int nk = nctx + B;
+                int TK = tile;
+                while ((nk + TK - 1) / TK > max_tiles) TK *= 2;
+                const int ntile = (nk + TK - 1) / TK;
+                // (256 threads a tile: 512 / 1024 - a thread a (query, key) pair - measured slower on an R9700)
+                attn_tile_kernel<<<dim3((unsigned) ntile, (unsigned) Hkv), 256,
+                                   ((size_t) TK * D + (size_t) B * (H / Hkv) * TK + (size_t) B * (H / Hkv)) * sizeof(float), s>>>(
+                    qv, kv, vv, (const __half*) l.K, (const __half*) l.V, l.ring, (long long) (l.ring > 0 ? lo % l.ring : lo), nctx, B,
+                    H, Hkv, D, TK, scale, ast, apart);
+                attn_combine_kernel<<<(unsigned) (B * H), 256, 0, s>>>(ast, apart, ntile, D, ao);
+            }
             check("attention");
             if (!phase(st.attn_ms)) return false;
             hk::q8_rows(ao, (size_t) HD, B, HD, xq, xd, s);
-            if (!mv({job(l.o, xq, xd, B, ob, (size_t) E)}, err)) return false;
+            if (!mv8({job(l.o, xq, xd, B, ob, (size_t) E)}, err)) return false;
             inkling2::k::add(x, ob, (size_t) B * E, s);
             if (!phase(st.o_ms)) return false;
             inkling2::k::rms(x, (size_t) E, B, E, l.ffn_norm, eps, a, (size_t) E, s);
             hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
-            if (!mv({job(l.gate, xq, xd, B, gu, (size_t) FF), job(l.up, xq, xd, B, gu + (size_t) B * FF, (size_t) FF)}, err))
+            if (!mv8({job(l.gate, xq, xd, B, gu, (size_t) FF), job(l.up, xq, xd, B, gu + (size_t) B * FF, (size_t) FF)}, err))
                 return false;
             hk::swiglu(gu, gu + (size_t) B * FF, (size_t) FF, B, FF, hh, (size_t) FF, s);
             hk::q8_rows(hh, (size_t) FF, B, FF, xq, xd, s);
-            if (!mv({job(l.down, xq, xd, B, ob, (size_t) E)}, err)) return false;
+            if (!mv8({job(l.down, xq, xd, B, ob, (size_t) E)}, err)) return false;
             inkling2::k::add(x, ob, (size_t) B * E, s);
             if (!phase(st.ffn_ms)) return false;
         }

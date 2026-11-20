@@ -54,6 +54,8 @@ int main(int argc, char** argv) {
         else if (a == "--no-profile") o.profile = false;
         else if (a == "--timing-only") timing_only = true;
         else if (a == "--paths") paths = true;
+        else if (a == "--gemm-min") o.attn_gemm_min = std::atoi(val().c_str());
+        else if (a == "--iq-gemv") o.own_gemv = false;
         else if (a == "--tile") o.attn_tile = std::atoi(val().c_str());
         else if (a == "--synth") synth = std::atoll(val().c_str());
         else if (a == "--cum") o.cum_min = (float) std::atof(val().c_str());
