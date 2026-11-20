@@ -15,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace inkling2 {
@@ -37,7 +38,8 @@ struct Options {
     std::string dspark_index;     // the drafter's index folder (inkling2_dspark.hpp; empty: no drafter): loaded on the
                                   // last GPU, fed every position's taps by the steps and the prompt path
     float dspark_cum = 0.5f;      // its cut on the running product of the drafts' probabilities (Model::set_draft_cum)
-    double dspark_reserve_gb = 3.4;   // VRAM the last GPU keeps for it beyond reserve_gb (fewer experts there)
+    double dspark_reserve_gb = 3.4;   // VRAM the last GPU keeps for it beyond reserve_gb (fewer experts there), at a
+                                      // context of 32768: a longer one adds the drafter's rows a position
     bool swap = true;             // the expert cache: the experts routed to lately move into VRAM, colder ones out
     bool verbose = false;
 };
@@ -81,6 +83,12 @@ public:
     /// The expert cache's moves on / off from here on (Options::swap).  Off, the experts stay where they are: two passes
     /// over the same tokens then give the same bits (an expert's sum on the CPU lane is not its sum on the GPU).
     void set_swap(bool on);
+    /// A request's logit bias (the server's GEN logit_bias=<id>:<bias>,...; its ignore_eos bans the end tokens with
+    /// -100): added on the device to every row of logits from here on - forward's last row, each window row - after the
+    /// soft cap and before the argmax (top(), a window's tops) and the copy logits_out / logits_rows get.  So a greedy
+    /// verdict on a draft is the biased pick, and a banned token's draft is turned down.  Ids outside the unpadded
+    /// vocabulary are dropped.  None (an empty list): the logits exactly as without.  Call it between two steps.
+    bool set_logit_bias(const std::vector<std::pair<int, float>>& entries, std::string& err);
     /// The drafter (Options::dspark_index) is loaded and fed
     bool dspark() const;
     /// Drafts after `anchor`, the token at end() (not read yet): up to max_n (<= 7) tokens for end() + 1 .. with the

@@ -152,7 +152,10 @@ struct Lines {
 };
 
 // GEN <max_new> [key=value ...] <id,id,...>: keys this engine does not use are taken and ignored
-bool parse_gen(const std::string& line, mm3::sample::Req& r, float& cum) {
+// logit_bias=<id>:<bias>,... (OpenAI's logit_bias; the server's ignore_eos bans the end tokens with -100) -> bias, for
+// Model::set_logit_bias: added to the logits of every pick of the answer, on the device
+bool parse_gen(const std::string& line, mm3::sample::Req& r, float& cum, std::vector<std::pair<int, float>>& bias) {
+    bias.clear();
     std::istringstream is(line.substr(4));
     r.top_k = 0;   // (no top-k unless asked)
     if (!(is >> r.max_new)) return false;
@@ -174,6 +177,16 @@ bool parse_gen(const std::string& line, mm3::sample::Req& r, float& cum) {
         else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
         else if (k == "spec") r.spec = std::atoi(v.c_str());
         else if (k == "dspark_cum" || k == "spec_cum") cum = std::strtof(v.c_str(), nullptr);
+        else if (k == "logit_bias") {   // (the server checked them: ids in the vocabulary, -100 .. 100)
+            size_t at = 0;
+            while (at < v.size()) {
+                const size_t end = std::min(v.find(',', at), v.size()), colon = v.find(':', at);
+                if (colon != std::string::npos && colon < end)
+                    bias.emplace_back(std::atoi(v.substr(at, colon - at).c_str()),
+                                      std::strtof(v.substr(colon + 1, end - colon - 1).c_str(), nullptr));
+                at = end + 1;
+            }
+        }
     }
     return !r.ids.empty();
 }
@@ -442,6 +455,7 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool d
     std::printf("INFO engine=inkling2 engine_kind=inkling2 model=Inkling-2-Small ctx=%lld vram_gb=%.2f dspark=%d mtp=0 "
                 "experts=%d experts_vram=%d\n", (long long) m.max_ctx(), st.vram_gb + m.dspark_vram_gb(),
                 m.dspark() && drafting ? 1 : 0, st.experts_all, st.experts_vram);
+    std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
     Drafting dr;
     dr.on = m.dspark() && drafting;
     if (rest0 >= 0) dr.rest0 = rest0;
@@ -469,7 +483,8 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool d
         ++counter;
         mm3::sample::Req r;
         float cum = cum_default;
-        if (!parse_gen(line, r, cum)) {
+        std::vector<std::pair<int, float>> bias;
+        if (!parse_gen(line, r, cum, bias)) {
             std::printf("ERR expected: GEN <max_new> [keys] <id,id,...>\n");
             std::fflush(stdout);
             continue;
@@ -482,6 +497,15 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool d
             else
                 std::printf("ERR the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", n, r.max_new,
                             (long long) m.max_ctx());
+            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", n);
+            std::fflush(stdout);
+            continue;
+        }
+        // the request's logit bias, before its prompt is read (the prompt's last row gives the answer's first token);
+        // none: the last request's is cleared
+        if (!m.set_logit_bias(bias, err)) {
+            std::printf("ERR the logit bias: %s\n", err.c_str());
+            std::fprintf(stderr, "inkling2: the logit bias: %s\n", err.c_str());
             std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", n);
             std::fflush(stdout);
             continue;

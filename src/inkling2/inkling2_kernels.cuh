@@ -158,6 +158,8 @@ void conv_add_rows(const float* y, int T, const float* h0, float* h1, const floa
 /// The drafter's taps of a window: dst [T][n][E] (rows ld floats apart) from n sources of [T][E] (n <= 8); bit k of
 /// vol: source k is host memory the device maps, written by another device (read fresh)
 void taps_gather(const float* const* src, unsigned vol, int n, int T, int E, float* dst, size_t ld, cudaStream_t s);
+/// A request's logit bias: x[r ld + ids[i]] += vals[i] for each of the n entries (distinct ids) and each of `rows` rows
+void bias_rows(float* x, size_t ld, int rows, const int* ids, const float* vals, int n, cudaStream_t s);
 /// argmax of each of `rows` rows of x (ld apart, n values): out[2 r] the index as a float, out[2 r + 1] the value
 void argmax_rows(const float* x, size_t ld, int rows, int n, float* out, cudaStream_t s);
 

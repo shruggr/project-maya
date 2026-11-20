@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <thread>
 
 namespace inkling2 {
@@ -544,6 +545,12 @@ struct Model::Impl {
                (!last || gp.alloc(gp.logits, (size_t) g.n_vocab, err));
     }
 
+    // The drafter's VRAM on the last GPU: Options::dspark_reserve_gb is its measure at a context of 32768; a position
+    // more costs its global layer's K / V rows (F16) and its attention's score rows (Dspark::ctx_bytes)
+    size_t dspark_bytes() const {
+        return (size_t) (o.dspark_reserve_gb * 1e9) +
+               (size_t) std::max<int64_t>(0, o.max_ctx - 32768) * Dspark::ctx_bytes();
+    }
     // The plan: the layers over the GPUs by their bytes, then each GPU's room filled with its layers' experts - the
     // most routed first by the profile (none: each layer's first ones, the layers in turn)
     bool plan(std::string& err) {
@@ -586,7 +593,7 @@ struct Model::Impl {
             gp.blob_max = 1;
             for (int il = gp.l0; il < gp.l1; ++il) gp.blob_max = std::max(gp.blob_max, L[(size_t) il].blob);
             size_t fixed = scratch_bytes() + chunk_bytes(gp.blob_max) + (gi == ng - 1 ? head_bytes : 0) + (size_t) (o.reserve_gb * 1e9) +
-                           (gi == ng - 1 && !o.dspark_index.empty() ? (size_t) (o.dspark_reserve_gb * 1e9) : 0);
+                           (gi == ng - 1 && !o.dspark_index.empty() ? dspark_bytes() : 0);
             for (int il = gp.l0; il < gp.l1; ++il) fixed += L[(size_t) il].dense;
             if (fixed > gp.free0) {
                 err = "GPU " + std::to_string(gp.dev) + ": " + std::to_string(gp.free0 >> 20) + " MiB free, layers " +
@@ -1957,6 +1964,7 @@ struct Model::Impl {
             return false;
         }
         if (g.softcap > 0.0f) k::softcap(gp.w_logits, (size_t) T * g.n_vocab, g.softcap, gp.s);
+        if (bias_n > 0) k::bias_rows(gp.w_logits, (size_t) g.n_vocab, T, d_bias_ids, d_bias_vals, bias_n, gp.s);
         k::argmax_rows(gp.w_logits, (size_t) g.n_vocab, T, g.n_vocab_unpadded, gp.w_top, gp.s);
         CK(cudaMemcpyAsync(h_wtop, gp.w_top, sizeof(float) * 2 * T, cudaMemcpyDeviceToHost, gp.s));
         if (job_rows) CK(cudaMemcpyAsync(h_wlog, gp.w_logits, sizeof(float) * T * g.n_vocab, cudaMemcpyDeviceToHost, gp.s));
@@ -2046,6 +2054,45 @@ struct Model::Impl {
         return true;
     }
 
+    // The request's logit bias (Model::set_logit_bias): its entries (distinct ids of the unpadded vocabulary, none of
+    // them zero) on the last GPU, added to every row of logits after the soft cap - before the argmax and the copy the
+    // sampler reads - by the token step, every window row and the prompt's last row.  bias_n 0: no launch, the logits
+    // exactly as without.  The buffers (a vocabulary of entries at most) are allocated with the first request that has
+    // a bias; the caller sets it between two steps, when the last GPU's stream is idle
+    int *d_bias_ids = nullptr;
+    float* d_bias_vals = nullptr;
+    int bias_n = 0;
+    std::vector<std::pair<int, float>> bias_cur;
+    bool set_logit_bias(const std::vector<std::pair<int, float>>& entries, std::string& err) {
+        std::map<int, float> u;
+        for (const auto& [id, b] : entries)
+            if (id >= 0 && id < g.n_vocab_unpadded) u[id] = b;   // (an id twice: its last bias)
+        std::vector<std::pair<int, float>> e;
+        for (const auto& [id, b] : u)
+            if (b != 0.0f) e.push_back({id, b});
+        if (e == bias_cur) return true;
+        bias_n = 0;
+        bias_cur.clear();
+        if (e.empty()) return true;
+        Gpu& gp = G.back();
+        CK(cudaSetDevice(gp.dev));
+        CK(cudaStreamSynchronize(gp.s));
+        if (!d_bias_ids && (!gp.alloc(d_bias_ids, (size_t) g.n_vocab_unpadded, err) ||
+                            !gp.alloc(d_bias_vals, (size_t) g.n_vocab_unpadded, err)))
+            return false;
+        std::vector<int> ids(e.size());
+        std::vector<float> vals(e.size());
+        for (size_t i = 0; i < e.size(); ++i) {
+            ids[i] = e[i].first;
+            vals[i] = e[i].second;
+        }
+        CK(cudaMemcpy(d_bias_ids, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_bias_vals, vals.data(), vals.size() * sizeof(float), cudaMemcpyHostToDevice));
+        bias_cur = std::move(e);
+        bias_n = (int) bias_cur.size();
+        return true;
+    }
+
     // the head, on the last GPU: the token whose stream and saved ones are in its gp.cur / gp.blocks
     bool head_out(int nb, float* logits_out, std::string& err) {
         const int E = g.n_embd;
@@ -2058,6 +2105,7 @@ struct Model::Impl {
             return false;
         }
         if (g.softcap > 0.0f) k::softcap(gp.logits, (size_t) g.n_vocab_unpadded, g.softcap, gp.s);
+        if (bias_n > 0) k::bias_rows(gp.logits, (size_t) g.n_vocab, 1, d_bias_ids, d_bias_vals, bias_n, gp.s);
         k::argmax(gp.logits, g.n_vocab_unpadded, gp.top, gp.s);
         CK(cudaMemcpyAsync(h_top, gp.top, 8, cudaMemcpyDeviceToHost, gp.s));
         if (logits_out)
@@ -2920,6 +2968,9 @@ bool Model::window(const int* ids, int T, int64_t pos0, int* tops, float* logits
 }
 bool Model::keep(int rows, std::string& err) { return m->win_keep(rows, err); }
 int Model::window_max() const { return m->fast_on() ? Impl::kWin : 1; }
+bool Model::set_logit_bias(const std::vector<std::pair<int, float>>& entries, std::string& err) {
+    return m->set_logit_bias(entries, err);
+}
 void Model::set_debug(int mask) { m->dbg = mask; }
 void Model::set_swap(bool on) { m->o.swap = on; }
 bool Model::dspark() const { return m->taps_on; }

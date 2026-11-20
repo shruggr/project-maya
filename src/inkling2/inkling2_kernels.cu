@@ -562,6 +562,36 @@ __global__ void attn_combine_seq_kernel(const float* __restrict__ st, const floa
     if (gate) v *= 1.0f / (1.0f + expf(-gate[(size_t) h * D + tid]));
     out[(size_t) h * D + tid] = v;
 }
+// ... the same sums for more tiles than a block's shared memory holds factors for (contexts past kCombTiles * kATK
+// keys: 131072): the tiles' factors a chunk of kCombTiles at a time, summed in the same order
+constexpr int kCombTiles = 8192;
+__global__ void attn_combine_seq_big_kernel(const float* __restrict__ st, const float* __restrict__ part, int ntile, int D,
+                                            const float* __restrict__ gate, float* __restrict__ out) {
+    __shared__ float sh[256];
+    __shared__ float se[kCombTiles];
+    const int h = blockIdx.x, tid = threadIdx.x;
+    const float* sth = st + (size_t) h * ntile * 2;
+    float m = 0.0f;
+    for (int b = tid; b < ntile; b += blockDim.x) m = fmaxf(m, sth[2 * b]);
+    m = block_max(m, sh);
+    float v = 0.0f, sum = 0.0f;
+    for (int b0 = 0; b0 < ntile; b0 += kCombTiles) {
+        const int nb = ntile - b0 < kCombTiles ? ntile - b0 : kCombTiles;
+        for (int b = tid; b < nb; b += blockDim.x) se[b] = expf(sth[2 * (b0 + b)] - m);
+        __syncthreads();
+        if (tid < D)
+            for (int b = 0; b < nb; ++b) {
+                v += part[((size_t) h * ntile + b0 + b) * D + tid] * se[b];
+                sum += sth[2 * (b0 + b) + 1] * se[b];
+            }
+        __syncthreads();
+    }
+    if (tid >= D) return;
+    sum += expf(-m);
+    v /= sum;
+    if (gate) v *= 1.0f / (1.0f + expf(-gate[(size_t) h * D + tid]));
+    out[(size_t) h * D + tid] = v;
+}
 // ---- the window step's fused forms: the decode step's launches over T rows (T 1: a token) --------------------------
 // block = (a kv head, K or V, a row): the row's conv from the window's inputs and the histories before it, the clip /
 // the norm, the F16 cache row; the last row's blocks write the histories after the window into h1
@@ -662,6 +692,12 @@ __global__ void taps_gather_kernel(TapSrc src, int n, int T, int E, float* __res
         const float* sp = src.p[k] + (size_t) t * E + e;
         dst[(size_t) t * ld + (size_t) k * E + e] = (src.vol >> k) & 1u ? *(const volatile float*) sp : *sp;
     }
+}
+// a request's logit bias (Model::set_logit_bias): entry i of row blockIdx.y; the ids are distinct
+__global__ void bias_rows_kernel(float* __restrict__ x, size_t ld, const int* __restrict__ ids,
+                                 const float* __restrict__ vals, int n) {
+    const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) x[(size_t) blockIdx.y * ld + (size_t) ids[i]] += vals[i];
 }
 // each row's argmax: out[2 t] the index as a float (ties: the lower), out[2 t + 1] its value; rows ld apart
 __global__ void argmax_rows_kernel(const float* __restrict__ x, size_t ld, int n, float* __restrict__ out) {
@@ -1105,7 +1141,10 @@ bool attention_split_rows(const float* q, const float* rel, const float* sink, i
         attn_tile_rows_kernel<8><<<grid, 256, shb, s>>>(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, (const __half*) K,
                                                         (const __half*) V, ring, base, (int) (p0 - lo0), window, nk, TK, scale,
                                                         S, part);
-    attn_combine_seq_kernel<<<(unsigned) (T * H), 256, (256 + (size_t) ntile) * sizeof(float), s>>>(S, part, ntile, D, gate, out);
+    if (ntile <= kCombTiles)
+        attn_combine_seq_kernel<<<(unsigned) (T * H), 256, (256 + (size_t) ntile) * sizeof(float), s>>>(S, part, ntile, D, gate, out);
+    else   // (more factors than a block's shared memory holds: a chunk of them at a time)
+        attn_combine_seq_big_kernel<<<(unsigned) (T * H), 256, 0, s>>>(S, part, ntile, D, gate, out);
     check("attention_split_rows");
     return true;
 }
@@ -1297,6 +1336,11 @@ void taps_gather(const float* const* src, unsigned vol, int n, int T, int E, flo
     ts.vol = vol;
     taps_gather_kernel<<<blocks_of((size_t) T * n * E), 256, 0, s>>>(ts, n, T, E, dst, ld);
     check("taps_gather");
+}
+void bias_rows(float* x, size_t ld, int rows, const int* ids, const float* vals, int n, cudaStream_t s) {
+    if (n <= 0 || rows <= 0) return;
+    bias_rows_kernel<<<dim3(blocks_of((size_t) n), (unsigned) rows), 256, 0, s>>>(x, ld, ids, vals, n);
+    check("bias_rows");
 }
 void argmax_rows(const float* x, size_t ld, int rows, int n, float* out, cudaStream_t s) {
     argmax_rows_kernel<<<(unsigned) rows, 1024, 0, s>>>(x, ld, n, out);

@@ -64,6 +64,9 @@ class Dspark {
 public:
     static constexpr int kTaps = 8;     // taps a position
     static constexpr int kBlock = 8;    // a block's rows: the anchor and 7 drafts
+    /// The VRAM a position of DsparkOptions::max_ctx costs (Inkling 2 Small's drafter: one global layer's K and V rows,
+    /// F16 [8 kv heads][128], and the GEMM attention's scores, F32 and F16 a (block row, head) pair: 8 x 48)
+    static constexpr size_t ctx_bytes() { return 2 * 8 * 128 * 2 + (size_t) kBlock * 48 * (4 + 2); }
 
     Dspark();
     ~Dspark();
