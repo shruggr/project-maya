@@ -374,6 +374,8 @@ int usage() {
                  "  --short-prompt N    (serve) a prompt's unread tokens up to N take the decode path (default 3: measured,\n"
                  "                      the prompt path is faster from about 4 tokens on)\n"
                  "  --eos a,b           (serve) the ids that end an answer (default 200006,199999)\n"
+                 "  --window-test DIR   (tests) a verify window of 9 rows after a reference's prompt against 9 token steps,\n"
+                 "                      a window cut back, a window's time for 1 .. 9 rows\n"
                  "  --rewind-test DIR   (tests) a reference's prompt read, rewound and read on, against a cold read\n"
                  "  --short-bench       (tests, with --tokens) short suffixes on the prompt path and the decode path\n"
                  "  --verbose\n");
@@ -389,7 +391,7 @@ int main(int argc, char** argv) {
     int n_predict = 0, repeat = 1, short_n = 3;
     bool serving = false, short_bench = false;
     std::vector<int> stops = {200006, 199999};   // the model's end of sequence and <|content_model_end_sampling|>
-    std::string rewind_test, tokens_file;
+    std::string rewind_test, tokens_file, window_test;
     std::vector<int> try_chunks;
     int64_t parity_max = -1;
     bool decode_only = false;   // (parity) the prompt token by token (the decode path) instead of the prompt path
@@ -427,6 +429,7 @@ int main(int argc, char** argv) {
         else if (a == "--short-prompt") short_n = std::atoi(val().c_str());
         else if (a == "--eos") stops = int_list(val());
         else if (a == "--rewind-test") rewind_test = val();
+        else if (a == "--window-test") window_test = val();
         else if (a == "--short-bench") short_bench = true;
         else if (a == "--parity-detail") detail = true;
         else if (a == "--parity-decode") decode_only = true;
@@ -435,7 +438,7 @@ int main(int argc, char** argv) {
         else if (a == "--parity-force-only") force_opt = force_only = true;
         else return usage();
     }
-    if (o.pack.empty() || (parities.empty() && tokens.empty() && !serving && rewind_test.empty() && tokens_file.empty()))
+    if (o.pack.empty() || (parities.empty() && tokens.empty() && !serving && rewind_test.empty() && tokens_file.empty() && window_test.empty()))
         return usage();
     std::string err;
     for (const std::string& d : parities) {   // (a wrong folder: said before the load)
@@ -480,6 +483,78 @@ int main(int argc, char** argv) {
         }
         if (!model.save_profile(err)) std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
         return 0;
+    }
+    if (!window_test.empty()) {
+        // --window-test <reference dir>: after its prompt, 9 greedy tokens a step each (their logits kept), then the
+        // same 9 as one verify window from the same position: each row's argmax and logits against the token steps';
+        // a window cut back to 4 rows and read on; and a window's time for 1 .. 9 rows
+        Ref rf;
+        if (!rf.load(window_test, err)) return 1;
+        const int W = model.window_max(), V = model.vocab();
+        if (W < 2) {
+            std::fprintf(stderr, "maya-inkling2: no verify windows in this configuration\n");
+            return 1;
+        }
+        auto cosine = [&](const float* a, const float* b) {
+            double dot = 0, a2 = 0, b2 = 0;
+            for (int i = 0; i < V; ++i) {
+                dot += (double) a[i] * b[i];
+                a2 += (double) a[i] * a[i];
+                b2 += (double) b[i] * b[i];
+            }
+            return dot / std::sqrt(a2 * b2);
+        };
+        model.reset();
+        if (!model.forward(rf.prompt.data(), (int) rf.prompt.size(), 0, nullptr, err)) return 1;
+        const int64_t P = model.end();
+        std::vector<int> gt, tops((size_t) W);
+        std::vector<float> lt((size_t) W * V), lw((size_t) W * V), l1((size_t) V);
+        for (int t = 0; t < W; ++t) {
+            gt.push_back(model.top());
+            if (!model.forward(&gt.back(), 1, P + t, lt.data() + (size_t) t * V, err)) return 1;
+        }
+        int bad = 0;
+        if (model.rewind(P) != P || !model.window(gt.data(), W, P, tops.data(), lw.data(), err)) {
+            std::fprintf(stderr, "maya-inkling2: the window at %lld: %s\n", (long long) P, err.c_str());
+            return 1;
+        }
+        std::printf("window of %d rows at position %lld against the same tokens a step each:\n", W, (long long) P);
+        for (int t = 0; t < W; ++t) {
+            const double c = cosine(lt.data() + (size_t) t * V, lw.data() + (size_t) t * V);
+            int am = 0;
+            for (int i = 1; i < V; ++i)
+                if (lt[(size_t) t * V + i] > lt[(size_t) t * V + am]) am = i;
+            const bool ok = am == tops[(size_t) t] && c >= 0.9999;
+            bad += !ok;
+            std::printf("  row %d: next token %d / %d a step, logits cosine %.6f - %s\n", t, tops[(size_t) t], am, c,
+                        ok ? "OK" : "DIFFERENT");
+        }
+        // cut back to 4 rows, then the 5th token a step: its logits against the token steps'
+        if (!model.keep(4, err) || !model.forward(&gt[4], 1, P + 4, l1.data(), err)) {
+            std::fprintf(stderr, "maya-inkling2: keep: %s\n", err.c_str());
+            return 1;
+        }
+        {
+            const double c = cosine(lt.data() + (size_t) 4 * V, l1.data());
+            const bool ok = c >= 0.9999;
+            bad += !ok;
+            std::printf("window cut back to 4 rows, the next token a step: logits cosine %.6f - %s\n", c, ok ? "OK" : "DIFFERENT");
+        }
+        std::printf("a window's time at position %lld, ms (5 runs each):", (long long) P);
+        for (int T = 1; T <= W; ++T) {
+            double best = 1e9, sum = 0;
+            for (int r = 0; r < 5; ++r) {
+                if (model.rewind(P) != P) return 1;
+                const double t0 = now_s();
+                if (!model.window(gt.data(), T, P, tops.data(), nullptr, err)) return 1;
+                const double dt = (now_s() - t0) * 1e3;
+                best = std::min(best, dt);
+                sum += dt;
+            }
+            std::printf(" T=%d %.1f (best %.1f);", T, sum / 5, best);
+        }
+        std::printf("\n%s\n", bad ? "WINDOW DIFFERENT" : "WINDOW OK");
+        return bad ? 3 : 0;
     }
     if (!rewind_test.empty()) {
         // --rewind-test <reference dir>: its prompt as A; B = A's first part and other tokens after it.  B read after

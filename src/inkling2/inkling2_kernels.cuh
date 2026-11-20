@@ -50,6 +50,16 @@ void attention_split(const float* q, const float* rel, const float* sink, int H,
                      const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p,
                      int64_t lo, float scale, float* S, const float* gate, float* out, cudaStream_t s);
 
+/// attention_split for a verify window's T rows in one pair of launches: the K / V tiles read once for all T x (H /
+/// Hkv) queries of a kv head.  Row t (position p0 + t) sees the keys up to its own position and, with window > 0, the
+/// last `window` of them; lo0: the first key position row 0 sees.  q [T][H][D], rel [T][H][n_rel], sink [T][H], gate
+/// and out [T][H][D].  false (nothing launched): the scratch (S_floats) does not hold the tiles' parts - the caller
+/// runs the rows one at a time.
+bool attention_split_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
+                          const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
+                          int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
+                          cudaStream_t s);
+
 /// x *= sigmoid(g), n values
 void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s);
 /// y += x
@@ -112,6 +122,23 @@ void perm_heads(const float* src, float* dst, int T, int Hkv, int per, int D, bo
 /// tbl [T H][extent] (rel . rel_bias per distance).
 void attn_softmax_rows(float* S, int T, int Hkv, int per, int nk, int64_t klo, int64_t p0, int window, int extent,
                        const float* tbl, const float* sink, float scale, cudaStream_t s);
+
+// ---- the verify window: T (a few) tokens a decode step ----------------------------------------------------------
+/// mix_rms for T tokens (state st of token t at blocks + st ldb + t E; out [nq][T][E]): a block a token, each the
+/// one-token launch's arithmetic
+void mix_rms_rows(const float* blocks, size_t ldb, int nb, const float* cur, int T, int E, const float* query, int nq,
+                  const float* g0, const float* g1, const float* g2, float eps, float* out, cudaStream_t s);
+/// conv_rows, the histories as they were before the window copied to save [3][C] first (a window is cut back to its
+/// first rows from them and its inputs: hist_set4)
+void conv_rows_save(const float* y, int T, float* hist, const float* w, int C, const float* dyn, int heads, float* out,
+                    float* save, cudaStream_t s);
+/// lane_add for T tokens: ids [T][nu], src and y [T][n]; the wait once, when any of the tokens has a pick outside VRAM
+void lane_add_rows(const unsigned* flag, unsigned v, const int* ids, const int* slot, int nu, const float* src, float* y,
+                   int n, int T, cudaStream_t s);
+/// A layer's four histories as after `keep` rows of a window: stream q's hist[q] [3][C[q]] = the last three rows of
+/// (h0[q] [3][C[q]], then in[q]'s first `keep` rows)
+void hist_set4(float* const hist[4], const float* const h0[4], const float* const in[4], const int C[4], int keep,
+               cudaStream_t s);
 
 /// A chunk's expert outputs by entry, whichever set computed them: ent[e] = y[row_of[e]] for the n entries with a row
 /// (row_of >= 0; rows of E) - then out[t] = sum_j w[t][j] ent[t nu + j], the picks in their order: a token's sum does

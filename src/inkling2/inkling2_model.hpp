@@ -61,6 +61,14 @@ public:
     /// histories hold the positions before it); logits_out (if given) gets the last position's logits, [vocab] F32
     /// (soft-capped, the padded rows cut).  top() is that position's argmax either way.
     bool forward(const int* ids, int n, int64_t pos0, float* logits_out, std::string& err);
+    /// A verify window: T (1 .. window_max()) tokens at positions pos0 .. (pos0 = end()) in one decode step - the same
+    /// arithmetic a token as forward gives it, the routed experts grouped over the window's rows.  tops [T]: each
+    /// row's argmax (the token after it); logits_rows (if given): [T][vocab].  The context then ends after the T rows;
+    /// keep(rows) cuts it back to the window's first `rows` (1 .. T) without reading anything again - the rows after
+    /// them were drafts the target turned down.
+    bool window(const int* ids, int T, int64_t pos0, int* tops, float* logits_rows, std::string& err);
+    bool keep(int rows, std::string& err);
+    int window_max() const;
     /// Back to an empty context (position 0)
     void reset();
     /// Back to a position at or before pos (<= end()): the caches keep every position and the short convolutions'

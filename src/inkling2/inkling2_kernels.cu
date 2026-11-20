@@ -423,6 +423,83 @@ __global__ void attn_tile_kernel(const float* __restrict__ q, const float* __res
         for (int r = 0; r < per; ++r) part[((size_t) (g * per + r) * ntile + tile) * D + tid] = v[r];
     }
 }
+// ... for a window's T rows: block = (a tile of TK keys, a kv head) - the tile's K rows in shared memory once for the
+// T x per queries (read where they lie), each query's softmax within the tile over the keys its row sees, then the
+// tile's V rows in the same shared memory for the parts.  st [T H][tiles][2], part [T H][tiles][D]
+__global__ void attn_tile_rows_kernel(const float* __restrict__ q, const float* __restrict__ rel,
+                                      const float* __restrict__ sink, int T, int H, int Hkv, int D, int n_rel,
+                                      const float* __restrict__ rel_bias, int extent, const __half* __restrict__ K,
+                                      const __half* __restrict__ V, int ring, long long base, int d0, int window, int nk,
+                                      int TK, float scale, float* __restrict__ st, float* __restrict__ part) {
+    extern __shared__ float sm[];   // [TK][D] keys (then values), [T per][TK] scores / weights, [T per] maxima
+    const int g = blockIdx.y, tile = blockIdx.x, ntile = gridDim.x, j0 = tile * TK, per = H / Hkv, tid = threadIdx.x;
+    const int TP = T * per;
+    float* sk = sm;
+    float* sw = sk + (size_t) TK * D;
+    float* smb = sw + (size_t) TP * TK;
+    for (int i = tid; i < TK * D; i += blockDim.x) {
+        const int j = j0 + i / D;
+        if (j < nk) {
+            long long sl = base + j;
+            if (ring > 0 && sl >= ring) sl -= ring;
+            sk[i] = __half2float(K[((size_t) sl * Hkv + g) * D + i % D]);
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e < TP * TK; e += blockDim.x) {
+        const int tr = e / TK, jj = e % TK, t = tr / per, h = g * per + tr % per, j = j0 + jj;
+        const int d = d0 + t - j;   // (row t's position less the key's)
+        float a = -INFINITY;
+        if (j < nk && d >= 0 && (window == 0 || d < window)) {
+            const float* qr = q + ((size_t) t * H + h) * D;
+            a = 0.0f;
+            for (int i = 0; i < D; ++i) a += qr[i] * sk[jj * D + i];
+            a *= scale;
+            if (d < extent) {
+                const float* bb = rel_bias + (size_t) d * n_rel;
+                const float* rr = rel + ((size_t) t * H + h) * n_rel;
+                float bs = 0.0f;
+                for (int i = 0; i < n_rel; ++i) bs += rr[i] * bb[i];
+                a += bs;
+            }
+            a -= sink[(size_t) t * H + h];
+        }
+        sw[e] = a;
+    }
+    __syncthreads();
+    if (tid < TP) {
+        float m = -INFINITY;
+        for (int jj = 0; jj < TK; ++jj) m = fmaxf(m, sw[tid * TK + jj]);
+        smb[tid] = m;
+    }
+    __syncthreads();
+    for (int e = tid; e < TP * TK; e += blockDim.x) sw[e] = sw[e] > -INFINITY ? expf(sw[e] - smb[e / TK]) : 0.0f;
+    // (the keys are done with: the tile's values in their place)
+    for (int i = tid; i < TK * D; i += blockDim.x) {
+        const int j = j0 + i / D;
+        if (j < nk) {
+            long long sl = base + j;
+            if (ring > 0 && sl >= ring) sl -= ring;
+            sk[i] = __half2float(V[((size_t) sl * Hkv + g) * D + i % D]);
+        }
+    }
+    __syncthreads();
+    if (tid < TP) {
+        float sum = 0.0f;
+        for (int jj = 0; jj < TK; ++jj) sum += sw[tid * TK + jj];
+        float* o = st + (((size_t) (tid / per) * H + g * per + tid % per) * ntile + tile) * 2;
+        o[0] = smb[tid];
+        o[1] = sum;
+    }
+    if (tid < D) {
+        const int n = min(TK, nk - j0);
+        for (int tr = 0; tr < TP; ++tr) {
+            float v = 0.0f;
+            for (int jj = 0; jj < n; ++jj) v += sw[tr * TK + jj] * sk[jj * D + tid];
+            part[(((size_t) (tr / per) * H + g * per + tr % per) * ntile + tile) * D + tid] = v;
+        }
+    }
+}
 // block = a query head: the tiles' parts under one maximum (the sink's zero logit in it and in the sum), the gate
 __global__ void attn_combine_kernel(const float* __restrict__ st, const float* __restrict__ part, int ntile, int D,
                                     const float* __restrict__ gate, float* __restrict__ out) {
@@ -443,15 +520,17 @@ __global__ void attn_combine_kernel(const float* __restrict__ st, const float* _
     out[(size_t) h * D + tid] = v;
 }
 // one block: the states' norms and dots, then each query's mix, its own norm and gain
-__global__ void mix_rms_kernel(const float* __restrict__ blocks, int nb, const float* __restrict__ cur, int E,
+__global__ void mix_rms_kernel(const float* __restrict__ blocks, size_t ldb, int nb, const float* __restrict__ cur, int T,
+                               int E,
                                const float* __restrict__ query, int nq, const float* __restrict__ g0,
                                const float* __restrict__ g1, const float* __restrict__ g2, float eps,
                                float* __restrict__ out) {
     __shared__ float sh[1024];
     __shared__ float st[kMaxStates * 4];
-    const int ns = nb + 1, tid = threadIdx.x;
+    const int ns = nb + 1, tid = threadIdx.x, t = blockIdx.x;   // (a block a token: each the one-token arithmetic)
+    const size_t to = (size_t) t * E;
     for (int s = 0; s < ns; ++s) {
-        const float* x = s < nb ? blocks + (size_t) s * E : cur;
+        const float* x = (s < nb ? blocks + (size_t) s * ldb : cur) + to;
         float ss = 0.0f, d[3] = {0.0f, 0.0f, 0.0f};
         for (int i = tid; i < E; i += blockDim.x) {
             const float v = x[i];
@@ -480,14 +559,30 @@ __global__ void mix_rms_kernel(const float* __restrict__ blocks, int nb, const f
         int n = 0;
         for (int i = tid; i < E && n < 8; i += blockDim.x, ++n) {
             float v = 0.0f;
-            for (int s = 0; s < ns; ++s) v += w[s] * st[4 * s] * (s < nb ? blocks[(size_t) s * E + i] : cur[i]);
+            for (int s = 0; s < ns; ++s) v += w[s] * st[4 * s] * (s < nb ? blocks[(size_t) s * ldb + to + i] : cur[to + i]);
             vv[n] = v / den;
             ss += vv[n] * vv[n];
         }
         ss = block_sum(ss, sh);
         const float inv = rsqrtf(ss / (float) E + eps);
         n = 0;
-        for (int i = tid; i < E && n < 8; i += blockDim.x, ++n) out[(size_t) qi * E + i] = vv[n] * inv * (gain ? gain[i] : 1.0f);
+        for (int i = tid; i < E && n < 8; i += blockDim.x, ++n) out[((size_t) qi * T + t) * E + i] = vv[n] * inv * (gain ? gain[i] : 1.0f);
+    }
+}
+__global__ void hist_set4_kernel(float* h0p, float* h1p, float* h2p, float* h3p, const float* s0, const float* s1,
+                                 const float* s2, const float* s3, const float* i0, const float* i1, const float* i2,
+                                 const float* i3, int C0, int C1, int C2, int C3, int keep) {
+    float* const hist[4] = {h0p, h1p, h2p, h3p};
+    const float* const h0[4] = {s0, s1, s2, s3};
+    const float* const in[4] = {i0, i1, i2, i3};
+    const int C[4] = {C0, C1, C2, C3};
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int q = 0; q < 4; ++q) {
+        if (c >= C[q]) continue;
+        for (int r = 0; r < 3; ++r) {
+            const int i = keep + r;
+            hist[q][(size_t) r * C[q] + c] = i < 3 ? h0[q][(size_t) i * C[q] + c] : in[q][(size_t) (i - 3) * C[q] + c];
+        }
     }
 }
 __global__ void lane_add_kernel(const unsigned* flag, unsigned v, const int* __restrict__ ids, const int* __restrict__ slot,
@@ -626,9 +721,11 @@ __global__ void conv_rows_kernel(const float* __restrict__ y, const float* __res
     }
     out[(size_t) t * C + c] = (in[3] + o) * scale;
 }
-__global__ void conv_hist_kernel(const float* __restrict__ y, int T, float* hist, int C) {
+__global__ void conv_hist_kernel(const float* __restrict__ y, int T, float* hist, int C, float* __restrict__ save) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
+    if (save)
+        for (int r = 0; r < 3; ++r) save[(size_t) r * C + c] = hist[(size_t) r * C + c];
     for (int r = 0; r < 3; ++r) {   // (the row T + r of hist's three, then the chunk's)
         const int i = T + r;
         hist[(size_t) r * C + c] = i < 3 ? hist[(size_t) i * C + c] : y[(size_t) (i - 3) * C + c];
@@ -811,6 +908,21 @@ void attention_split(const float* q, const float* rel, const float* sink, int H,
     attn_combine_kernel<<<(unsigned) H, 256, 0, s>>>(S, part, ntile, D, gate, out);
     check("attention_split");
 }
+bool attention_split_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
+                          const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
+                          int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
+                          cudaStream_t s) {
+    const int nk = (int) (p0 + T - lo0), per = H / Hkv, TK = 16, ntile = (nk + TK - 1) / TK, TP = T * per;
+    if (TP > 256 || D > 256 || (size_t) T * H * ntile * (size_t) (D + 2) > S_floats) return false;
+    float* part = S + (size_t) T * H * ntile * 2;
+    attn_tile_rows_kernel<<<dim3((unsigned) ntile, (unsigned) Hkv), 256,
+                            ((size_t) TK * D + (size_t) TP * TK + (size_t) TP + 16) * sizeof(float), s>>>(
+        q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, (const __half*) K, (const __half*) V, ring,
+        (long long) (ring > 0 ? lo0 % ring : lo0), (int) (p0 - lo0), window, nk, TK, scale, S, part);
+    attn_combine_kernel<<<(unsigned) (T * H), 256, 0, s>>>(S, part, ntile, D, gate, out);
+    check("attention_split_rows");
+    return true;
+}
 void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s) {
     sigmoid_mul_kernel<<<blocks_of(n), 256, 0, s>>>(x, g, n);
     check("sigmoid_mul");
@@ -852,7 +964,7 @@ void conv_rows(const float* y, int T, float* hist, const float* w, int C, const 
                cudaStream_t s) {
     conv_rows_kernel<<<dim3(blocks_of((size_t) C), (unsigned) T), 256, 0, s>>>(y, hist, w, C, dyn, heads,
                                                                                 1.0f / std::sqrt(dyn ? 9.0f : 5.0f), out);
-    conv_hist_kernel<<<blocks_of((size_t) C), 256, 0, s>>>(y, T, hist, C);
+    conv_hist_kernel<<<blocks_of((size_t) C), 256, 0, s>>>(y, T, hist, C, nullptr);
     check("conv_rows");
 }
 void head_clip_rows(float* x, int T, int H, int n, const float* scale, float thr, float alpha, double floor, int64_t p0,
@@ -920,8 +1032,37 @@ void mix_rms(const float* blocks, int nb, const float* cur, int E, const float* 
         g_err.fetch_add(1);
         return;
     }
-    mix_rms_kernel<<<1, 1024, 0, s>>>(blocks, nb, cur, E, query, nq, g0, g1, g2, eps, out);
+    mix_rms_kernel<<<1, 1024, 0, s>>>(blocks, (size_t) E, nb, cur, 1, E, query, nq, g0, g1, g2, eps, out);
     check("mix_rms");
+}
+void mix_rms_rows(const float* blocks, size_t ldb, int nb, const float* cur, int T, int E, const float* query, int nq,
+                  const float* g0, const float* g1, const float* g2, float eps, float* out, cudaStream_t s) {
+    if (nb + 1 > kMaxStates || nq > 3 || E > 8 * 1024) {
+        g_err.fetch_add(1);
+        return;
+    }
+    mix_rms_kernel<<<(unsigned) T, 1024, 0, s>>>(blocks, ldb, nb, cur, T, E, query, nq, g0, g1, g2, eps, out);
+    check("mix_rms_rows");
+}
+void conv_rows_save(const float* y, int T, float* hist, const float* w, int C, const float* dyn, int heads, float* out,
+                    float* save, cudaStream_t s) {
+    conv_rows_kernel<<<dim3(blocks_of((size_t) C), (unsigned) T), 256, 0, s>>>(y, hist, w, C, dyn, heads,
+                                                                                1.0f / std::sqrt(dyn ? 9.0f : 5.0f), out);
+    conv_hist_kernel<<<blocks_of((size_t) C), 256, 0, s>>>(y, T, hist, C, save);
+    check("conv_rows_save");
+}
+void lane_add_rows(const unsigned* flag, unsigned v, const int* ids, const int* slot, int nu, const float* src, float* y,
+                   int n, int T, cudaStream_t s) {
+    // (the tokens' picks as one list: any outside VRAM and the wait is taken; rows of n are contiguous)
+    lane_add_kernel<<<blocks_of((size_t) n * T), 256, 0, s>>>(flag, v, ids, slot, nu * T, src, y, n * T);
+    check("lane_add_rows");
+}
+void hist_set4(float* const hist[4], const float* const h0[4], const float* const in[4], const int C[4], int keep,
+               cudaStream_t s) {
+    const int cm = std::max(std::max(C[0], C[1]), std::max(C[2], C[3]));
+    hist_set4_kernel<<<blocks_of((size_t) cm), 256, 0, s>>>(hist[0], hist[1], hist[2], hist[3], h0[0], h0[1], h0[2], h0[3],
+                                                            in[0], in[1], in[2], in[3], C[0], C[1], C[2], C[3], keep);
+    check("hist_set4");
 }
 void lane_add(const unsigned* flag, unsigned v, const int* ids, const int* slot, int nu, const float* src, float* y, int n,
               cudaStream_t s) {

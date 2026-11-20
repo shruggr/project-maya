@@ -86,6 +86,7 @@ struct Layer {
     uint16_t *K = nullptr, *V = nullptr;   // (F16 rows)
     int ring = 0;                 // the caches' rows when they are a ring (0: a row a position)
     int* slot_d = nullptr;        // (slot_of on the device: the prompt path's sets, the host-free step's plan)
+    float *win_in = nullptr, *win_h0 = nullptr;   // (a window's conv inputs [K | V | attention | FFN][kWin], the histories before it)
     cudaEvent_t pe[10] = {};      // (INKLING2_PHASES: the host-free step's phase marks on its GPU's stream)
     float *m_pub = nullptr, *m_cpu = nullptr;   // (mapped host memory: its routing out to the lane, the lane's sum back)
     float* snap = nullptr;        // the histories' saved copies [kSnaps][k | v | attention | FFN]
@@ -137,7 +138,7 @@ struct Gpu {
     int *c_ids = nullptr, *c_bounds = nullptr, *c_stok = nullptr, *c_srow = nullptr, *pmap[2] = {nullptr, nullptr};
     uint16_t *xh16 = nullptr, *wband = nullptr, *c_sh16 = nullptr, *c_P16 = nullptr;
     uint8_t* xstage[2] = {nullptr, nullptr};
-    size_t wband_n = 0, S_n = 0, blob_max = 0;
+    size_t wband_n = 0, S_n = 0, blob_max = 0, S_floats = 0;
     int ts_max = 0;
     // (pinned host memory of its own: the stages run on a thread a GPU)
     float *hc_rw = nullptr, *hc_rl = nullptr, *hc_in = nullptr;
@@ -158,6 +159,15 @@ struct Gpu {
     bool sw_quit = false;
     cudaStream_t s3 = nullptr;
     uint8_t* h_swap = nullptr;
+    // (a verify window's rows: kWin of each)
+    float *w_cb = nullptr, *w_mixo = nullptr, *w_xn = nullptr, *w_stat = nullptr, *w_q = nullptr, *w_gate = nullptr;
+    float *w_ao = nullptr, *w_rel = nullptr, *w_sink = nullptr, *w_kc = nullptr, *w_vc = nullptr, *w_dk = nullptr;
+    float *w_dv = nullptr, *w_oc = nullptr, *w_xf = nullptr, *w_rl = nullptr, *w_rw = nullptr, *w_yc = nullptr;
+    float *w_xd = nullptr, *w_x2d = nullptr, *w_eh = nullptr, *w_ehd = nullptr, *w_part = nullptr, *w_pub = nullptr;
+    float *w_top = nullptr, *w_logits = nullptr;
+    int8_t *w_xq = nullptr, *w_x2q = nullptr, *w_ehq = nullptr;
+    int *w_ids = nullptr, *w_gstart = nullptr, *w_gent = nullptr, *w_ng = nullptr;
+    unsigned long long* w_gptr = nullptr;
     float *pub = nullptr, *m_hand = nullptr;   // (the routing packed; mapped host memory: the hand-off into this GPU)
     unsigned* cnt = nullptr;                   // (a zero word: publish's tally)
     uint8_t* stage = nullptr;     // (the load's: pinned host memory every copy to the device goes through)
@@ -487,9 +497,16 @@ struct Model::Impl {
         std::memcpy(dst + l.tr[2], pk.data(*l.t_dn) + (size_t) e * l.db, l.db);
     }
 
+    // the attention's scratch, floats: a token's tiles over every key, or a window's 9 rows' over up to 4096 keys (a
+    // window whose keys are more runs its rows one at a time)
+    size_t S_need() const {
+        const size_t one = std::max((size_t) g.n_head * (2 * max_keys + 256),
+                                    k::attention_split_floats(g.n_head, g.head_dim, (int64_t) max_keys));
+        return std::max(one, (size_t) 9 * g.n_head * (4096 / 16 + 2) * (size_t) (g.head_dim + 2));
+    }
     size_t scratch_bytes() const {
         const size_t E = (size_t) g.n_embd, HD = (size_t) g.n_head * g.head_dim, nu = (size_t) g.n_used;
-        return (size_t) 4 * ((2 + k::kMaxStates + 3 + 3 + 6) * E + 3 * HD + std::max((size_t) g.n_head * (2 * max_keys + 256), k::attention_split_floats(g.n_head, g.head_dim, (int64_t) max_keys)) +
+        return (size_t) 4 * ((2 + k::kMaxStates + 3 + 3 + 6) * E + 3 * HD + S_need() +
                              nu * (size_t) (2 * g.n_ff_exp + g.n_ff_exp + g.n_embd) + (size_t) g.n_vocab) +
                nu * E * 2 + ((size_t) 64 << 20);
     }
@@ -502,7 +519,7 @@ struct Model::Impl {
                gp.alloc(gp.gate, HD, err) && gp.alloc(gp.rel, (size_t) g.n_head * g.d_rel, err) &&
                gp.alloc(gp.sink, (size_t) g.n_head, err) && gp.alloc(gp.ky, kvd, err) && gp.alloc(gp.vy, kvd, err) &&
                gp.alloc(gp.dk, (size_t) 4 * g.n_head_kv, err) && gp.alloc(gp.dv, (size_t) 4 * g.n_head_kv, err) &&
-               gp.alloc(gp.S, std::max((size_t) g.n_head * (2 * max_keys + 256), k::attention_split_floats(g.n_head, g.head_dim, (int64_t) max_keys)), err) && gp.alloc(gp.ao, HD, err) &&
+               gp.alloc(gp.S, gp.S_floats = S_need(), err) && gp.alloc(gp.ao, HD, err) &&
                gp.alloc(gp.o, E, err) && gp.alloc(gp.xf, E, err) && gp.alloc(gp.rl, (size_t) g.n_expert, err) &&
                gp.alloc(gp.rw, 16, err) && gp.alloc(gp.wres, 16, err) && gp.alloc(gp.ids, 16, err) &&
                gp.alloc(gp.gu, nu * 2 * ff, err) && gp.alloc(gp.eh, nu * ff, err) && gp.alloc(gp.part, nu * E, err) &&
@@ -1314,6 +1331,14 @@ struct Model::Impl {
     unsigned seq = 0;
     int64_t job_p = 0;
     int job_slot = -1;
+    int job_T = 1;                  // (1: a token's step; more: a window's rows)
+    const int* job_ids = nullptr;
+    float* job_rows = nullptr;      // (a window's logits out, [T][vocab], or null)
+    int win_tops[16];
+    int64_t win_p0 = -1;            // the last window's first position and rows (keep cuts back to them); -1: none
+    int win_T = 0;
+    static constexpr int kWin = 9;
+    float *h_xw = nullptr, *h_wtop = nullptr, *h_wlog = nullptr;
     float* job_logits = nullptr;
     unsigned *f_pub = nullptr, *f_cpu = nullptr, *f_hand = nullptr;   // (mapped host memory: a line a flag)
     static constexpr int kLine = 16;
@@ -1343,12 +1368,13 @@ struct Model::Impl {
         std::memset(f_hand, 0, sizeof(unsigned) * kLine * G.size());
         for (Layer& l : L) {
             CK(cudaSetDevice(G[(size_t) l.gpu].dev));
-            CK(cudaHostAlloc((void**) &l.m_pub, sizeof(float) * (E + 16), fl));
-            CK(cudaHostAlloc((void**) &l.m_cpu, sizeof(float) * E, fl));
+            CK(cudaHostAlloc((void**) &l.m_pub, sizeof(float) * (E + 16) * kWin, fl));
+            CK(cudaHostAlloc((void**) &l.m_cpu, sizeof(float) * E * kWin, fl));
         }
         for (Gpu& gp : G) {
             CK(cudaSetDevice(gp.dev));
-            CK(cudaHostAlloc((void**) &gp.m_hand, sizeof(float) * (1 + k::kMaxStates) * E, fl));
+            CK(cudaHostAlloc((void**) &gp.m_hand, sizeof(float) * (1 + k::kMaxStates) * E * kWin, fl));
+            if (!win_scratch(gp, err)) return false;
             if (!gp.alloc(gp.pub, E + 16, err) || !zeros(gp, gp.cnt, 4, err)) return false;
         }
         if (phases)
@@ -1356,6 +1382,9 @@ struct Model::Impl {
                 CK(cudaSetDevice(G[(size_t) l.gpu].dev));
                 for (cudaEvent_t& e : l.pe) CK(cudaEventCreate(&e));
             }
+        CK(cudaMallocHost((void**) &h_xw, sizeof(float) * kWin * E));
+        CK(cudaMallocHost((void**) &h_wtop, sizeof(float) * 2 * kWin));
+        CK(cudaMallocHost((void**) &h_wlog, sizeof(float) * kWin * (size_t) g.n_vocab));
         workers.resize(G.size());
         for (size_t gi = 0; gi < G.size(); ++gi) workers[gi].th = std::thread([this, gi] { worker_run(gi); });
         lane_th = std::thread([this] { lane_run(); });
@@ -1403,23 +1432,29 @@ struct Model::Impl {
                     const double t0 = now_s();
                     lane_wait_s += t0 - tw;
                     const float* x = l.m_pub;
-                    int32_t ids[16];
-                    float w[16];
-                    std::memcpy(ids, x + E, sizeof(int32_t) * (size_t) nu);
-                    std::memcpy(w, x + E + nu, sizeof(float) * (size_t) nu);
-                    ent.clear();
+                    const int Tn = job_T;   // (a token, or a window's rows: [T][E] inputs, [T][nu] picks, [T][nu] weights)
                     uint32_t* cnt = prof_cnt.data() + (size_t) il * g.n_expert;
-                    for (int j = 0; j < nu; ++j) {
-                        const int e = ids[j];
-                        if (e < 0 || e >= g.n_expert) continue;
-                        ++cnt[e];
-                        l.use[(size_t) e] += 1.0f;
-                        if (l.slot_of[(size_t) e] < 0) ent.push_back({l.ram_of[(size_t) e], w[j]});
+                    size_t n_ent = 0;
+                    for (int t = 0; t < Tn; ++t) {
+                        int32_t ids[16];
+                        float w[16];
+                        std::memcpy(ids, x + (size_t) Tn * E + (size_t) t * nu, sizeof(int32_t) * (size_t) nu);
+                        std::memcpy(w, x + (size_t) Tn * E + (size_t) (Tn + t) * nu, sizeof(float) * (size_t) nu);
+                        ent.clear();
+                        for (int j = 0; j < nu; ++j) {
+                            const int e = ids[j];
+                            if (e < 0 || e >= g.n_expert) continue;
+                            ++cnt[e];
+                            l.use[(size_t) e] += 1.0f;
+                            if (l.slot_of[(size_t) e] < 0) ent.push_back({l.ram_of[(size_t) e], w[j]});
+                        }
+                        if (ent.empty()) std::memset(l.m_cpu + (size_t) t * E, 0, sizeof(float) * (size_t) E);
+                        else cpu_experts(*lane, l.cex, ent, x + (size_t) t * E, l.m_cpu + (size_t) t * E);
+                        n_ent += ent.size();
                     }
-                    if (ent.empty()) std::memset(l.m_cpu, 0, sizeof(float) * (size_t) E);
-                    else cpu_experts(*lane, l.cex, ent, x, l.m_cpu);
-                    st.cpu_experts += (int64_t) ent.size();
-                    st.experts += nu;
+                    ent.resize(n_ent);   // (below: only whether there were any)
+                    st.cpu_experts += (int64_t) n_ent;
+                    st.experts += nu * Tn;
                     __atomic_store_n(f_cpu + (size_t) il * kLine, v, __ATOMIC_SEQ_CST);
                     const double t1 = now_s();
                     lane_work_s += t1 - t0;
@@ -1562,7 +1597,7 @@ struct Model::Impl {
             }
             const double t0 = now_s();
             std::string e;
-            const bool ok = enqueue_fast(gi, e);
+            const bool ok = job_T > 1 ? enqueue_win(gi, e) : enqueue_fast(gi, e);
             {
                 std::lock_guard<std::mutex> lk(w.mu);
                 w.ok = ok;
@@ -1591,6 +1626,13 @@ struct Model::Impl {
         snap_next = false;
         job_p = p;
         job_logits = logits_out;
+        job_T = 1;
+        win_p0 = -1;
+        return fast_run(t0, err);
+    }
+    // a token's (or a window's) layers queued on every GPU by its worker, the lane's thread told; back when the last
+    // GPU is done
+    bool fast_run(double t0, std::string& err) {
         ++seq;
         lane_abort = false;
         lane_seq.store(seq, std::memory_order_release);
@@ -1634,7 +1676,277 @@ struct Model::Impl {
                 }
             }
         CK(cudaSetDevice(G.back().dev));
-        ++st.tokens;
+        st.tokens += job_T;
+        return true;
+    }
+
+    // ---- the verify window: T (<= kWin) tokens a host-free step ----------------------------------------------------
+    // The decode step's layers over T rows: the GEMVs take T columns (the weights read once), the attention runs a row
+    // at a time on the decode step's own kernels (row t sees the cache and the window's rows up to itself), the
+    // routed experts are grouped over the window (ds4_iq's grouped form: each expert once over its rows, a row's sum
+    // as the token step's), the lane gets T rows.  Each stream's conv inputs stay in the layer (win_in) with the
+    // histories as they were before the window (win_h0): keep() rebuilds the histories of any shorter prefix.
+    bool win_scratch(Gpu& gp, std::string& err) {
+        const size_t W = kWin, E = (size_t) g.n_embd, HD = (size_t) g.n_head * g.head_dim, nu = (size_t) g.n_used;
+        const size_t kvd = (size_t) g.n_head_kv * g.head_dim, ff = (size_t) g.n_ff_exp, H = (size_t) g.n_head;
+        const size_t qmax = std::max(E, HD);
+        for (int il = gp.l0; il < gp.l1; ++il) {
+            Layer& l = L[(size_t) il];
+            if (!gp.alloc(l.win_in, W * (2 * kvd + 2 * E), err) || !gp.alloc(l.win_h0, 3 * (2 * kvd + 2 * E), err)) return false;
+        }
+        const bool last = &gp == &G.back();
+        return gp.alloc(gp.w_cb, (1 + k::kMaxStates) * W * E, err) && gp.alloc(gp.w_mixo, 3 * W * E, err) &&
+               gp.alloc(gp.w_xn, 3 * W * E, err) && gp.alloc(gp.w_stat, 4 * k::kMaxStates * W, err) &&
+               gp.alloc(gp.w_q, W * HD, err) && gp.alloc(gp.w_gate, W * HD, err) && gp.alloc(gp.w_ao, W * HD, err) &&
+               gp.alloc(gp.w_rel, W * H * g.d_rel, err) && gp.alloc(gp.w_sink, W * H, err) &&
+               gp.alloc(gp.w_kc, W * kvd, err) && gp.alloc(gp.w_vc, W * kvd, err) && gp.alloc(gp.w_dk, W * 32, err) &&
+               gp.alloc(gp.w_dv, W * 32, err) && gp.alloc(gp.w_oc, W * E, err) && gp.alloc(gp.w_xf, W * E, err) &&
+               gp.alloc(gp.w_rl, W * (size_t) g.n_expert, err) && gp.alloc(gp.w_rw, W * 16, err) &&
+               gp.alloc(gp.w_ids, W * 16, err) && gp.alloc(gp.w_yc, W * E, err) && gp.alloc(gp.w_xq, W * qmax, err) &&
+               gp.alloc(gp.w_xd, W * qmax / 32, err) && gp.alloc(gp.w_x2q, 2 * W * E, err) &&
+               gp.alloc(gp.w_x2d, 2 * W * E / 32, err) && gp.alloc(gp.w_eh, 16 * W * ff, err) &&
+               gp.alloc(gp.w_ehq, 16 * W * ff, err) && gp.alloc(gp.w_ehd, 16 * W * ff / 32, err) &&
+               gp.alloc(gp.w_part, 16 * W * E, err) && gp.alloc(gp.w_gptr, (size_t) g.n_expert + 16, err) &&
+               gp.alloc(gp.w_gstart, (size_t) g.n_expert + 16, err) && gp.alloc(gp.w_gent, 16 * W + 16, err) &&
+               gp.alloc(gp.w_ng, 16, err) && gp.alloc(gp.w_pub, W * (E + 16), err) && gp.alloc(gp.w_top, 2 * W, err) &&
+               (!last || gp.alloc(gp.w_logits, W * (size_t) g.n_vocab, err));
+    }
+    bool mmw(Gpu& gp, const Mat& M, const float* x, int T, float* y) {
+        if (M.type == kF32) {
+            hk::gemv_f32w((const float*) M.w, (size_t) M.k, M.k, M.n, x, (size_t) M.k, T, y, (size_t) M.n, 1.0f, gp.s);
+            return true;
+        }
+        return mmw_multi(gp, {{&M, y}}, x, T);
+    }
+    bool mmw_multi(Gpu& gp, std::initializer_list<Out> outs, const float* x, int T) {
+        const int kk = outs.begin()->m->k;
+        hk::q8_rows(x, (size_t) kk, T, kk, gp.w_xq, gp.w_xd, gp.s);
+        iq::MvJob jobs[8];
+        int n = 0;
+        for (const Out& o2 : outs) {
+            if (o2.m->type == kF32 || o2.m->k != kk || n >= 8) return false;
+            iq::MvJob& j = jobs[n++];
+            j.w = o2.m->w;
+            j.ld = o2.m->ld;
+            j.type = o2.m->type;
+            j.k = kk;
+            j.n = o2.m->n;
+            j.ncol = T;
+            j.xq = gp.w_xq;
+            j.xd = gp.w_xd;
+            j.y = o2.y;
+            j.ycs = (size_t) o2.m->n;
+        }
+        return iq::mv(jobs, n, gp.s);
+    }
+    bool layer_win(Layer& l, Gpu& gp, int T, int64_t p0, int& nb, unsigned v, std::string& err) {
+        const int E = g.n_embd, H = g.n_head, Hkv = g.n_head_kv, D = g.head_dim, HD = H * D, kvd = Hkv * D, ff = g.n_ff_exp;
+        const int nu = g.n_used;
+        const size_t TE = (size_t) T * E, ldb = (size_t) kWin * E;
+        cudaStream_t s = gp.s;
+        float *cur = gp.w_cb, *blocks = gp.w_cb + ldb;
+        float *in_k = l.win_in, *in_v = in_k + (size_t) kWin * kvd, *in_a = in_v + (size_t) kWin * kvd, *in_f = in_a + ldb;
+        float *h0_k = l.win_h0, *h0_v = h0_k + 3 * (size_t) kvd, *h0_a = h0_v + 3 * (size_t) kvd, *h0_f = h0_a + 3 * (size_t) E;
+        const float* src = cur;
+        const bool fused = l.il > 0;   // (as the token step: the mix and the norms in a launch, a block a row)
+        if (fused) k::mix_rms_rows(blocks, ldb, nb, cur, T, E, l.attn_res, l.swa ? 1 : 3, l.swa ? l.attn_norm : l.q_norm,
+                                   l.k_norm, l.v_norm, g.eps, gp.w_xn, s);
+        const float *xq = gp.w_xn, *xk = gp.w_xn, *xv = gp.w_xn;
+        bool ok = true;
+        if (l.swa) {
+            if (!fused) k::rms(src, (size_t) E, T, E, l.attn_norm, g.eps, gp.w_xn, (size_t) E, s);
+            ok = mmw_multi(gp, {{&l.q, gp.w_q}, {&l.gate, gp.w_gate}, {&l.rel, gp.w_rel}, {&l.wk, in_k}, {&l.wv, in_v}}, xq, T);
+        } else {
+            const size_t st1 = l.il > 0 ? TE : 0;
+            if (!fused) {
+                k::rms(src, (size_t) E, T, E, l.q_norm, g.eps, gp.w_xn, (size_t) E, s);
+                k::rms(src + st1, (size_t) E, T, E, l.k_norm, g.eps, gp.w_xn + TE, (size_t) E, s);
+                k::rms(src + 2 * st1, (size_t) E, T, E, l.v_norm, g.eps, gp.w_xn + 2 * TE, (size_t) E, s);
+            }
+            xk = gp.w_xn + TE;
+            xv = gp.w_xn + 2 * TE;
+            ok = mmw_multi(gp, {{&l.q, gp.w_q}, {&l.gate, gp.w_gate}, {&l.rel, gp.w_rel}}, xq, T) && mmw(gp, l.wk, xk, T, in_k) &&
+                 mmw(gp, l.wv, xv, T, in_v) && mmw(gp, l.k_proj, xk, T, gp.w_dk) && mmw(gp, l.v_proj, xv, T, gp.w_dv);
+        }
+        ok = ok && mmw(gp, l.sink, xq, T, gp.w_sink);
+        k::conv_rows_save(in_k, T, l.hist_k, l.k_conv, kvd, l.swa ? nullptr : gp.w_dk, Hkv, gp.w_kc, h0_k, s);
+        k::conv_rows_save(in_v, T, l.hist_v, l.v_conv, kvd, l.swa ? nullptr : gp.w_dv, Hkv, gp.w_vc, h0_v, s);
+        const float alpha = l.swa ? 0.0f : g.log_alpha;
+        k::head_clip_rows(gp.w_q, T, H, D, l.q_clip, g.qk_clip, alpha, g.log_floor, p0, s);
+        k::head_clip_rows(gp.w_kc, T, Hkv, D, nullptr, g.qk_clip, 0.0f, 1.0, p0, s);
+        k::rms(gp.w_vc, (size_t) D, T * Hkv, D, nullptr, g.eps, gp.w_vc, (size_t) D, s);
+        k::head_clip_rows(gp.w_rel, T, H, g.d_rel, l.rel_clip, g.rel_clip, alpha, g.log_floor, p0, s);
+        k::store_rows(gp.w_kc, T, kvd, l.K, l.ring, p0, s);
+        k::store_rows(gp.w_vc, T, kvd, l.V, l.ring, p0, s);
+        // the window's rows in one pair of launches (the K / V tiles read once); more keys than the scratch holds: a
+        // row at a time
+        const int64_t lo0 = l.swa ? std::max<int64_t>(0, p0 - (g.n_swa - 1)) : 0;
+        if (!k::attention_split_rows(gp.w_q, gp.w_rel, gp.w_sink, T, H, Hkv, D, g.d_rel, l.rel_bias,
+                                     l.swa ? g.n_swa : g.rel_extent, l.K, l.V, l.ring, p0, lo0, l.swa ? g.n_swa : 0,
+                                     1.0f / std::sqrt((float) D), gp.S, gp.S_floats, gp.w_gate, gp.w_ao, s))
+        for (int t = 0; t < T; ++t) {   // (row t: the keys up to its own position - the rows after it are not its)
+            const int64_t p = p0 + t, lo = l.swa ? std::max<int64_t>(0, p - (g.n_swa - 1)) : 0;
+            k::attention_split(gp.w_q + (size_t) t * HD, gp.w_rel + (size_t) t * H * g.d_rel, gp.w_sink + (size_t) t * H, H,
+                               Hkv, D, g.d_rel, l.rel_bias, l.swa ? g.n_swa : g.rel_extent, l.K, l.V, l.ring, p, lo,
+                               1.0f / std::sqrt((float) D), gp.S, gp.w_gate + (size_t) t * HD, gp.w_ao + (size_t) t * HD, s);
+        }
+        ok = ok && mmw(gp, l.wo, gp.w_ao, T, in_a);
+        k::conv_rows_save(in_a, T, l.hist_a, l.a_conv, E, nullptr, 1, gp.w_oc, h0_a, s);
+        if (l.il % g.res_block == 0) {
+            CK(cudaMemcpyAsync(blocks + (size_t) nb * ldb, cur, sizeof(float) * TE, cudaMemcpyDeviceToDevice, s));
+            CK(cudaMemcpyAsync(cur, gp.w_oc, sizeof(float) * TE, cudaMemcpyDeviceToDevice, s));
+            ++nb;
+        } else {
+            k::add(cur, gp.w_oc, TE, s);
+        }
+        k::mix_rms_rows(blocks, ldb, nb, cur, T, E, l.ffn_res, 1, l.ffn_norm, nullptr, nullptr, g.eps, gp.w_xf, s);
+        hk::gemv_f32w((const float*) l.router.w, (size_t) E, E, g.n_expert, gp.w_xf, (size_t) E, T, gp.w_rl, (size_t) g.n_expert,
+                      1.0f, s);
+        hk::router(gp.w_rl, T, g.n_expert, l.router_b, nu, true, g.w_scale, gp.w_ids, gp.w_rw, s);
+        hk::pack3(gp.w_xf, TE, gp.w_ids, (size_t) T * nu, gp.w_rw, (size_t) T * nu, gp.w_pub, s);
+        hk::publish(gp.w_pub, l.m_pub, TE + 2 * (size_t) T * nu, gp.cnt, f_pub + (size_t) l.il * kLine, v, s);
+        // the window's picks grouped by expert (the device's map: the RAM ones' weights zeroed, the lane's)
+        hk::q8_rows(gp.w_xf, (size_t) E, T, E, gp.w_xq, gp.w_xd, s);
+        hk::dup_rows_q8(gp.w_xq, gp.w_xd, T, E, gp.w_x2q, gp.w_x2d, s);
+        hk::group_experts(gp.w_ids, T, nu, g.n_expert, l.experts, l.blob, gp.w_gptr, gp.w_gstart, gp.w_gent, gp.w_ng, s,
+                          l.slot_d, gp.w_rw);
+        iq::Args a;
+        a.grp_ptr = gp.w_gptr;
+        a.grp_start = gp.w_gstart;
+        a.grp_ent = gp.w_gent;
+        a.n_groups = gp.w_ng;
+        a.tr[0] = l.tr[0];
+        a.tr[1] = l.tr[1];
+        a.tr[2] = l.tr[2];
+        a.n_embd = E;
+        a.n_ff = ff;
+        a.xq = gp.w_x2q;
+        a.xd = gp.w_x2d;
+        a.h = gp.w_eh;
+        a.part = gp.w_part;
+        a.tg = l.tg;
+        a.td = l.td;
+        a.act = iq::kActSitu;
+        a.situ_beta = g.situ_beta;
+        a.situ_lb = g.situ_lb;
+        const int groups = std::min(nu * T, g.n_expert);
+        ok = ok && iq::gate_up(a, groups, T, s);
+        hk::q8_rows(gp.w_eh, (size_t) ff, 16 * T, ff, gp.w_ehq, gp.w_ehd, s);
+        a.hq = gp.w_ehq;
+        a.hd = gp.w_ehd;
+        ok = ok && iq::down(a, groups, T, s);
+        hk::moe_sum(gp.w_part, T, nu, E, gp.w_rw, in_f, s);
+        k::lane_add_rows(f_cpu + (size_t) l.il * kLine, v, gp.w_ids, l.slot_d, nu, l.m_cpu, in_f, E, T, s);
+        k::conv_rows_save(in_f, T, l.hist_f, l.f_conv, E, nullptr, 1, gp.w_yc, h0_f, s);
+        k::add(cur, gp.w_yc, TE, s);
+        if (!ok) err = "layer " + std::to_string(l.il) + ": a window kernel did not take its shapes";
+        return ok;
+    }
+    bool enqueue_win(size_t gi, std::string& err) {
+        const size_t E = (size_t) g.n_embd, ldb = (size_t) kWin * E;
+        const int T = job_T;
+        Gpu& gp = G[gi];
+        const unsigned v = seq;
+        int nb = 0;
+        for (int il = 0; il < gp.l0; ++il) nb += il % g.res_block == 0;
+        if (job_slot >= 0 && !snap_copy(gp, job_slot, true, err)) return false;
+        if (gi == 0) {
+            CK(cudaMemcpyAsync(gp.w_oc, h_xw, sizeof(float) * T * E, cudaMemcpyHostToDevice, gp.s));
+            k::rms(gp.w_oc, E, T, (int) E, tok_norm, g.eps, gp.w_cb, E, gp.s);
+        } else {
+            hk::wait_pull(f_hand + gi * kLine, v, gp.w_cb, gp.m_hand, (size_t) (1 + nb) * ldb, gp.s);
+        }
+        for (int il = gp.l0; il < gp.l1; ++il)
+            if (!layer_win(L[(size_t) il], gp, T, job_p, nb, v, err)) return false;
+        if (gi + 1 < G.size()) {
+            hk::publish(gp.w_cb, G[gi + 1].m_hand, (size_t) (1 + nb) * ldb, gp.cnt, f_hand + (gi + 1) * kLine, v, gp.s);
+            return true;
+        }
+        // the head over the window's rows: each row's logits, its argmax
+        k::mix_rows(gp.w_cb + ldb, ldb, nb, gp.w_cb, T, (int) E, out_res, 1, 1e-6f, gp.w_stat, gp.w_mixo, gp.s);
+        k::rms(gp.w_mixo, E, T, (int) E, out_norm, g.eps, gp.w_xf, E, gp.s);
+        if (!mmw(gp, head, gp.w_xf, T, gp.w_logits)) {
+            err = "the output head's GEMV did not take its shapes";
+            return false;
+        }
+        if (g.softcap > 0.0f) k::softcap(gp.w_logits, (size_t) T * g.n_vocab, g.softcap, gp.s);
+        for (int t = 0; t < T; ++t)
+            k::argmax(gp.w_logits + (size_t) t * g.n_vocab, g.n_vocab_unpadded, gp.w_top + 2 * t, gp.s);
+        CK(cudaMemcpyAsync(h_wtop, gp.w_top, sizeof(float) * 2 * T, cudaMemcpyDeviceToHost, gp.s));
+        if (job_rows) CK(cudaMemcpyAsync(h_wlog, gp.w_logits, sizeof(float) * T * g.n_vocab, cudaMemcpyDeviceToHost, gp.s));
+        CK(cudaStreamSynchronize(gp.s));
+        for (int t = 0; t < T; ++t) {
+            win_tops[t] = (int) h_wtop[2 * t];
+            if (job_rows)
+                std::memcpy(job_rows + (size_t) t * g.n_vocab_unpadded, h_wlog + (size_t) t * g.n_vocab,
+                            sizeof(float) * (size_t) g.n_vocab_unpadded);
+        }
+        top_id = win_tops[T - 1];
+        if (k::errors() || hk::errors()) {
+            err = "a kernel launch failed";
+            return false;
+        }
+        return true;
+    }
+    bool step_win(const int* ids, int T, int64_t p0, int* tops, float* rows, std::string& err) {
+        const int E = g.n_embd;
+        const double t0 = now_s();
+        for (int t = 0; t < T; ++t) {
+            if (ids[t] < 0 || ids[t] >= g.n_vocab) {
+                err = "token " + std::to_string(ids[t]) + " is outside the vocabulary";
+                return false;
+            }
+            const uint8_t* row = tok_embd.data() + (size_t) ids[t] * tok_row;
+            float* dst = h_xw + (size_t) t * E;
+            if (tok_type == 13) dequantize_row_q5_K(row, dst, E);
+            else if (tok_type == 14) dequantize_row_q6_K(row, dst, E);
+            else std::memcpy(dst, row, (size_t) E * 4);
+        }
+        use_decay(std::pow(0.995f, (float) T));
+        if (!swap_poll(err)) return false;
+        hw = std::max(hw, p0 + T);
+        job_slot = snap_next || p0 / kSnapEvery != (p0 + T) / kSnapEvery || p0 % kSnapEvery == 0 ? snap_alloc(p0) : -1;
+        snap_next = false;
+        job_p = p0;
+        job_T = T;
+        job_ids = ids;
+        job_rows = rows;
+        job_logits = nullptr;
+        const bool ok = fast_run(t0, err);
+        job_T = 1;
+        if (!ok) return false;
+        for (int t = 0; t < T; ++t) tops[t] = win_tops[t];
+        win_p0 = p0;
+        win_T = T;
+        return true;
+    }
+    // the context cut back to the last window's first `rows` rows: each layer's histories from the window's inputs
+    bool win_keep(int rows, std::string& err) {
+        if (win_p0 < 0 || rows < 1 || rows > win_T || n_end != win_p0 + win_T) {
+            err = "keep: no window to cut back, or not " + std::to_string(rows) + " of its rows";
+            return false;
+        }
+        if (rows == win_T) return true;
+        const int kvd = g.n_head_kv * g.head_dim, E = g.n_embd;
+        const size_t ldb = (size_t) kWin * E;
+        for (Gpu& gp : G) {
+            CK(cudaSetDevice(gp.dev));
+            for (int il = gp.l0; il < gp.l1; ++il) {
+                Layer& l = L[(size_t) il];
+                float* hist[4] = {l.hist_k, l.hist_v, l.hist_a, l.hist_f};
+                const float* in[4] = {l.win_in, l.win_in + (size_t) kWin * kvd, l.win_in + 2 * (size_t) kWin * kvd,
+                                      l.win_in + 2 * (size_t) kWin * kvd + ldb};
+                const float* h0[4] = {l.win_h0, l.win_h0 + 3 * (size_t) kvd, l.win_h0 + 6 * (size_t) kvd,
+                                      l.win_h0 + 6 * (size_t) kvd + 3 * (size_t) E};
+                const int C[4] = {kvd, kvd, E, E};
+                k::hist_set4(hist, h0, in, C, rows, gp.s);
+            }
+            CK(cudaStreamSynchronize(gp.s));
+        }
+        n_end = win_p0 + rows;
+        win_T = rows;
+        for (int i = 0; i < kSnaps; ++i)
+            if (snap_pos[i] > n_end) snap_pos[i] = -1;
         return true;
     }
 
@@ -2394,6 +2706,7 @@ bool Model::forward(const int* ids, int n, int64_t pos0, float* logits_out, std:
         return false;
     }
     m->was_cancelled = false;
+    m->win_p0 = -1;
     if (m->Tc > 1 && n > 1) {   // (the prompt path)
         if (!m->prompt(ids, n, pos0, logits_out, err)) return false;
         if (!m->was_cancelled) m->n_end += n;
@@ -2439,6 +2752,25 @@ bool Model::save_profile(std::string& err) const {
 int Model::vocab() const { return m->g.n_vocab_unpadded; }
 int64_t Model::max_ctx() const { return m->o.max_ctx; }
 int Model::eos() const { return m->g.eos; }
+bool Model::window(const int* ids, int T, int64_t pos0, int* tops, float* logits_rows, std::string& err) {
+    if (T < 1 || T > window_max() || pos0 != m->n_end || pos0 + T > m->o.max_ctx) {
+        err = "window of " + std::to_string(T) + " at " + std::to_string(pos0) + ": the context ends at " +
+              std::to_string(m->n_end) + ", a window is 1 .. " + std::to_string(window_max()) + " rows";
+        return false;
+    }
+    if (T == 1) {   // (a token's step)
+        if (!m->step(ids[0], pos0, logits_rows, err)) return false;
+        tops[0] = m->top_id;
+        m->win_p0 = -1;
+        ++m->n_end;
+        return true;
+    }
+    if (!m->step_win(ids, T, pos0, tops, logits_rows, err)) return false;
+    m->n_end += T;
+    return true;
+}
+bool Model::keep(int rows, std::string& err) { return m->win_keep(rows, err); }
+int Model::window_max() const { return m->fast_ready && !m->tapf && !m->pick_hook ? Impl::kWin : 1; }
 int Model::layers() const { return m->NL; }
 int Model::chunk() const { return m->Tc; }
 void Model::set_chunk(int n) { m->run_chunk = n; }
