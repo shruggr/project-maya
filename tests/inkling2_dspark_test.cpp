@@ -8,7 +8,15 @@
 //
 //   inkling2-dspark-test --index <maya-inkling2-dspark-q8_0> --target-pack <maya-inkling2> --ref <dir>
 //                        [--variant q8_0] [--gpu 3] [--joint-index <maya-inkling2-dspark-bf16>] [--max-ctx 16384]
+//   --paths    then the other ways in, each against the straight host feed's drafts at the run's end: a rollback and
+//              the rows fed again, the taps fed from the device (feed_dev), a second drafter on the caller's copy of
+//              the target's output matrix (output_dev)
+//   --synth N  then a context of N positions (the run's taps repeated; --max-ctx above N): a block's time there, and
+//              a rollback of 100 positions fed again against the drafts before it
 #include "inkling2_dspark.hpp"
+#include "inkling2_pack.hpp"
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <chrono>
@@ -31,7 +39,8 @@ int main(int argc, char** argv) {
     o.profile = true;
     o.verbose = true;
     o.cum_min = 0.0f;
-    bool timing_only = false;
+    bool timing_only = false, paths = false;
+    long long synth = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -44,6 +53,9 @@ int main(int argc, char** argv) {
         else if (a == "--max-ctx") o.max_ctx = std::atoll(val().c_str());
         else if (a == "--no-profile") o.profile = false;
         else if (a == "--timing-only") timing_only = true;
+        else if (a == "--paths") paths = true;
+        else if (a == "--tile") o.attn_tile = std::atoi(val().c_str());
+        else if (a == "--synth") synth = std::atoll(val().c_str());
         else if (a == "--cum") o.cum_min = (float) std::atof(val().c_str());
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
@@ -204,5 +216,113 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 7; ++i) std::printf(" %lld/%lld", kept_o[i], reach_o[i]);
         std::printf("\n");
     }
-    return 0;
+    auto same = [](const std::vector<int>& a, const std::vector<float>& ap, const std::vector<int>& b,
+                   const std::vector<float>& bp) {
+        if (a != b || ap.size() != bp.size()) return false;
+        for (size_t i = 0; i < ap.size(); ++i)
+            if (ap[i] != bp[i]) return false;
+        return true;
+    };
+    int bad = 0;
+    if (paths) {
+        const int e = (int) d.end(), anchor = tok[(size_t) e];
+        std::vector<int> a0, b0;
+        std::vector<float> ap, bp;
+        if (!d.draft(anchor, 7, a0, ap, err)) return 1;
+        // a rollback, the rows fed again
+        d.rollback(e - 37);
+        if (!d.draft(tok[(size_t) (e - 37)], 7, b0, bp, err) || !d.feed(taps.data() + (size_t) (e - 37) * NT * E, 37, e - 37, err) ||
+            !d.draft(anchor, 7, b0, bp, err)) {
+            std::fprintf(stderr, "rollback: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("rollback of 37 positions, fed again: %s\n", same(a0, ap, b0, bp) ? "the same drafts and probabilities" : "DIFFERENT");
+        bad += !same(a0, ap, b0, bp);
+        // the taps from the device
+        {
+            cudaSetDevice(o.gpu);
+            void* dt = nullptr;
+            const size_t bytes = (size_t) e * NT * E * 4;
+            if (cudaMalloc(&dt, bytes) != cudaSuccess || cudaMemcpy(dt, taps.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                std::fprintf(stderr, "feed_dev: no device buffer\n");
+                return 1;
+            }
+            d.reset();
+            if (!d.feed_dev((const float*) dt, (size_t) NT * E, e, 0, err) || !d.draft(anchor, 7, b0, bp, err)) {
+                std::fprintf(stderr, "feed_dev: %s\n", err.c_str());
+                return 1;
+            }
+            cudaFree(dt);
+            std::printf("feed_dev of %d positions: %s\n", e, same(a0, ap, b0, bp) ? "the same drafts and probabilities" : "DIFFERENT");
+            bad += !same(a0, ap, b0, bp);
+        }
+        // a second drafter on the caller's output matrix
+        {
+            inkling2::Pack tp;
+            if (!tp.load(o.target_pack, err)) return 1;
+            const inkling2::Tensor* to = tp.get("output.weight");
+            void* dw = nullptr;
+            if (!to || cudaMalloc(&dw, to->bytes) != cudaSuccess ||
+                cudaMemcpy(dw, tp.data(*to), to->bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                std::fprintf(stderr, "output_dev: no output.weight on the device\n");
+                return 1;
+            }
+            inkling2::DsparkOptions o2 = o;
+            o2.verbose = false;
+            o2.output_dev = (const uint8_t*) dw;
+            o2.output_type = to->type == "Q6_K" ? 14 : 8;
+            o2.output_ld = (size_t) to->bytes / (size_t) to->n(1);
+            inkling2::Dspark d2;
+            if (!d2.load(o2, err) || !d2.feed(taps.data(), e, 0, err) || !d2.draft(anchor, 7, b0, bp, err)) {
+                std::fprintf(stderr, "output_dev: %s\n", err.c_str());
+                return 1;
+            }
+            std::printf("output_dev (%.2f GB without the copy): %s\n", d2.stats().vram_gb,
+                        same(a0, ap, b0, bp) ? "the same drafts and probabilities" : "DIFFERENT");
+            bad += !same(a0, ap, b0, bp);
+        }
+    }
+    if (synth > 0) {
+        d.reset();
+        const double tf = now_ms();
+        for (long long p = 0; p < synth;) {
+            const int r = (int) (p % n_all), n = (int) std::min<long long>(synth - p, n_all - r);
+            if (!d.feed(taps.data() + (size_t) r * NT * E, n, p, err)) {
+                std::fprintf(stderr, "synth feed: %s\n", err.c_str());
+                return 1;
+            }
+            p += n;
+        }
+        std::printf("synthetic context of %lld positions fed in %.0f ms\n", synth, now_ms() - tf);
+        const inkling2::DsparkStats s0 = d.stats();
+        std::vector<int> a0, b0;
+        std::vector<float> ap, bp;
+        const int anchor = tok[(size_t) (synth % n_all)];
+        for (int i = 0; i < 50; ++i)
+            if (!d.draft(anchor, 7, a0, ap, err)) {
+                std::fprintf(stderr, "synth draft: %s\n", err.c_str());
+                return 1;
+            }
+        const inkling2::DsparkStats& s1 = d.stats();
+        const double nb2 = (double) (s1.drafts - s0.drafts);
+        if (nb2 < 1 || a0.size() != 7) {
+            std::fprintf(stderr, "synth: no drafts at %lld (a --max-ctx above it?)\n", synth);
+            return 1;
+        }
+        std::printf("at %lld positions: a block %.2f ms (embed %.2f, layers %.2f - Q/K/V %.2f, attention %.2f, its output %.2f, FFN %.2f "
+                    "-, base logits %.2f, head %.2f)\n", synth, (s1.draft_ms - s0.draft_ms) / nb2, (s1.embed_ms - s0.embed_ms) / nb2,
+                    (s1.qkv_ms + s1.attn_ms + s1.o_ms + s1.ffn_ms - s0.qkv_ms - s0.attn_ms - s0.o_ms - s0.ffn_ms) / nb2,
+                    (s1.qkv_ms - s0.qkv_ms) / nb2, (s1.attn_ms - s0.attn_ms) / nb2, (s1.o_ms - s0.o_ms) / nb2,
+                    (s1.ffn_ms - s0.ffn_ms) / nb2, (s1.base_ms - s0.base_ms) / nb2, (s1.head_ms - s0.head_ms) / nb2);
+        d.rollback(synth - 100);
+        for (long long p = synth - 100; p < synth;) {
+            const int r = (int) (p % n_all), n = (int) std::min<long long>(synth - p, n_all - r);
+            if (!d.feed(taps.data() + (size_t) r * NT * E, n, p, err)) return 1;
+            p += n;
+        }
+        if (!d.draft(anchor, 7, b0, bp, err)) return 1;
+        std::printf("rollback of 100 positions at %lld, fed again: %s\n", synth, same(a0, ap, b0, bp) ? "the same drafts and probabilities" : "DIFFERENT");
+        bad += !same(a0, ap, b0, bp);
+    }
+    return bad ? 1 : 0;
 }

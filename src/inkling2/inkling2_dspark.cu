@@ -146,62 +146,107 @@ __global__ void half_to_float_kernel(const __half* __restrict__ x, int n, float*
 }
 
 // ---- the block's attention --------------------------------------------------------------------------------------------
-// block (h, t): the probabilities of query head h of row t over its keys - the nctx cached contexts at positions
-// lo .. lo + nctx - 1 (row slot p % ring, ring 0: p; F16 [slots][Hkv][D]), then the block's own T rows (kb F32
-// [T][Hkv][D]) - into S[(t H + h)][nctx + T] (rows lds apart).  A plain softmax of scale q . k.
-// (Written for clarity: every query head reads its kv head's keys again.  A variant that read a kv head's keys once
-//  for its 48 queries through shared-memory tiles measured slower on an R9700 - 4.1 against 2.5 ms a block at 2,700
-//  positions; the engine's attention_split / chunk GEMMs are the place to look when long contexts need it.)
-__global__ void attn_prob_kernel(const float* __restrict__ q, const float* __restrict__ kb, const __half* __restrict__ K,
-                                 int ring, long long lo, int nctx, int T, int H, int Hkv, int D, float scale,
-                                 float* __restrict__ S, size_t lds) {
-    __shared__ float sh[256];
-    __shared__ float qs[256];
-    const int h = blockIdx.x, t = blockIdx.y, g = h / (H / Hkv), nk = nctx + T;
-    const float* qr = q + ((size_t) t * H + h) * D;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) qs[i] = qr[i];
-    __syncthreads();
-    float* s = S + ((size_t) t * H + h) * lds;
-    float mx = -INFINITY;
-    for (int j = threadIdx.x; j < nk; j += blockDim.x) {
-        float d = 0.0f;
+// Every row of the block reads the same keys: the nctx cached contexts at positions lo .. lo + nctx - 1 (row slot
+// p % ring, ring 0: p; F16 [slots][Hkv][D]), then the block's own T rows (kb / vb F32 [T][Hkv][D]); nk = nctx + T.
+// Split over the keys, as the engine's k::attention_split: block (tile, kv head) = TK keys of one kv head for its
+// T * per queries (per = H / Hkv query heads a kv head, all T rows) - the keys read once into shared memory, each
+// query's scores, their softmax within the tile (st: its maximum and sum) and the tile's part of the output - then a
+// combine a query.  A plain softmax of scale q . k: no sink, no bias.
+constexpr int kMaxTiles = 4096, kPartAcc = 24;
+__global__ void attn_tile_kernel(const float* __restrict__ q, const float* __restrict__ kb, const float* __restrict__ vb,
+                                 const __half* __restrict__ K, const __half* __restrict__ V, int ring, long long base,
+                                 int nctx, int T, int H, int Hkv, int D, int TK, float scale, float* __restrict__ st,
+                                 float* __restrict__ part) {
+    extern __shared__ float sm[];   // [TK][D] keys, [NQ][TK] scores / weights, [NQ] maxima
+    const int g = blockIdx.y, tile = blockIdx.x, ntile = gridDim.x, j0 = tile * TK, per = H / Hkv, tid = threadIdx.x;
+    const int NQ = T * per, nk = nctx + T, n = min(TK, nk - j0);
+    float* sk = sm;
+    float* sw = sk + (size_t) TK * D;
+    float* smb = sw + (size_t) NQ * TK;
+    for (int i = tid; i < n * D; i += blockDim.x) {
+        const int j = j0 + i / D;
         if (j < nctx) {
-            const long long p = lo + j;
-            const __half* kr = K + ((size_t) (ring > 0 ? p % ring : p) * Hkv + g) * D;
-            for (int i = 0; i < D; ++i) d = fmaf(qs[i], __half2float(kr[i]), d);
-        } else {
-            const float* kr = kb + ((size_t) (j - nctx) * Hkv + g) * D;
-            for (int i = 0; i < D; ++i) d = fmaf(qs[i], kr[i], d);
-        }
-        d *= scale;
-        s[j] = d;
-        mx = fmaxf(mx, d);
+            long long sl = base + j;   // (wrapped once: no 64-bit modulo a value)
+            if (ring > 0 && sl >= ring) sl -= ring;
+            sk[i] = __half2float(K[((size_t) sl * Hkv + g) * D + i % D]);
+        } else
+            sk[i] = kb[((size_t) (j - nctx) * Hkv + g) * D + i % D];
     }
-    mx = block_max(mx, sh);
+    __syncthreads();
+    for (int e = tid; e < NQ * TK; e += blockDim.x) {
+        const int r = e / TK, jj = e % TK;
+        float a = -INFINITY;
+        if (jj < n) {
+            const float* qr = q + ((size_t) (r / per) * H + (size_t) g * per + r % per) * D;
+            const float* kr = sk + jj * D;
+            a = 0.0f;
+            for (int i = 0; i < D; ++i) a = fmaf(qr[i], kr[i], a);
+            a *= scale;
+        }
+        sw[e] = a;
+    }
+    __syncthreads();
+    if (tid < NQ) {
+        float m = -INFINITY;
+        for (int jj = 0; jj < n; ++jj) m = fmaxf(m, sw[tid * TK + jj]);
+        smb[tid] = m;
+    }
+    __syncthreads();
+    for (int e = tid; e < NQ * TK; e += blockDim.x) sw[e] = e % TK < n ? expf(sw[e] - smb[e / TK]) : 0.0f;
+    __syncthreads();
+    if (tid < NQ) {
+        float sum = 0.0f;
+        for (int jj = 0; jj < n; ++jj) sum += sw[tid * TK + jj];
+        float* o = st + (((size_t) (tid / per) * H + (size_t) g * per + tid % per) * ntile + tile) * 2;
+        o[0] = smb[tid];
+        o[1] = sum;
+    }
+    // the tile's part: thread (group, i) takes value i of its group's queries (the queries split over the groups)
+    const int ng = blockDim.x / D, grp = tid / D, i = tid % D;
+    if (grp < ng) {
+        const int qn = (NQ + ng - 1) / ng, r0 = grp * qn, r1 = min(NQ, r0 + qn);
+        float v[kPartAcc];
+#pragma unroll
+        for (int r = 0; r < kPartAcc; ++r) v[r] = 0.0f;
+        for (int jj = 0; jj < n; ++jj) {
+            const int j = j0 + jj;
+            float x;
+            if (j < nctx) {
+                long long sl = base + j;
+                if (ring > 0 && sl >= ring) sl -= ring;
+                x = __half2float(V[((size_t) sl * Hkv + g) * D + i]);
+            } else
+                x = vb[((size_t) (j - nctx) * Hkv + g) * D + i];
+#pragma unroll
+            for (int r = 0; r < kPartAcc; ++r)
+                if (r0 + r < r1) v[r] = fmaf(sw[(r0 + r) * TK + jj], x, v[r]);
+        }
+        for (int r = r0; r < r1; ++r)
+            part[(((size_t) (r / per) * H + (size_t) g * per + r % per) * ntile + tile) * D + i] = v[r - r0];
+    }
+}
+// block = a query (row t, head h): the tiles' parts under one maximum
+__global__ void attn_combine_kernel(const float* __restrict__ st, const float* __restrict__ part, int ntile, int D,
+                                    float* __restrict__ out) {
+    __shared__ float sh[256];
+    __shared__ float w[kMaxTiles];
+    const int qi = blockIdx.x, tid = threadIdx.x;
+    const float* sq = st + (size_t) qi * ntile * 2;
+    float m = -INFINITY;
+    for (int b = tid; b < ntile; b += blockDim.x) m = fmaxf(m, sq[2 * b]);
+    m = block_max(m, sh);
     float sum = 0.0f;
-    for (int j = threadIdx.x; j < nk; j += blockDim.x) {
-        const float e = expf(s[j] - mx);
-        s[j] = e;
-        sum += e;
+    for (int b = tid; b < ntile; b += blockDim.x) {
+        const float e = expf(sq[2 * b] - m);
+        w[b] = e;
+        sum += sq[2 * b + 1] * e;
     }
     sum = block_sum(sum, sh);
-    const float inv = 1.0f / sum;
-    for (int j = threadIdx.x; j < nk; j += blockDim.x) s[j] *= inv;
-}
-// block (h, t), D threads: out[t][h][i] = sum_j S[j] V_j[i]
-__global__ void attn_out_kernel(const float* __restrict__ S, size_t lds, const float* __restrict__ vb,
-                                const __half* __restrict__ V, int ring, long long lo, int nctx, int T, int H, int Hkv,
-                                int D, float* __restrict__ out) {
-    const int h = blockIdx.x, t = blockIdx.y, g = h / (H / Hkv), i = threadIdx.x;
-    if (i >= D) return;
-    const float* s = S + ((size_t) t * H + h) * lds;
-    float acc = 0.0f;
-    for (int j = 0; j < nctx; ++j) {
-        const long long p = lo + j;
-        acc = fmaf(s[j], __half2float(V[((size_t) (ring > 0 ? p % ring : p) * Hkv + g) * D + i]), acc);
-    }
-    for (int j = 0; j < T; ++j) acc = fmaf(s[nctx + j], vb[((size_t) j * Hkv + g) * D + i], acc);
-    out[((size_t) t * H + h) * D + i] = acc;
+    if (tid >= D) return;
+    const float* pq = part + (size_t) qi * ntile * D + tid;
+    float v = 0.0f;
+    for (int b = 0; b < ntile; ++b) v = fmaf(pq[(size_t) b * D], w[b], v);
+    out[(size_t) qi * D + tid] = v / sum;
 }
 
 // ---- the markov head ----------------------------------------------------------------------------------------------------
@@ -495,13 +540,13 @@ struct Dspark::Impl {
     int FR = 0;
     // scratch
     float *x = nullptr, *a = nullptr, *emb = nullptr, *qv = nullptr, *kv = nullptr, *vv = nullptr, *ao = nullptr,
-          *ob = nullptr, *gu = nullptr, *hh = nullptr, *S = nullptr, *hN = nullptr, *base = nullptr, *lg = nullptr,
+          *ob = nullptr, *gu = nullptr, *hh = nullptr, *ast = nullptr, *apart = nullptr, *hN = nullptr, *base = nullptr, *lg = nullptr,
           *z = nullptr, *state = nullptr, *ctx = nullptr, *prob = nullptr, *taps = nullptr,
           *fz = nullptr, *kc = nullptr, *vc = nullptr, *xd = nullptr;
     int8_t* xq = nullptr;
     int *tok = nullptr, *bidx = nullptr;
     float *bmax = nullptr, *bsum = nullptr, *x0 = nullptr, *cumd = nullptr;
-    size_t lds = 0;
+    int max_tiles = 0, tile = 16;
     // the anchor's embedding row
     const uint8_t* tok_embd = nullptr;
     size_t tok_row = 0;
@@ -681,7 +726,7 @@ struct Dspark::Impl {
         const Geo& tg = tp.g;
         if (NL < 1 || NL > 15 || NT != Dspark::kTaps || B != Dspark::kBlock || (int) swa.size() != NL || E != tg.n_embd ||
             Vp != tg.n_vocab || Vu != tg.n_vocab_unpadded || E % 32 || FF % 32 || (H * D) % 32 || (Hkv * D) % 32 ||
-            D > 256 || D % 2 || H % Hkv || R < 4 || R > 256 || R % 4 || n_swa < 1 || Vu > Vp || cap <= 0 ||
+            D > 128 || D % 2 || H % Hkv || (B * (H / Hkv) + 256 / D - 1) / (256 / D) > kPartAcc || R < 4 || R > 256 || R % 4 || n_swa < 1 || Vu > Vp || cap <= 0 ||
             targets.back() != tg.n_layer || (int) ix.num("target_n_layer") != tg.n_layer) {
             err = o.index + ": a drafter maya-inkling2 does not run with this target";
             return false;
@@ -788,12 +833,14 @@ struct Dspark::Impl {
             return false;
 
         // ---- scratch (before the head's tables: M's making borrows some)
-        lds = (size_t) o.max_ctx + (size_t) B;
+        tile = o.attn_tile >= 4 && o.attn_tile <= 64 ? o.attn_tile : 8;
+        max_tiles = (int) std::min<int64_t>(kMaxTiles, (o.max_ctx + B + tile - 1) / tile);
         const int qk = std::max(std::max(E, FF), HD);
         if (!alloc(x, (size_t) B * E, err) || !alloc(a, (size_t) B * E, err) || !alloc(emb, (size_t) E, err) ||
             !alloc(qv, (size_t) B * HD, err) || !alloc(kv, (size_t) B * KD, err) || !alloc(vv, (size_t) B * KD, err) ||
             !alloc(ao, (size_t) B * HD, err) || !alloc(ob, (size_t) B * E, err) || !alloc(gu, (size_t) 2 * B * FF, err) ||
-            !alloc(hh, (size_t) B * FF, err) || !alloc(S, (size_t) B * H * lds, err) || !alloc(hN, (size_t) B * E, err) ||
+            !alloc(hh, (size_t) B * FF, err) || !alloc(ast, (size_t) B * H * max_tiles * 2, err) ||
+            !alloc(apart, (size_t) B * H * max_tiles * D, err) || !alloc(hN, (size_t) B * E, err) ||
             !alloc(base, (size_t) (B - 1) * Vp, err) || !alloc(lg, (size_t) Vp, err) || !alloc(z, (size_t) 3 * R, err) ||
             !alloc(state, (size_t) R, err) || !alloc(ctx, (size_t) E, err) ||
             !alloc(prob, (size_t) B, err) || !alloc(tok, (size_t) B, err) ||
@@ -974,10 +1021,17 @@ struct Dspark::Impl {
             if (!phase(st.qkv_ms)) return false;
             const int64_t lo = l.swa ? lo_swa : 0;
             const int nctx = (int) (n - lo);
-            attn_prob_kernel<<<dim3((unsigned) H, (unsigned) B), 256, 0, s>>>(qv, kv, (const __half*) l.K, l.ring, (long long) lo,
-                                                                         nctx, B, H, Hkv, D, scale, S, lds);
-            attn_out_kernel<<<dim3((unsigned) H, (unsigned) B), (unsigned) D, 0, s>>>(S, lds, vv, (const __half*) l.V, l.ring,
-                                                                                (long long) lo, nctx, B, H, Hkv, D, ao);
+            // (attn_tile keys a tile; more only where a context needs more than kMaxTiles tiles)
+            const int nk = nctx + B;
+            int TK = tile;
+            while ((nk + TK - 1) / TK > max_tiles) TK *= 2;
+            const int ntile = (nk + TK - 1) / TK;
+            // (256 threads a tile: 512 / 1024 - a thread a (query, key) pair - measured slower on an R9700)
+            attn_tile_kernel<<<dim3((unsigned) ntile, (unsigned) Hkv), 256,
+                               ((size_t) TK * D + (size_t) B * (H / Hkv) * TK + (size_t) B * (H / Hkv)) * sizeof(float), s>>>(
+                qv, kv, vv, (const __half*) l.K, (const __half*) l.V, l.ring, (long long) (l.ring > 0 ? lo % l.ring : lo), nctx, B,
+                H, Hkv, D, TK, scale, ast, apart);
+            attn_combine_kernel<<<(unsigned) (B * H), 256, 0, s>>>(ast, apart, ntile, D, ao);
             check("attention");
             if (!phase(st.attn_ms)) return false;
             hk::q8_rows(ao, (size_t) HD, B, HD, xq, xd, s);
@@ -1002,30 +1056,15 @@ struct Dspark::Impl {
         if (!mv({job(out, xq, xd, max_n, base, (size_t) Vp)}, err)) return false;
         if (!phase(st.base_ms)) return false;
         // ---- the markov head, a step a draft: all on the device
-        static const bool hp = std::getenv("INK_DSPARK_HEADPROF") != nullptr;   // (a debugging aid: the head's kernels apart)
-        static double hpt[3] = {0, 0, 0};
-        static long hpn = 0;
-        auto hmark = [&](int w) {
-            if (!hp) return;
-            (void) cudaStreamSynchronize(s);
-            const double t = now_ms();
-            hpt[w] += t - tp0;
-            tp0 = t;
-        };
         for (int i = 1; i <= max_n; ++i) {
             joint_kernel<<<(unsigned) (3 * R), 256, 0, s>>>((const __half*) Wj, bj, state, (const __half*) w1, tok + (i - 1),
                                                         hN + (size_t) i * E, ctx, R, E, z, cumd, cum_min);
-            hmark(0);
             logits_kernel<<<blocks_of((size_t) Vu), 256, 0, s>>>(base + (size_t) (i - 1) * Vp, Mq, msc, m0, z, R, Vu, Vp, cap, lg,
                                                               bmax, bidx, bsum, cumd, cum_min);
-            hmark(1);
             pick_kernel<<<1, 1024, 0, s>>>(bmax, bidx, bsum, (int) blocks_of((size_t) Vu), tok + i, prob + i, z, R, state, cumd,
                                            cum_min);
-            hmark(2);
         }
         check("head");
-        if (hp && ++hpn % 100 == 0)
-            std::fprintf(stderr, "dspark head: joint %.3f, logits %.3f, pick %.3f ms a block\n", hpt[0] / hpn, hpt[1] / hpn, hpt[2] / hpn);
         int h_tok[Dspark::kBlock];
         float h_prob[Dspark::kBlock];
         CK(cudaMemcpyAsync(h_tok, tok, sizeof(int) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));

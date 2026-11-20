@@ -38,6 +38,9 @@ struct DsparkOptions {
     const uint8_t* output_dev = nullptr;
     int output_type = 0;
     size_t output_ld = 0;
+    int attn_tile = 8;         // keys a tile of the block's attention (4 .. 64).  An R9700 at 300 / 2.7K / 16K
+                               // positions: 8 keys 0.44 / 1.60 / 4.54 ms a block, 16 keys 0.57 / 2.25 / 6.02, 24 keys
+                               // 0.77 / 3.13 / 8.08; the scratch is 50 KB a tile (max_ctx / attn_tile tiles)
     bool profile = false;      // a synchronisation after each phase of draft(): Stats' split (slows a draft a little)
     bool verbose = false;
 };
