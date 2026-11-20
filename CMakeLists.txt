@@ -928,6 +928,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/inkling2_engine.cmake OPTIONAL)
       include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/inkling2_kernels.cmake OPTIONAL)
+      include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/inkling2_dspark.cmake OPTIONAL)
     endif()
     if(STRATA_BUILD_TESTS)
       # maya-mm3's EXL3 kernels against the scalar CPU reference (random matrices, no model): exl3_test's cases with
