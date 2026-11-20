@@ -294,25 +294,44 @@ __global__ void argmax_kernel(const float* __restrict__ x, int n, float* __restr
 // (a single block a kv head that also computed the scores measured twice the four launches' time).
 __global__ void attn_soft_out_kernel(float* __restrict__ S, int H, int Hkv, int D, const __half* __restrict__ V, int ring,
                                      long long lo, int nk, float* __restrict__ out) {
-    __shared__ float sh[1024];
+    __shared__ float vr[6144];   // [per][threads]: the heads' reductions side by side (a tree for all, not one a head)
     __shared__ float ps[6144];   // [per][segments][D]
-    const int g = blockIdx.x, per = H / Hkv, tid = threadIdx.x;
+    const int g = blockIdx.x, per = H / Hkv, tid = threadIdx.x, B = blockDim.x;
+    for (int r = 0; r < per; ++r) {
+        const float* sr = S + (size_t) (g * per + r) * nk;
+        float m = 0.0f;   // (the sink's logit)
+        for (int j = tid; j < nk; j += B) m = fmaxf(m, sr[j]);
+        vr[r * B + tid] = m;
+    }
+    __syncthreads();
+    for (int o = B / 2; o > 0; o >>= 1) {
+        if (tid < o)
+            for (int r = 0; r < per; ++r) vr[r * B + tid] = fmaxf(vr[r * B + tid], vr[r * B + tid + o]);
+        __syncthreads();
+    }
+    float mx[8];
+    for (int r = 0; r < per; ++r) mx[r] = vr[r * B];
+    __syncthreads();
     for (int r = 0; r < per; ++r) {
         float* sr = S + (size_t) (g * per + r) * nk;
-        float m = 0.0f;   // (the sink's logit)
-        for (int j = tid; j < nk; j += blockDim.x) m = fmaxf(m, sr[j]);
-        m = block_max(m, sh);
         float sum = 0.0f;
-        for (int j = tid; j < nk; j += blockDim.x) {
-            const float e = expf(sr[j] - m);
+        for (int j = tid; j < nk; j += B) {
+            const float e = expf(sr[j] - mx[r]);
             sr[j] = e;
             sum += e;
         }
-        sum = block_sum(sum, sh) + expf(-m);
-        const float inv = 1.0f / sum;
-        for (int j = tid; j < nk; j += blockDim.x) sr[j] *= inv;
+        vr[r * B + tid] = sum;
     }
     __syncthreads();
+    for (int o = B / 2; o > 0; o >>= 1) {
+        if (tid < o)
+            for (int r = 0; r < per; ++r) vr[r * B + tid] += vr[r * B + tid + o];
+        __syncthreads();
+    }
+    float inv[8];
+    for (int r = 0; r < per; ++r) inv[r] = 1.0f / (vr[r * B] + expf(-mx[r]));
+    __syncthreads();
+    // (the probabilities stay unnormalised in S: the output takes the factor)
     const int nseg = blockDim.x / D, seg = tid / D, i = tid % D, len = (nk + nseg - 1) / nseg;
     const size_t col = (size_t) g * D + i, row = (size_t) Hkv * D;
     float v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -322,7 +341,7 @@ __global__ void attn_soft_out_kernel(float* __restrict__ S, int H, int Hkv, int 
         const float x = __half2float(V[(size_t) (ring > 0 ? pos % ring : pos) * row + col]);
         for (int r = 0; r < per; ++r) v[r] += S[(size_t) (g * per + r) * nk + j] * x;
     }
-    for (int r = 0; r < per; ++r) ps[(r * nseg + seg) * D + i] = v[r];
+    for (int r = 0; r < per; ++r) ps[(r * nseg + seg) * D + i] = v[r] * inv[r];
     __syncthreads();
     if (seg == 0)
         for (int r = 0; r < per; ++r) {
@@ -646,7 +665,10 @@ void attention(const float* q, const float* rel, const float* sink, int H, int H
     else
         attn_score_kernel<<<blocks_of((size_t) H * nk), 256, 0, s>>>(q, rel, sink, H, Hkv, D, n_rel, rel_bias, extent,
                                                                       (const __half*) K, ring, (long long) p, (long long) lo, nk, scale, S);
-    if (per * 1024 <= 6144 && 1024 % D == 0 && nk <= 4096) {   // (the softmax and the output in a launch)
+    // (the softmax and the output in a launch while the keys are few: measured, 512 decoded tokens at a short context
+    //  34.8 tok/s against 32.5 - and 27.3 against 28.1 after a 2.7k prompt, where the window is full: the three
+    //  launches then, as before)
+    if (per * 1024 <= 6144 && 1024 % D == 0 && nk <= 640) {
         attn_soft_out_kernel<<<(unsigned) Hkv, 1024, 0, s>>>(S, H, Hkv, D, (const __half*) V, ring, (long long) lo, nk, out);
         check("attention");
         return;
