@@ -63,6 +63,7 @@ from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("m
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 #                                                          (hy4_vision.Vision is an mm3_vision.Vision)
 HY4_TEXT_ONLY = "Hy4-Flash with its pictures off"         # (no vision tower loaded: the errors' name for it)
+INKLING_TEXT_ONLY = "Inkling 2 Small on maya-inkling2"     # (text only: its engine has no vision tower yet)
 # (... and what stands for a picture in a tool result then: the agent's turn goes on)
 HY4_PICTURE_NOTE = "[a picture was here; pictures are off on this server, so it was not read]"
 
@@ -84,8 +85,8 @@ from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Even
                             EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
                             deepseek_images,
                             effort_kwargs,
-                            effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
-                            unmark_literals, LiteralMemo)
+                            effort_level, effort_name, inkling_marked, inkling_unmarked, literal_tags, mark_literals,
+                            media_of, openai_to_messages, unmark_literals, LiteralMemo)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
                              new_response, response_collect, response_events)
@@ -2607,7 +2608,12 @@ class Service:
                             # Hy4-flash with <｜hy_end:..｜> (and would start the next turn with <｜hy_start:..｜>)
                             (_special_ids("<｜hy_end%s｜>" % template.hy4_tag) +
                              _special_ids("<｜hy_start%s｜>" % template.hy4_tag)
-                             if getattr(template, "hy4", False) else []))
+                             if getattr(template, "hy4", False) else []) +
+                            # Inkling 2 with <|content_model_end_sampling|> (its EOS; llama.cpp's EOG with
+                            # <|endoftext|>) - and another role's message would start the next turn
+                            (_special_ids("<|content_model_end_sampling|>") + _special_ids("<|message_user|>") +
+                             _special_ids("<|message_system|>") + _special_ids("<|message_tool|>")
+                             if getattr(template, "inkling", False) else []))
         # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
         self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
         self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
@@ -2626,9 +2632,11 @@ class Service:
         self.think_budget_max = 0
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
         # (Hy4-flash with its suffixed </think:..>, which the pack's tokenizer names </think> in what the server reads)
+        # (Inkling 2 has no end-of-thinking token - <|end_message|> ends every block: no thinking budget yet)
         end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else \
             (_special_ids("</think%s>" % template.hy4_tag) or _special_ids("</think>")) \
-            if getattr(template, "hy4", False) else _special_ids("</think>")
+            if getattr(template, "hy4", False) else [] if getattr(template, "inkling", False) else \
+            _special_ids("</think>")
         self.think_end_id = end[0] if end else None
         # the tokens the engine itself ends a request at, whatever the server does (see THINK_RESTARTS): a pack
         # tokenizer that names its "eos" (DeepSeek's, MiniMax's: their engines' --eos default) ends there only; the
@@ -2989,6 +2997,8 @@ class Service:
         tpl = getattr(self, "template", None)
         if getattr(self, "vision", None) is None and getattr(tpl, "hy4", False):
             return HY4_TEXT_ONLY
+        if getattr(self, "vision", None) is None and getattr(tpl, "inkling", False):
+            return INKLING_TEXT_ONLY
         if getattr(self, "vision", None) is None and getattr(tpl, "glm_dsa", False) and not reads_images(tpl.source):
             return glm_dsa_product.LABEL
         return None
@@ -3734,12 +3744,19 @@ class Service:
             # Hy4-flash: GLM's form under its own suffixed tags, inside its <tool_calls:..> wrapper.  The prompt gets
             # the opening as its template writes it; the parser reads it in GLM's spelling, as it reads the answer
             given["_prefill"], prefill = CALL_START + (force or ""), self.template.hy4_call_open(force)
+        if prefill and getattr(self.template, "inkling", False):
+            # Inkling 2: a block of its own, headed by the tool's name, and the call's JSON up to the arguments (a call
+            # required with no name: the header alone - the model names the tool, or writes another block first).  The
+            # parser reads the opening as it reads the answer, its structural tokens as their marks
+            prefill = self.template.inkling_call_open(force)
+            given["_prefill"] = inkling_marked(prefill)
         given["_blocked"] = self._block_suffixes(blocked, tools, kwargs) if blocked and force is None else None
         if looping and tools and force is None and not loop_guard.answers_user(asked):   # (an answer to the user ends)
             keep = self._keep_suffix(tools, kwargs)
             if keep is not None:                     # (+ what the model said before: stops_short's `seen`)
                 given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep + (loop_guard.said_before(asked),)}
-        if getattr(self.template, "hy4", False) and getattr(self, "vision", None) is None:
+        if (getattr(self.template, "hy4", False) or getattr(self.template, "inkling", False)) and \
+                getattr(self, "vision", None) is None:
             messages = hy4_tool_pictures_noted(messages)   # (a tool result's picture: a text note, not a 400)
         ids = self._as_written(self.render_ids(messages, tools, kwargs, prefill))   # (Qwen3.x: the model's own ids)
         self.embeddings.path = None
@@ -3782,6 +3799,10 @@ class Service:
                 raise ValueError(f"{HY4_TEXT_ONLY} reads text only (Images on the Models page turns them on where "
                                  "the card has room for a picture beside the model), so it cannot read images or "
                                  "videos: send the request without them (describe the picture in text instead)")
+            if self.vision is None and getattr(self.template, "inkling", False):
+                # Inkling 2: its engine (maya-inkling2) reads text only - the vision tower (mmproj) is not ported yet
+                raise ValueError(f"{INKLING_TEXT_ONLY} reads text only, so it cannot read images or videos: send the "
+                                 "request without them (describe the picture in text instead)")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images or videos")
@@ -3883,7 +3904,8 @@ class Service:
     def chat_prompt(self, req: dict):
         """A chat request's template messages, tools and kwargs as prepare() gets them (the run config's thinking
         level included), for measuring its prompt without running it."""
-        messages, tools, kw = openai_to_messages(req, deepseek=getattr(self.template, "deepseek", False), glm_dsa=getattr(self.template, "glm_dsa", False))
+        messages, tools, kw = openai_to_messages(req, deepseek=getattr(self.template, "deepseek", False), glm_dsa=getattr(self.template, "glm_dsa", False),
+                inkling=getattr(self.template, "inkling", False))
         kw = {k: v for k, v in kw.items() if k != "_force_tool"}
         if req.get("strata_mcp") is True and self.mcp is not None:
             own = {t.get("name") for t in tools or []}
@@ -3917,6 +3939,8 @@ class Service:
         if not isinstance(ids, list) or not all(isinstance(t, int) and not isinstance(t, bool) and t >= 0 for t in ids):
             raise ValueError("detokenize needs tokens as a list of token ids")
         text = self.tok.decode(ids)
+        if getattr(self.template, "inkling", False):    # (Inkling 2's structural tokens by their text, not their marks)
+            text = inkling_unmarked(text)
         return {"content": text, "prompt": text}
 
     def count_tokens(self, req: dict) -> dict:
@@ -4178,6 +4202,8 @@ class Service:
             call_end = f"</{dsml_token}{tool_calls_block_name}>"
         elif getattr(self.template, "hy4", False):   # (Hy4-flash: the end of its wrapper, after the last call's own)
             call_end = "</tool_calls%s>" % self.template.hy4_tag
+        elif getattr(self.template, "inkling", False):   # (Inkling 2: the end of the call's block - the turn's last)
+            call_end = "<|end_message|>"
         out = {}
         for key, rep in blocked.items():
             call = {"id": "call_loop_guard", "type": "function",
@@ -4220,6 +4246,10 @@ class Service:
         # before a user message - DeepSeek with no tools opens the current thinking with <think> and the earlier one
         # without, so p is not a prefix of f there; f's own copy of the words is the same position in both.)
         tail = f[f.rindex(mark) + len(mark):]
+        if getattr(self.template, "inkling", False) and tail.startswith("<|end_message|>"):
+            # (Inkling 2: the model closes its own block before its turn's end - the token it stops at - so what
+            # follows its words starts after that <|end_message|>)
+            tail = tail[len("<|end_message|>"):]
         if not tail:
             return None
         return (self.tok.encode(tail, parse_special=True), self._opens_thinking(f))
@@ -4472,7 +4502,8 @@ class Service:
                                 token_only_end=getattr(self.template, "deepseek", False) and self.think_end_id is not None,
                                 minimax=getattr(self.template, "minimax", False),
                                 strict_tools=responses, single_tool=single_tool,
-                                unions=getattr(self.template, "glm_dsa", False))
+                                unions=getattr(self.template, "glm_dsa", False),
+                                inkling=getattr(self.template, "inkling", False))
         parser = new_parser()
         # calls the loop guard blocks in this answer (prepare, _block_suffixes): {(name, args): (ToolRepeat, ids)}.
         # While there are any, the answer's calls are held back (`pending`) until it ends; one that ends it alone
@@ -5899,7 +5930,8 @@ def make_handler(svc: Service):
             oreq = svc.with_shared(oreq, "openai")
             oreq["_api"] = "openai"
             svc.check_request(oreq)
-            messages, tools, kw = openai_to_messages(oreq, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
+            messages, tools, kw = openai_to_messages(oreq, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False),
+                    inkling=getattr(svc.template, "inkling", False))
             max_new = int(oreq.get("max_tokens") or 0)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(oreq))
             if kw.get("_prefill"):
@@ -6229,11 +6261,13 @@ def make_handler(svc: Service):
                         svc.default_effort) or svc.default_effort
                     if getattr(svc.template, "forced_thinking", False):
                         rec["reasoning_effort"] = QWEN_EFFORT.get(rec["reasoning_effort"], rec["reasoning_effort"])
-                    if getattr(svc.template, "hy4", False):   # (Hy4-flash: the level it runs at, none / high)
+                    if getattr(svc.template, "hy4", False) or getattr(svc.template, "inkling", False):
+                        # (Hy4-flash: the level it runs at, none / high; Inkling 2: its own six)
                         rec["reasoning_effort"] = svc.template.effort_shown(svc.default_effort) or \
                             rec["reasoning_effort"]
-                # Hy4-flash alone: its two levels (the page offers these and no others)
-                levels = svc.template.thinking_levels() if getattr(svc.template, "hy4", False) else None
+                # Hy4-flash: its two levels, Inkling 2 its six (the page offers these and no others)
+                levels = svc.template.thinking_levels() if getattr(svc.template, "hy4", False) or \
+                    getattr(svc.template, "inkling", False) else None
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
@@ -6754,7 +6788,8 @@ def make_handler(svc: Service):
         def _response_work(self, req, sampling, history, validation, owner, cancel, response_id=None, persist=True):
             sampling = dict(sampling)
             # Shared thinking defaults must be resolved by the same normalizer as request values.
-            messages, tools, kw = openai_to_messages(sampling, glm_dsa=getattr(svc.template, "glm_dsa", False))
+            messages, tools, kw = openai_to_messages(sampling, glm_dsa=getattr(svc.template, "glm_dsa", False),
+                    inkling=getattr(svc.template, "inkling", False))
             max_new = int(sampling.get("max_completion_tokens") or sampling.get("max_tokens") or 0)
             events = None
             svc.embeddings.path = None
@@ -6787,7 +6822,8 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "openai")
             req["_api"] = "web" if req.get("strata_resume") is True else "openai"   # the Monitor's request table
             svc.check_request(req)                             # a bad sampling field or logit_bias: a 400, now
-            messages, tools, kw = openai_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
+            messages, tools, kw = openai_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False),
+                    inkling=getattr(svc.template, "inkling", False))
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or []}
@@ -6896,7 +6932,8 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "anthropic")
             req["_api"] = "anthropic"
             svc.check_request(req)                             # a bad sampling field: a 400, now
-            messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
+            messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False),
+                    inkling=getattr(svc.template, "inkling", False))
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             if kw.get("_prefill"):                             # a required tool call starts the answer
@@ -7532,8 +7569,8 @@ def main() -> int:
                                                      else "none")
         if getattr(svc.template, "forced_thinking", False):   # (CYBER-FROST: Qwen's words, low / medium / xhigh)
             level = QWEN_EFFORT.get(level, level)
-        if getattr(svc.template, "hy4", False):               # (Hy4-flash: the level it runs at, none / high)
-            level = svc.template.effort_shown(svc.default_effort) or level
+        if getattr(svc.template, "hy4", False) or getattr(svc.template, "inkling", False):
+            level = svc.template.effort_shown(svc.default_effort) or level   # (Hy4: none / high; Inkling 2: its six)
         print(f"[maya] thinking level when a request names none: {level}"
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
               flush=True)

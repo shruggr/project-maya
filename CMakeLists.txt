@@ -922,6 +922,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         set_tests_properties(hy4_experts_test PROPERTIES TIMEOUT 300)
       endif()
     endif()
+    # Thinking Machines' Inkling 2 Small (a GGUF set, tools/inkling2/pack_gguf.py): its own engine (src/inkling2) on
+    # maya-ds4's ggml block-type kernels, built like maya-hy4 (docs/INKLING2_PORT.md). The engine's targets and the
+    # expert-activation tests each live in their own file.
+    if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+      include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/inkling2_engine.cmake OPTIONAL)
+      include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/inkling2_kernels.cmake OPTIONAL)
+    endif()
     if(STRATA_BUILD_TESTS)
       # maya-mm3's EXL3 kernels against the scalar CPU reference (random matrices, no model): exl3_test's cases with
       # swigluoai, the Volta / Turing tensor-core tiles and the FP16 GEMM path before sm_80

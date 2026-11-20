@@ -367,6 +367,7 @@ function fieldsOf(m, d) {
   if (m.family === "minimax") return mm3Fields(m, d, s, ch, images, gpus);
   if (m.family === "qwen") return qwenFields(m, d, s, ch, gpus);
   if (m.family === "hy4") return hy4Fields(m, d, s, ch, images, gpus);
+  if (m.family === "inkling2") return inklingFields(m, d, ch, gpus);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -588,6 +589,19 @@ function hy4Fields(m, d, s, ch, images, gpus) {
       html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The CPU lane's threads, which compute the experts VRAM does not hold. Empty: the engine picks."
         warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
         <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
+  ];
+}
+
+// Inkling 2 Small's (maya-inkling2: text only, one answer at a time, no drafting yet - its other flags stay as the config has
+// them).  Its cache's VRAM a context token: the 8 global layers keep every position, K and V of 8 heads x 128 in F16 (the
+// 40 sliding-window layers keep 1024 positions whatever the context)
+const INK_KV_BYTES = 32768;
+function inklingFields(m, d, ch, gpus) {
+  return [
+    {label: "Model", rows: [contextRow(m, d, ch, {vram: INK_KV_BYTES}),
+      html`<${Row} label="Images" hint="Inkling 2 Small's engine reads text only for now."/>`,
+      html`<${Row} label="Answers at once" hint="Inkling 2 Small answers one request at a time for now."/>`]},
+    {label: "GPUs and memory", rows: [gpus]},
   ];
 }
 

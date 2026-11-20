@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jinja2
+import regex
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from serve.response_schema import json_instruction, with_system_note
@@ -87,25 +88,51 @@ class ChatTemplate:
         hytk = re.search(r"set\s+HYTK\s*=\s*'([^']*)'", self.source)
         self.hy4 = bool(hytk) and "reasoning_mode" in self.source and "hy_start" in self.source
         self.hy4_tag = hytk.group(1) if hytk else ""
+        # Inkling 2 (Thinking Machines' template, the GGUF's): typed blocks <|message_ROLE|>[NAME]<|content_KIND|>...
+        # <|end_message|>, no generation prefix (the model opens its own turn with <|message_model|>), the thinking
+        # level as a system block ("Thinking effort level: 0.9", reasoning_effort by name or number), tool calls as
+        # canonical JSON ({"name":..,"args":..}).  Its answer is read through InklingRewriter (OutputParser(inkling)).
+        self.inkling = "<|message_model|>" in self.source and "<|content_invoke_tool_json|>" in self.source and \
+            "<|content_model_end_sampling|>" in self.source and not (self.hy4 or self.deepseek or self.minimax)
 
     def effort_shown(self, value) -> str | None:
         """Hy4-flash: a thinking level as given (a config's, a client's) -> the level this model really runs it at, in
         the server's words: "none", or "high" for every other level (render's rule) - what /health and the start's
-        line report.  None for another model's template, or a value that is no level."""
+        line report.  Inkling 2: its own level (none, low, medium, high, xhigh, max; auto: high, its default).  None for
+        another model's template, or a value that is no level."""
+        if self.inkling:
+            level = effort_level(value)
+            if level is None:
+                return None
+            if str(value).strip().lower() == "minimal":
+                return "minimal"
+            return "high" if level == AUTO else level if level == "none" else effort_name(value)
         level = effort_level(value) if self.hy4 else None
         if level is None:
             return None
         return "none" if level == "none" else "high"
 
     def thinking_levels(self) -> list | None:
-        """Hy4-flash: the two levels it is made for, in the server's words (none / high) - /health's
-        "thinking_levels".  None for every other model."""
-        return ["none", "high"] if self.hy4 else None
+        """Hy4-flash: the two levels it is made for, in the server's words (none / high); Inkling 2: its six (none,
+        low, medium, high, xhigh, max) - /health's "thinking_levels".  None for every other model."""
+        return ["none", "high"] if self.hy4 else list(INKLING_SHOWN) if self.inkling else None
 
     def opens_thinking(self, prompt: str) -> bool:
-        """Whether a rendered prompt ends in an open thinking block (Hy4-flash: its suffixed <think:..>)."""
+        """Whether a rendered prompt ends in an open thinking block (Hy4-flash: its suffixed <think:..>; Inkling 2: a
+        thinking block's header - which its template never ends with: the model opens its blocks itself)."""
         end = prompt.rstrip()
+        if self.inkling:
+            return end.endswith("<|message_model|><|content_thinking|>")
         return end.endswith("<think>") or (self.hy4 and end.endswith("<think%s>" % self.hy4_tag))
+
+    @staticmethod
+    def inkling_call_open(name: str = "") -> str:
+        """Inkling 2: a tool call's opening as its template writes one - the block's header, and with a name its JSON
+        up to the arguments' object - what a required call's prompt ends with (the model writes the rest)."""
+        if not name:
+            return "<|message_model|>"
+        return "<|message_model|>%s<|content_invoke_tool_json|>{\"name\":%s,\"args\":" % (
+            name, json.dumps(name, ensure_ascii=False))
 
     def hy4_call_open(self, name: str = "") -> str:
         """Hy4-flash: a tool call's opening as its template writes one (the wrapper, the call, the tool's name) - what
@@ -173,6 +200,22 @@ class ChatTemplate:
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
+        if self.inkling:
+            # Inkling 2's levels by its own names (INKLING_LEVELS: the client's medium / xhigh reach it through
+            # effort_name); thinking off is "none" (0.0); none named (auto) is the template's default, 0.9 (high).
+            # Its template reads tool['function']; a tool result is headed by its tool's name (inkling_messages).
+            off = kwargs.pop("enable_thinking", None) is False
+            level = kwargs.pop("reasoning_effort", None)
+            kwargs.pop("thinking_mode", None)
+            if off:                                      # (OpenAI's "minimal" is a level here: 0.1)
+                word = "minimal" if name == "minimal" else "none"
+            else:
+                word = name if name in INKLING_LEVELS else level if level in INKLING_LEVELS else None
+            if word is not None:
+                kwargs["reasoning_effort"] = word
+            tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
+            return self.template.render(messages=inkling_messages(messages), tools=tools,
+                                        add_generation_prompt=add_generation_prompt, **kwargs)
         off = False
         if self.glm_effort:
             off = kwargs.pop("enable_thinking", True) is False
@@ -223,6 +266,16 @@ def _text_of(content) -> str:
         return content
     return "".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") in
                    ("text", "input_text", None))
+
+
+def _text_parts(content, text: str):
+    """Inkling 2: a content of more than one text part as the list of them ({"type": "text", "text": ...} each, its
+    template's typed parts); anything else as `text` (its text, as _text_of reads it)."""
+    if isinstance(content, list):
+        parts = [p for p in content if isinstance(p, dict) and p.get("type") in ("text", "input_text", None)]
+        if len(parts) > 1 and len(parts) == len(content):
+            return [{"type": "text", "text": p.get("text", "")} for p in parts]
+    return text
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
@@ -276,7 +329,9 @@ def effort_kwargs(value) -> dict:
         raise ValueError(f"unknown reasoning effort {value!r}: use {EFFORT_WORDS}")
     level = EFFORT[key]
     if level is None:
-        return {"enable_thinking": False}
+        # (OpenAI's "minimal" is thinking off for every template but Inkling 2's, which has it as a level of its own:
+        #  its name rides along - render pops it first)
+        return {"enable_thinking": False, "effort_name": "minimal"} if key == "minimal" else {"enable_thinking": False}
     name = effort_name(value)
     return {"reasoning_effort": level} if name == level else {"reasoning_effort": level, "effort_name": name}
 
@@ -663,9 +718,10 @@ def _clear_thinking(req: dict) -> dict:
 
 
 def openai_to_messages(req: dict, deepseek: bool = False,
-                       glm_dsa: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
+                       glm_dsa: bool = False, inkling: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs).  glm_dsa (GLM-5.3's template,
-    ChatTemplate.glm_dsa): the tool call ids and clear_thinking go to the template too."""
+    ChatTemplate.glm_dsa): the tool call ids and clear_thinking go to the template too.  inkling (Inkling 2's,
+    ChatTemplate.inkling): a content of several text parts stays a list of them (its template writes a block each)."""
     if deepseek:
         from serve.ds41_encoding import _tool_name_for_encoding, tools_from_openai_format
         messages = copy.deepcopy(req.get("messages", []))
@@ -725,6 +781,8 @@ def openai_to_messages(req: dict, deepseek: bool = False,
         if role == "developer":
             role = "system"
         out = {"role": role, "content": _parts_of(m.get("content")) if role in ("user", "tool", "assistant") else _text_of(m.get("content"))}
+        if inkling and isinstance(out["content"], str):
+            out["content"] = _text_parts(m.get("content"), out["content"])
         if m.get("reasoning_content"):
             out["reasoning_content"] = m["reasoning_content"]
         if glm_dsa and role == "tool" and m.get("tool_call_id"):   # GLM-5.3 orders parallel results by id
@@ -769,13 +827,14 @@ def openai_to_messages(req: dict, deepseek: bool = False,
 
 
 def anthropic_to_messages(req: dict, deepseek: bool = False,
-                          glm_dsa: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
-    """Anthropic Messages -> (template messages, template tools, template kwargs).  glm_dsa: as openai_to_messages."""
+                          glm_dsa: bool = False, inkling: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
+    """Anthropic Messages -> (template messages, template tools, template kwargs).  glm_dsa, inkling: as
+    openai_to_messages (Inkling 2: a message's text blocks, and a system prompt's, stay a list of text parts)."""
     messages = []
     system = req.get("system")
     if system:
         text = "\n\n".join(_text_of([part]) for part in system) if deepseek and isinstance(system, list) else _text_of(system)
-        messages.append({"role": "system", "content": text})
+        messages.append({"role": "system", "content": _text_parts(system, text) if inkling else text})
     for m in req.get("messages", []):
         content = m.get("content")
         if isinstance(content, str):
@@ -810,6 +869,8 @@ def anthropic_to_messages(req: dict, deepseek: bool = False,
                     messages[-1]["tool_call_id"] = block["tool_use_id"]
         if text or calls or reasoning:
             out = {"role": m["role"], "content": ("\n\n" if deepseek else "").join(text)}
+            if inkling and len(text) > 1:
+                out["content"] = [{"type": "text", "text": x} for x in text]
             if reasoning:
                 out["reasoning_content"] = "".join(reasoning)
             if calls:
@@ -1305,14 +1366,317 @@ class MinimaxRewriter:
         return {n: v for n, v in items}
 
 
+# Inkling 2's structural tokens as the server reads them: one private-use character each (the pack tokenizer's aliases -
+# KEEP IN STEP: tools/strata_tokenizer.py INKLING2_MARKS), so the text of a token written by the model out of ordinary
+# pieces ("<|end_message|>" quoted in an answer) stays text
+INKLING_MARKS = {"<|message_model|>": "\U0010fff0", "<|content_thinking|>": "\U0010fff1",
+                 "<|content_text|>": "\U0010fff2", "<|content_invoke_tool_json|>": "\U0010fff3",
+                 "<|content_invoke_tool_text|>": "\U0010fff4", "<|end_message|>": "\U0010fff5",
+                 "<|content_tool_error|>": "\U0010fff6"}
+INK_HEAD, INK_THINK, INK_TEXT, INK_CALL, INK_CALL_TEXT, INK_END, INK_ERROR = INKLING_MARKS.values()
+INK_MARKS = frozenset(INKLING_MARKS.values())
+# Inkling 2's levels (its template's effort_map: none 0.0, minimal 0.1, low 0.2, medium 0.7, high 0.9 - its default -,
+# xhigh and max 0.99), by the server's names for them (effort_kwargs: medium / xhigh through effort_name)
+INKLING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+INKLING_SHOWN = ["none", "low", "medium", "high", "xhigh", "max"]   # (the page's: "minimal" is Off in the server's words)
+# (the template's call: {"name":NAME,"args":{...}} - read with partial matches, so a prefix still arriving waits)
+_INK_PREFIX = regex.compile(r'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"args"\s*:\s*\{')
+_INK_KEY = regex.compile(r'"((?:[^"\\]|\\.)*)"\s*:')
+
+
+def inkling_messages(messages: list[dict]) -> list[dict]:
+    """Inkling 2's template heads a tool result with its tool's name (message.name, or the call its tool_call_id
+    answers - the server's messages carry neither): each tool result without one gets the name of the call it answers
+    by its place - the k-th result after an assistant turn answers its k-th call (OpenAI's and Anthropic's order).
+    The messages are not changed; new ones where a name is added."""
+    out, calls, k = [], [], 0
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant":
+            calls, k = [c for c in m.get("tool_calls") or [] if isinstance(c, dict)], 0
+        elif role == "tool":
+            if not m.get("name") and not m.get("tool_call_id") and k < len(calls):
+                fn = calls[k].get("function") if isinstance(calls[k].get("function"), dict) else {}
+                if isinstance(fn.get("name"), str) and fn["name"]:
+                    m = {**m, "name": fn["name"]}
+            k += 1
+        else:
+            calls, k = [], 0
+        out.append(m)
+    return out
+
+
+def inkling_marked(text: str) -> str:
+    """`text` with Inkling 2's structural tokens' literals as the server reads those tokens (INKLING_MARKS) - a prompt
+    suffix the parser is fed as the model's own words (a required call's opening)."""
+    for literal, mark in INKLING_MARKS.items():
+        text = text.replace(literal, mark)
+    return text
+
+
+def inkling_unmarked(text: str) -> str:
+    """inkling_marked's inverse: the marks of Inkling 2's structural tokens as the tokens' text (/detokenize)."""
+    for literal, mark in INKLING_MARKS.items():
+        text = text.replace(mark, literal)
+    return text
+
+
+class InklingRewriter:
+    """Inkling 2's answer, a list of blocks - `H<|content_thinking|>...E`, `H<|content_text|>...E`,
+    `H NAME <|content_invoke_tool_json|>{"name":"NAME","args":{...}}E` (H = <|message_model|>, E = <|end_message|>, each
+    one mark: INKLING_MARKS) - taken apart as it streams into OutputParser's actions: ("reasoning", text),
+    ("content", text), ("call_open", name), ("call_body", GLM's call body: <arg_key>K</arg_key><arg_value>V</arg_value>
+    with V JSON), ("call_close",) and ("call_fail", the call's text as written).  A string argument streams as it is
+    written (its JSON as the model writes it, `<` as \\u003c), any other value whole at its end.  Text between blocks
+    is the answer's when it is more than whitespace (a model that writes no blocks still answers).  A header split
+    across deltas is held until its content mark arrives."""
+
+    def __init__(self):
+        self.state = "between"          # between | head | think | text | call | call_text
+        self.head = ""                  # the header's text (a tool's name) before its content mark
+        self.loose = ""                 # text between blocks (dropped when it is only whitespace)
+        self.name = ""
+        self.raw = ""                   # the call's text as written (call_fail, an unterminated call's content)
+        self.cs = "prefix"              # in a call: prefix -> key -> value -> key ... -> tail | whole
+        self.cbuf = ""                  # in a call: text not taken yet
+        self.opened = False             # in a call: call_open went out
+        self.bodied = False             # ... and some of its body
+        self.vstr = False               # the value being read is a string (streamed)
+        self.vtext = ""                 # ... a non-string value so far
+        self.depth = 0
+        self.inq = self.esc = False     # (a non-string value: inside one of its strings, after a backslash)
+
+    # ---------------------------------------------------------------- the block structure
+    def feed(self, text: str) -> list:
+        out = []
+        start = 0
+        for i, ch in enumerate(text):
+            if ch in INK_MARKS:
+                if i > start:
+                    self._text(text[start:i], out)
+                self._mark(ch, out)
+                start = i + 1
+        if start < len(text):
+            self._text(text[start:], out)
+        return out
+
+    def finish(self) -> list:
+        out = []
+        if self.state == "between" and self.loose.strip():
+            out.append(("content", self.loose))
+        self.loose = ""
+        return out
+
+    def _text(self, s: str, out: list):
+        st = self.state
+        if st == "think":
+            out.append(("reasoning", s))
+        elif st == "text":
+            out.append(("content", s))
+        elif st == "head":
+            self.head += s
+        elif st in ("call", "call_text"):
+            self.raw += s
+            if st == "call":
+                self._call(s, out)
+            else:
+                self.cbuf += s
+        else:
+            self.loose += s
+            if self.loose.strip():                       # (an answer outside any block)
+                out.append(("content", self.loose))
+                self.loose = ""
+
+    def _mark(self, m: str, out: list):
+        st = self.state
+        if m == INK_HEAD:
+            if st in ("call", "call_text"):              # (a new block before the call's end: the call is cut off)
+                self._end_call(out)
+            self.state, self.head, self.loose = "head", "", ""
+            return
+        if m == INK_END:
+            if st in ("call", "call_text"):
+                self._end_call(out)
+            self.state = "between"
+            return
+        if st == "head":
+            if m == INK_THINK:
+                self.state = "think"
+            elif m in (INK_TEXT, INK_ERROR):
+                self.state = "text"
+            else:                                        # a tool call, headed by its name
+                self.state, self.name, self.raw = ("call" if m == INK_CALL else "call_text"), self.head.strip(), ""
+                self.cs, self.cbuf, self.opened, self.bodied = ("prefix" if m == INK_CALL else "whole"), "", False, False
+                if self.name and m == INK_CALL:
+                    out.append(("call_open", self.name))
+                    self.opened = True
+            return
+        # a content mark outside a header: the block structure as the model went on (a second content token; in a
+        # call: the call is cut off there)
+        if st in ("call", "call_text"):
+            self._end_call(out)
+        if m == INK_THINK:
+            self.state = "think"
+        elif m in (INK_TEXT, INK_ERROR):
+            self.state = "text"
+
+    # ---------------------------------------------------------------- a call's JSON
+    @staticmethod
+    def _esc(s: str) -> str:
+        return s.replace("<", "\\u003c")
+
+    def _call(self, s: str, out: list):
+        self.cbuf += s
+        while self.cbuf:
+            if self.cs == "prefix":
+                m = _INK_PREFIX.match(self.cbuf, partial=True)
+                if m is None:                            # not the template's form: read whole at the call's end
+                    self.cs = "whole"
+                    return
+                if m.partial:                            # (not whole yet)
+                    return
+                if not self.opened:
+                    try:
+                        self.name = json.loads(m.group(1))
+                    except ValueError:
+                        self.cs = "whole"
+                        return
+                    out.append(("call_open", self.name))
+                    self.opened = True
+                self.cbuf, self.cs = self.cbuf[m.end():], "key"
+            elif self.cs == "key":
+                rest = self.cbuf.lstrip(" \t\r\n,")
+                if not rest:
+                    self.cbuf = ""
+                    return
+                if rest[0] == "}":
+                    self.cbuf, self.cs = rest[1:], "tail"
+                    continue
+                if rest[0] != '"':
+                    self.cs = "whole"
+                    return
+                m = _INK_KEY.match(rest, partial=True)
+                if m is None:
+                    self.cs = "whole"
+                    return
+                if m.partial:
+                    self.cbuf = rest                     # (the key, or its colon, still arriving)
+                    return
+                try:
+                    key = json.loads('"' + m.group(1) + '"')
+                except ValueError:
+                    self.cs = "whole"
+                    return
+                self.cbuf = rest[m.end():]
+                self.cs, self.vstr, self.vtext, self.depth, self.inq, self.esc = "value", None, "", 0, False, False
+                self._body(out, ARG_KEY + str(key) + ARG_KEY_END + ARG_VAL)
+            elif self.cs == "value":
+                if self.vstr is None:
+                    rest = self.cbuf.lstrip(" \t\r\n")
+                    if not rest:
+                        self.cbuf = ""
+                        return
+                    self.cbuf, self.vstr = rest, rest[0] == '"'
+                    if self.vstr:
+                        self.cbuf = rest[1:]
+                        self._body(out, '"')
+                if self.vstr:
+                    i, piece = 0, []
+                    while i < len(self.cbuf):
+                        c = self.cbuf[i]
+                        if self.esc:
+                            self.esc = False
+                        elif c == "\\":
+                            self.esc = True
+                        elif c == '"':
+                            break
+                        i += 1
+                    if i < len(self.cbuf):               # the closing quote
+                        self._body(out, self._esc(self.cbuf[:i]) + '"' + ARG_VAL_END)
+                        self.cbuf, self.cs = self.cbuf[i + 1:], "key"
+                        continue
+                    # all of it is the string's (a trailing backslash is held with the character it escapes)
+                    keep = 1 if self.esc else 0
+                    if len(self.cbuf) > keep:
+                        self._body(out, self._esc(self.cbuf[:len(self.cbuf) - keep]))
+                    self.cbuf, self.esc = self.cbuf[len(self.cbuf) - keep:], False
+                    return
+                i = 0
+                while i < len(self.cbuf):
+                    c = self.cbuf[i]
+                    if self.inq:
+                        if self.esc:
+                            self.esc = False
+                        elif c == "\\":
+                            self.esc = True
+                        elif c == '"':
+                            self.inq = False
+                    elif c == '"':
+                        self.inq = True
+                    elif c in "{[":
+                        self.depth += 1
+                    elif c in "}]" and self.depth > 0:
+                        self.depth -= 1
+                    elif c in ",}" and self.depth == 0:
+                        break
+                    i += 1
+                self.vtext += self.cbuf[:i]
+                if i == len(self.cbuf):
+                    self.cbuf = ""
+                    return
+                end, self.cbuf = self.cbuf[i], self.cbuf[i + 1:]
+                try:
+                    v = json.loads(self.vtext)
+                except ValueError:
+                    v = self.vtext.strip()
+                self._body(out, self._esc(json.dumps(v, ensure_ascii=False)) + ARG_VAL_END)
+                self.cs = "tail" if end == "}" else "key"
+            else:                                        # tail / whole: read at the call's end
+                return
+
+    def _body(self, out: list, s: str):
+        self.bodied = True
+        out.append(("call_body", s))
+
+    def _end_call(self, out: list):
+        """The call's <|end_message|>: complete when its JSON was read to its end, or - another form of the same JSON
+        (its keys in another order, <|content_invoke_tool_text|>'s call) - when it reads whole now and nothing of it
+        went out yet; else the call's text as written (call_fail)."""
+        if self.state == "call" and self.cs == "tail":
+            out.append(("call_close",))
+        elif (self.cs == "whole" or self.state == "call_text") and not self.bodied:
+            try:
+                obj = json.loads(self.raw)
+            except ValueError:
+                obj = None
+            args = obj.get("args", obj.get("arguments")) if isinstance(obj, dict) else None
+            name = self.name or (obj.get("name") if isinstance(obj, dict) else None)
+            if isinstance(args, dict) and isinstance(name, str) and name:
+                if not self.opened:
+                    out.append(("call_open", name))
+                body = "".join(ARG_KEY + str(k) + ARG_KEY_END + ARG_VAL + self._esc(json.dumps(v, ensure_ascii=False))
+                               + ARG_VAL_END for k, v in args.items())
+                if body:
+                    self._body(out, body)
+                out.append(("call_close",))
+            else:
+                out.append(("call_fail", self.raw))
+        else:
+            out.append(("call_fail", self.raw))
+        self.state, self.raw, self.cbuf, self.opened, self.bodied = "between", "", "", False, False
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
-                 token_only_end: bool = False, unions: bool = False):
-        self.state = "reasoning" if thinking else "content"
+                 token_only_end: bool = False, unions: bool = False, inkling: bool = False):
+        # Inkling 2 (InklingRewriter): its blocks say what is reasoning, answer and call - no text is searched for a tag
+        # (the answer opens no block in the prompt: the parser starts outside the reasoning, whatever `thinking` says)
+        self.inkling = InklingRewriter() if inkling else None
+        self.state = "reasoning" if thinking and not inkling else "content"
         # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
         # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
         # the server's own code, would have its reasoning cut there and spill into the answer).  The server closes it
@@ -1326,7 +1690,7 @@ class OutputParser:
         self.buf = ""
         self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False
-        self.schemas = {} if dsml or minimax else {t.get("name"): t for t in tools or []}
+        self.schemas = {} if dsml or minimax or inkling else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
@@ -1446,7 +1810,8 @@ class OutputParser:
                 if self.sdeclared.get(pname) == "string":
                     args('"')
                     self.ss, self.sval_started = "str", True     # GLM's values are written as they are
-                elif self.dsml is not None:   # DeepSeek's: a string="true" value arrives JSON-quoted, piece by piece
+                elif self.dsml is not None or self.inkling is not None:
+                    # DeepSeek's: a string="true" value arrives JSON-quoted, piece by piece (Inkling's: every string)
                     self.ss, self.sval_started = "jstr", False
                 else:
                     self.ss = "raw"
@@ -1573,9 +1938,51 @@ class OutputParser:
     def feed(self, delta: str) -> list[Event]:
         if self.finished:
             return []
+        if self.inkling is not None:
+            out = []
+            for act in self.inkling.feed(delta):
+                out += self._inkling_act(act)
+                if self.finished:
+                    break
+            return out
         if self.dsml is not None:
             delta = self.dsml.feed(delta)
         return self._feed(delta)
+
+    def _inkling_act(self, act: tuple) -> list[Event]:
+        """One of InklingRewriter's actions: reasoning and answer text go out as they are (no tag is looked for in
+        them); a call is read in GLM's form through the call state (_feed), as a DSML call is."""
+        kind = act[0]
+        if kind == "reasoning":
+            if self.state != "reasoning":
+                self.state = "reasoning"
+            return [Event("reasoning", act[1])] if act[1] else []
+        if kind == "content":
+            if self.state == "reasoning":
+                self.state = "content"
+                self.fence, self.line, self.ticks = "", "", 0
+            return [Event("content", self._track(act[1]))] if act[1] else []
+        if kind == "call_open":
+            self.state, self.buf, self._call_resume = "call", act[1], 0
+            self._reset_scan()
+            return self._feed("")
+        if kind == "call_body":
+            return self._feed(act[1]) if self.state == "call" else []
+        if kind == "call_close":
+            return self._feed(CALL_END) if self.state == "call" else []
+        # call_fail: as a call that does not parse - one already announced goes out marked incomplete, one that was
+        # not the answer's text as the model wrote it
+        raw = act[1]
+        self.malformed.append(raw)
+        out = []
+        if self.state == "call" and self.scall is not None:
+            out += self._close_scan()
+            out.append(Event("tool_call", call=self.scall, complete=False))
+        elif raw.strip():
+            out.append(Event("content", self._track(raw)))
+        self._reset_scan()
+        self.buf, self.state = "", "content"
+        return out
 
     def _feed(self, delta: str) -> list[Event]:
         if self.finished:
@@ -1711,6 +2118,15 @@ class OutputParser:
         if self.finished:
             return []
         out = self._feed(self.dsml.finish()) if self.dsml is not None else []
+        if self.inkling is not None:
+            for act in self.inkling.finish():
+                out += self._inkling_act(act)
+            if self.state == "call" and not (self.stream_tools and self.scall is not None) and not self.strict_tools:
+                # (the answer ended inside a call nobody was told of: its text as the model wrote it)
+                raw, self.buf = self.inkling.raw, ""
+                self.state = "content"
+                self._reset_scan()
+                return out + ([Event("content", self._track(raw))] if raw.strip() else [])
         if self.finished:
             return out
         if self.state == "call" and self.stream_tools and self.scall is not None:
