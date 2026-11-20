@@ -41,6 +41,15 @@ void attention(const float* q, const float* rel, const float* sink, int H, int H
                const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p, int64_t lo,
                float scale, float* S, float* out, cudaStream_t s);
 
+/// The same attention, split over the keys (flash decoding): a launch of key tiles - each block a tile of one kv head:
+/// its query heads' scores, their softmax within the tile, the tile's part of the output - sized to the key count
+/// (64 keys or 32k both fill the device), then a small combine, which also applies the output gate when `gate`
+/// [H][D] is given (out *= sigmoid(gate): the step's next launch folded in).  S: scratch of attention_split_floats.
+size_t attention_split_floats(int H, int D, int64_t max_keys);
+void attention_split(const float* q, const float* rel, const float* sink, int H, int Hkv, int D, int n_rel,
+                     const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p,
+                     int64_t lo, float scale, float* S, const float* gate, float* out, cudaStream_t s);
+
 /// x *= sigmoid(g), n values
 void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s);
 /// y += x

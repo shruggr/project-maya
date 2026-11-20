@@ -489,7 +489,7 @@ struct Model::Impl {
 
     size_t scratch_bytes() const {
         const size_t E = (size_t) g.n_embd, HD = (size_t) g.n_head * g.head_dim, nu = (size_t) g.n_used;
-        return (size_t) 4 * ((2 + k::kMaxStates + 3 + 3 + 6) * E + 3 * HD + (size_t) g.n_head * (2 * max_keys + 256) +
+        return (size_t) 4 * ((2 + k::kMaxStates + 3 + 3 + 6) * E + 3 * HD + std::max((size_t) g.n_head * (2 * max_keys + 256), k::attention_split_floats(g.n_head, g.head_dim, (int64_t) max_keys)) +
                              nu * (size_t) (2 * g.n_ff_exp + g.n_ff_exp + g.n_embd) + (size_t) g.n_vocab) +
                nu * E * 2 + ((size_t) 64 << 20);
     }
@@ -502,7 +502,7 @@ struct Model::Impl {
                gp.alloc(gp.gate, HD, err) && gp.alloc(gp.rel, (size_t) g.n_head * g.d_rel, err) &&
                gp.alloc(gp.sink, (size_t) g.n_head, err) && gp.alloc(gp.ky, kvd, err) && gp.alloc(gp.vy, kvd, err) &&
                gp.alloc(gp.dk, (size_t) 4 * g.n_head_kv, err) && gp.alloc(gp.dv, (size_t) 4 * g.n_head_kv, err) &&
-               gp.alloc(gp.S, (size_t) g.n_head * (2 * max_keys + 256), err) && gp.alloc(gp.ao, HD, err) &&
+               gp.alloc(gp.S, std::max((size_t) g.n_head * (2 * max_keys + 256), k::attention_split_floats(g.n_head, g.head_dim, (int64_t) max_keys)), err) && gp.alloc(gp.ao, HD, err) &&
                gp.alloc(gp.o, E, err) && gp.alloc(gp.xf, E, err) && gp.alloc(gp.rl, (size_t) g.n_expert, err) &&
                gp.alloc(gp.rw, 16, err) && gp.alloc(gp.wres, 16, err) && gp.alloc(gp.ids, 16, err) &&
                gp.alloc(gp.gu, nu * 2 * ff, err) && gp.alloc(gp.eh, nu * ff, err) && gp.alloc(gp.part, nu * E, err) &&
@@ -1197,11 +1197,20 @@ struct Model::Impl {
             return false;
         const int64_t lo = l.swa ? std::max<int64_t>(0, p - (g.n_swa - 1)) : 0;
         mark(gp, 1);
-        k::attention(gp.q, gp.rel, gp.sink, H, Hkv, D, g.d_rel, l.rel_bias, l.swa ? g.n_swa : g.rel_extent, l.K, l.V,
-                     l.ring, p, lo, 1.0f / std::sqrt((float) D), gp.S, gp.ao, s);
-        if (!tap("kqv_out", l.il, gp, gp.ao, (size_t) HD, err)) return false;
-        mark(gp, 2);
-        k::sigmoid_mul(gp.ao, gp.gate, (size_t) HD, s);
+        // (the keys split over tiles, the output gate in the combine: INKLING2_ATTN_OLD=1 for the earlier launches)
+        if (!attn_old) {
+            k::attention_split(gp.q, gp.rel, gp.sink, H, Hkv, D, g.d_rel, l.rel_bias, l.swa ? g.n_swa : g.rel_extent, l.K, l.V,
+                               l.ring, p, lo, 1.0f / std::sqrt((float) D), gp.S, tapf ? nullptr : gp.gate, gp.ao, s);
+            if (!tap("kqv_out", l.il, gp, gp.ao, (size_t) HD, err)) return false;
+            mark(gp, 2);
+            if (tapf) k::sigmoid_mul(gp.ao, gp.gate, (size_t) HD, s);
+        } else {
+            k::attention(gp.q, gp.rel, gp.sink, H, Hkv, D, g.d_rel, l.rel_bias, l.swa ? g.n_swa : g.rel_extent, l.K, l.V,
+                         l.ring, p, lo, 1.0f / std::sqrt((float) D), gp.S, gp.ao, s);
+            if (!tap("kqv_out", l.il, gp, gp.ao, (size_t) HD, err)) return false;
+            mark(gp, 2);
+            k::sigmoid_mul(gp.ao, gp.gate, (size_t) HD, s);
+        }
         if (!mm(gp, l.wo, gp.ao, gp.o)) {
             err = "layer " + std::to_string(l.il) + ": the attention's output GEMV did not take its shapes";
             return false;
@@ -1314,6 +1323,7 @@ struct Model::Impl {
     // INKLING2_PHASES=1 (tests): device-side marks between a layer's phases in the host-free step (events on the
     // streams, read after the token: no extra waits), summed over the layers and tokens
     bool phases = std::getenv("INKLING2_PHASES") != nullptr;
+    bool attn_old = std::getenv("INKLING2_ATTN_OLD") != nullptr;
     double ph_ms[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     void ph(Layer& l, Gpu& gp, int k) {
         if (phases) cudaEventRecord(l.pe[k], gp.s);
@@ -1458,10 +1468,17 @@ struct Model::Impl {
         k::clip2(gp.q, H, D, l.q_clip, g.qk_clip, gp.rel, g.d_rel, l.rel_clip, g.rel_clip, tau, s);
         ph(l, gp, 3);
         const int64_t lo = l.swa ? std::max<int64_t>(0, p - (g.n_swa - 1)) : 0;
-        k::attention(gp.q, gp.rel, gp.sink, H, Hkv, D, g.d_rel, l.rel_bias, l.swa ? g.n_swa : g.rel_extent, l.K, l.V,
-                     l.ring, p, lo, 1.0f / std::sqrt((float) D), gp.S, gp.ao, s);
-        ph(l, gp, 4);
-        k::sigmoid_mul(gp.ao, gp.gate, (size_t) HD, s);
+        // (the keys split over tiles, the output gate in the combine: INKLING2_ATTN_OLD=1 for the earlier launches)
+        if (!attn_old) {
+            k::attention_split(gp.q, gp.rel, gp.sink, H, Hkv, D, g.d_rel, l.rel_bias, l.swa ? g.n_swa : g.rel_extent, l.K, l.V,
+                               l.ring, p, lo, 1.0f / std::sqrt((float) D), gp.S, gp.gate, gp.ao, s);
+            ph(l, gp, 4);
+        } else {
+            k::attention(gp.q, gp.rel, gp.sink, H, Hkv, D, g.d_rel, l.rel_bias, l.swa ? g.n_swa : g.rel_extent, l.K, l.V,
+                         l.ring, p, lo, 1.0f / std::sqrt((float) D), gp.S, gp.ao, s);
+            ph(l, gp, 4);
+            k::sigmoid_mul(gp.ao, gp.gate, (size_t) HD, s);
+        }
         ok = ok && mm(gp, l.wo, gp.ao, gp.o);
         if (l.il % g.res_block == 0) {
             k::conv(gp.o, l.hist_a, l.a_conv, E, nullptr, 1, s);

@@ -2,9 +2,9 @@
 
 Working spec for speculative decoding in `maya-inkling2` with Thinking Machines' own drafter (`mtp.safetensors`,
 `mtp_config`). Companion to [INKLING2_PORT.md](INKLING2_PORT.md) (the target's forward pass, whose notation this
-uses: `rms(x)`, `rmsg(x, g)`, eps 1e-6). Nothing here has run on a GPU yet: the equations are read from the reference's
-source, the cost model is arithmetic over measured routing, and the acceptance rate is unknown until the parity run
-at the end.
+uses: `rms(x)`, `rmsg(x, g)`, eps 1e-6). The equations are read from the reference's source; the acceptance rate and the tap / RoPE questions are measured
+on the reference (Measured); the cost model is arithmetic over measured routing, and a window's cost on our engine
+is still unmeasured.
 
 Sources:
 
@@ -389,7 +389,75 @@ Expected speed against no drafting (Q8_0 folded, 7 ms), best window in brackets:
   (no drafter needed). Measure both before writing the drafter's kernels. If acceptance on the long prompt is under
   0.6, stop.
 
-## Reference parity plan (not run: it needs the GPUs)
+## Measured (2026-11-20, the reference run)
+
+llama.cpp PR #32218's head (842c10f61) in a worktree (`/home/shruggr/build/llama.cpp-inkling2-dspark`, built in the
+ROCm container), with `tools/inkling2/ref/inkling-dspark-eval.cpp` (`examples/inkling-dspark-eval` there),
+`dspark-eval-worktree.patch` (env-switched variants; the extra tap candidates) and `run_dspark_eval.sh`. Our GGUFs
+load in the PR's loader as they are. The PR head's target gives the reference's greedy tokens after the long prompt
+(`13 198 12`), so its older Inkling 2 code is good enough for this.
+
+Method: the target (UD-Q2_K_XL, auto-fit, 6.6-10.5 tok/s here) reads a prompt and decodes 300 greedy tokens once,
+every position's taps kept (`/mnt/data/inkling2-ref/dspark-eval/<prompt>/`: `tokens.txt`, `tap-slot<id>.bin` F32
+[positions][4608] - slots 5..41 and 48 are the PR's taps; `drafts-<variant>.txt`; `results.jsonl` - inputs for the
+engine's drafter-only test). A greedy target does not depend on the drafter, so each drafter variant then runs alone:
+a block after **every** generated position (293 a prompt), its drafts compared with the target's next 7 tokens; and
+the real rounds (the next block after the kept drafts) replayed from that.
+
+Prompts: `prose` = the 2698-token long prompt continued; `code` = a chat request for a Python module (the answer
+starts with thinking, then code); `chat` = a chat question at the default thinking effort 0.9 (300 tokens of terse
+thinking notes - the hardest text for a drafter).
+
+**Acceptance by draft position** (kept / reached, a block after every position, BF16):
+
+| | 1 | 2 | 3 | 4 | 5 | 6 | 7 | kept of 7 (every position) | accepted a real round (7 offered) |
+|---|---|---|---|---|---|---|---|---|---|
+| prose | 0.86 | 0.84 | 0.86 | 0.87 | 0.86 | 0.80 | 0.81 | 3.90 | 3.11 (72 rounds, 224 of 300 tokens drafted) |
+| code | 0.84 | 0.80 | 0.76 | 0.81 | 0.81 | 0.85 | 0.84 | 3.27 | 2.78 (78 rounds, 217) |
+| chat (thinking) | 0.61 | 0.58 | 0.45 | 0.49 | 0.48 | 0.45 | 0.20 | 1.26 | 1.19 (134 rounds, 159) |
+
+A real round starts where the last one missed, a harder place than average: its first draft stands 0.75 / 0.79 / 0.60
+of the time. Acceptance hardly falls with the position on prose and code (the head's recurrence works).
+
+**Q8_0 = BF16**: 3.89 / 3.24 / 1.28 kept of 7, the same rounds and accepted counts (224 / 217 / 159). Use Q8_0.
+
+**Variants** (mean kept of 7, prose / code / chat; base 3.90 / 3.27 / 1.26):
+
+| variant | prose | code | chat | verdict |
+|---|---|---|---|---|
+| tap 48 = `l_out-47` raw | 3.59 | 3.12 | 1.02 | worse |
+| tap 48 = the head's mix without the norm | 3.60 | 3.04 | 1.05 | worse: **the PR's `result_norm` is right** |
+| taps 5-41 = the layer's mixed Q input | 3.73 | 2.95 | 1.21 | worse: **raw streams are right** |
+| RoPE adjacent pairs (NORM) | 0.32 | 0.69 | 0.30 | collapses: **half-split (NEOX) is right** |
+| window 1024 + 0 | 3.90 | 3.27 | 1.26 | identical counts |
+| a mask row per block row | 3.89 | 3.27 | 1.26 | one draft of 2051 differs |
+
+The "+1" and the shared mask row cannot be told apart by acceptance even at position 2700+; take the PR's.
+
+**The draft's top probability is a usable confidence** (all prompts and positions, kept / reached by `max softmax`):
+0.1-0.2: 0.16; 0.2-0.3: 0.31; 0.3-0.4: 0.28; 0.4-0.5: 0.42; 0.5-0.6: 0.49; 0.6-0.7: 0.63; 0.7-0.8: 0.71; 0.8-0.9:
+0.79; 0.9-1.0: 0.95 (1777 of 3190 drafts). It is close to calibrated as it is.
+
+**Speed against no drafting**, the cost model above over the replayed rounds (7 ms a draft round, 30 ms a token;
+A / M / B = the three readings of a window's cost):
+
+| window rule | prose | code | chat |
+|---|---|---|---|
+| always 7 drafts | 1.81 / 1.62 / 1.43 | 1.67 / 1.49 / 1.32 | 0.96 / 0.86 / 0.76 |
+| always 4 | 1.78 / 1.63 / 1.48 | 1.71 / 1.57 / 1.42 | 1.15 / 1.05 / 0.95 |
+| always 2 | 1.58 / 1.49 / 1.39 | 1.54 / 1.45 / 1.35 | 1.22 / 1.15 / 1.08 |
+| while the product of top probabilities >= 0.5 (ds4's `dspark_cum`) | 1.92 / 1.81 / 1.68 | 1.90 / 1.76 / 1.61 | 1.22 / 1.16 / 1.10 |
+| ... >= 0.3 | 1.96 / 1.81 / 1.65 | 1.85 / 1.68 / 1.52 | 1.25 / 1.18 / 1.10 |
+
+**Go.** With the window cut on the product of the drafts' top probabilities at 0.5 (2.5-3.5 drafts verified a round
+on prose and code, 1.5 on thinking text) the model gives about **1.6-1.9x on prose and code and 1.1-1.2x on terse
+thinking text**, and never a loss; a fixed 7-draft window loses on the thinking text. Still unmeasured: t(T) on our
+engine, which picks between A, M and B.
+
+llama.cpp's own drafter costs 91 ms a block here (83 ms Q8_0): the PR's head as written is slower than three target
+tokens of ours, which is why the fold and a device-side head loop matter. Injecting 2998 positions took 1.7 s.
+
+## Reference parity plan (steps 1-3 and 5 done as above; the tensor dumps of step 4 are not)
 
 1. **A checkout of the PR's head, beside the existing one** (the saved diff does not apply to master b94959a64:
    8 of its files fail `git apply --check`; master has since split DSpark / DFlash2 into classes of their own and
@@ -453,19 +521,19 @@ Expected speed against no drafting (Q8_0 folded, 7 ms), best window in brackets:
 
 ## Open questions
 
-1. **The "48" tap.** The PR feeds the mixed, output-normed head input (`result_norm`), while taps 5-41 are raw
-   streams. Hugging Face's `hidden_states[48]` would be the last layer's raw output (`l_out-47`), and a third reading
-   is the mix without the norm. Nobody has published Thinking Machines' own code for this. The PR's author reports
-   no acceptance figures. Decide by measured acceptance (step 5).
-2. **Taps 5-41: the block's raw stream or the layer's mixed input?** The PR takes `cur` at the top of the layer
-   (`l_out-(id-1)`), before `mix(blocks, cur, attn_res_query)`. Same remedy.
-3. **RoPE pairing** (halves, NEOX) is inherited, not stated by the PR; confirm in its head.
-4. **The window "+1"** and the shared mask row (every block row sees the anchor's 1024 contexts) are the PR's
-   reading; `sliding_window_size 1024` alone would also fit a per-row window.
-5. **Acceptance rate**: unknown. Everything in the verdict hangs on it.
-6. **t(T) on our engine** for T = 2..8, and whether the prompt path's chunk machinery has a fixed cost that the
-   token path does not (a window may want the token path's kernels over T rows instead).
-7. **A confidence stand-in**: does the draft's top probability predict acceptance well enough to cut windows?
-8. **Q8_0 against BF16** for acceptance (and `joint_proj`'s subnormal steps).
-9. The exactness of a window pass against token-by-token decoding when experts are split between VRAM and the CPU
+Settled by the reference run (Measured): tap 48 is `result_norm`; taps 5-41 are the raw streams; RoPE pairs are
+half-split; Q8_0 costs no acceptance; the top probability works as a confidence. The window "+1" / shared mask row
+makes no measurable difference. The PR's `conf` read in the greedy path is unguarded (`common/speculative.cpp`,
+`if (is_dspark)`: with `--spec-draft-p-min` > 0 it compares the markov state's first value with the threshold); the
+default p_min is 0, so it is latent - do not copy it.
+
+1. **t(T) on our engine** for T = 2..8, and whether the prompt path's chunk machinery has a fixed cost that the
+   token path does not (a window may want the token path's kernels over T rows instead). It decides between 1.6x and
+   1.9x.
+2. Acceptance on more text: 300 tokens a kind is a first figure; answers after the thinking, tool calls and sampled
+   requests are not covered.
+3. The exactness of a window pass against token-by-token decoding when experts are split between VRAM and the CPU
    lane (ds4 documents that answers can differ there).
+4. Tensor-level parity dumps of the drafter (step 4 of the plan) are still to be made; until then the engine's
+   drafter-only test compares drafts (`drafts-bf16.txt`: position, kept, 7 x `token:top probability`) from the saved
+   taps, not tensors.

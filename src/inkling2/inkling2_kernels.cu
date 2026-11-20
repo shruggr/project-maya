@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 namespace inkling2::k {
 
@@ -350,6 +351,97 @@ __global__ void attn_soft_out_kernel(float* __restrict__ S, int H, int Hkv, int 
             out[(size_t) (g * per + r) * D + i] = o;
         }
 }
+// Split-K attention.  block = (a tile of TK keys, a kv head): the tile's K rows and the head's queries in shared
+// memory, a thread a (query head, key) for the scores, each query head's softmax within the tile (its own max), the
+// tile's part of the output - st [H][tiles][2] = (the tile's max, its sum of exp(s - max)), part [H][tiles][D]
+__global__ void attn_tile_kernel(const float* __restrict__ q, const float* __restrict__ rel, const float* __restrict__ sink,
+                                 int H, int Hkv, int D, int n_rel, const float* __restrict__ rel_bias, int extent,
+                                 const __half* __restrict__ K, const __half* __restrict__ V, int ring, long long base,
+                                 int d0, int nk, int TK, float scale, float* __restrict__ st,
+                                 float* __restrict__ part) {
+    extern __shared__ float sm[];   // [TK][D] keys, [per][D] queries, [per][TK] scores / weights, [per] maxima
+    const int g = blockIdx.y, tile = blockIdx.x, ntile = gridDim.x, j0 = tile * TK, per = H / Hkv, tid = threadIdx.x;
+    float* sk = sm;
+    float* sq = sk + (size_t) TK * D;
+    float* sw = sq + (size_t) per * D;
+    float* smb = sw + (size_t) per * TK;
+    for (int i = tid; i < TK * D; i += blockDim.x) {
+        const int j = j0 + i / D;
+        if (j < nk) {   // (key j's row: base + j, wrapped once - no 64-bit modulo a value, which cost most of the launch)
+            long long sl = base + j;
+            if (ring > 0 && sl >= ring) sl -= ring;
+            sk[i] = __half2float(K[((size_t) sl * Hkv + g) * D + i % D]);
+        }
+    }
+    for (int i = tid; i < per * D; i += blockDim.x) sq[i] = q[(size_t) g * per * D + i];
+    __syncthreads();
+    for (int e = tid; e < per * TK; e += blockDim.x) {
+        const int r = e / TK, jj = e % TK, j = j0 + jj, h = g * per + r;
+        float a = -INFINITY;
+        if (j < nk) {
+            a = 0.0f;
+            for (int i = 0; i < D; ++i) a += sq[r * D + i] * sk[jj * D + i];
+            a *= scale;
+            const int d = d0 - j;   // (the query's position less the key's)
+            if (d < extent) {
+                const float* bb = rel_bias + (size_t) d * n_rel;
+                const float* rr = rel + (size_t) h * n_rel;
+                float bs = 0.0f;
+                for (int i = 0; i < n_rel; ++i) bs += rr[i] * bb[i];
+                a += bs;
+            }
+            a -= sink[h];
+        }
+        sw[e] = a;
+    }
+    __syncthreads();
+    if (tid < per) {
+        float m = -INFINITY;
+        for (int jj = 0; jj < TK; ++jj) m = fmaxf(m, sw[tid * TK + jj]);
+        smb[tid] = m;
+    }
+    __syncthreads();
+    for (int e = tid; e < per * TK; e += blockDim.x) sw[e] = j0 + e % TK < nk ? expf(sw[e] - smb[e / TK]) : 0.0f;
+    __syncthreads();
+    if (tid < per) {
+        float sum = 0.0f;
+        for (int jj = 0; jj < TK; ++jj) sum += sw[tid * TK + jj];
+        float* o = st + ((size_t) (g * per + tid) * ntile + tile) * 2;
+        o[0] = smb[tid];
+        o[1] = sum;
+    }
+    if (tid < D && per <= 8) {
+        const size_t col = (size_t) g * D + tid, row = (size_t) Hkv * D;
+        float v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        const int n = min(TK, nk - j0);
+        for (int jj = 0; jj < n; ++jj) {
+            long long sl = base + j0 + jj;
+            if (ring > 0 && sl >= ring) sl -= ring;
+            const float x = __half2float(V[(size_t) sl * row + col]);
+            for (int r = 0; r < per; ++r) v[r] += sw[r * TK + jj] * x;
+        }
+        for (int r = 0; r < per; ++r) part[((size_t) (g * per + r) * ntile + tile) * D + tid] = v[r];
+    }
+}
+// block = a query head: the tiles' parts under one maximum (the sink's zero logit in it and in the sum), the gate
+__global__ void attn_combine_kernel(const float* __restrict__ st, const float* __restrict__ part, int ntile, int D,
+                                    const float* __restrict__ gate, float* __restrict__ out) {
+    __shared__ float sh[256];
+    const int h = blockIdx.x, tid = threadIdx.x;
+    const float* sth = st + (size_t) h * ntile * 2;
+    float m = 0.0f;
+    for (int b = tid; b < ntile; b += blockDim.x) m = fmaxf(m, sth[2 * b]);
+    m = block_max(m, sh);
+    float sum = 0.0f;
+    for (int b = tid; b < ntile; b += blockDim.x) sum += sth[2 * b + 1] * expf(sth[2 * b] - m);
+    sum = block_sum(sum, sh) + expf(-m);
+    if (tid >= D) return;
+    float v = 0.0f;
+    for (int b = 0; b < ntile; ++b) v += part[((size_t) h * ntile + b) * D + tid] * expf(sth[2 * b] - m);
+    v /= sum;
+    if (gate) v *= 1.0f / (1.0f + expf(-gate[(size_t) h * D + tid]));
+    out[(size_t) h * D + tid] = v;
+}
 // one block: the states' norms and dots, then each query's mix, its own norm and gain
 __global__ void mix_rms_kernel(const float* __restrict__ blocks, int nb, const float* __restrict__ cur, int E,
                                const float* __restrict__ query, int nq, const float* __restrict__ g0,
@@ -679,6 +771,45 @@ void attention(const float* q, const float* rel, const float* sink, int H, int H
     attn_part_kernel<<<dim3((unsigned) nseg, (unsigned) Hkv), 256, 0, s>>>(S, H, Hkv, D, (const __half*) V, ring, (long long) lo, nk, nseg, part);
     attn_sum_kernel<<<(unsigned) H, 256, 0, s>>>(part, D, nseg, out);
     check("attention");
+}
+namespace {
+// keys a tile.  Measured at a full 1024-key window (ms of attention a token over the 48 layers): 64 keys 11.2, 32
+// keys 8.9, 16 keys 6.4 - the smaller the tile the faster, against what its work would say.  INKLING2_ATTN_TK=a,b
+// (tests): a for up to 2048 keys, b beyond.
+int split_tk(int nk) {
+    static int t1 = 16, t2 = 16;
+    static const bool init = [] {
+        if (const char* e = std::getenv("INKLING2_ATTN_TK")) {
+            int a = 0, b2 = 0;
+            if (std::sscanf(e, "%d,%d", &a, &b2) == 2 && a >= 8 && a <= 64 && b2 >= 16 && b2 <= 64) t1 = a, t2 = b2;
+        }
+        return true;
+    }();
+    (void) init;
+    return nk <= 2048 ? t1 : t2;
+}
+}  // namespace
+size_t attention_split_floats(int H, int D, int64_t max_keys) {
+    const int64_t nk = std::max<int64_t>(max_keys, 2048);
+    const int64_t tiles = std::max<int64_t>((2048 + 7) / 8, (nk + 15) / 16);
+    return (size_t) H * (size_t) tiles * (size_t) (D + 2);
+}
+void attention_split(const float* q, const float* rel, const float* sink, int H, int Hkv, int D, int n_rel,
+                     const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p,
+                     int64_t lo, float scale, float* S, const float* gate, float* out, cudaStream_t s) {
+    const int nk = (int) (p - lo + 1), per = H / Hkv, TK = split_tk(nk), ntile = (nk + TK - 1) / TK;
+    if (per > 8 || D > 256) {
+        std::fprintf(stderr, "maya-inkling2 attention_split: %d query heads a kv head, rows of %d\n", per, D);
+        g_err.fetch_add(1);
+        return;
+    }
+    float* part = S + (size_t) H * ntile * 2;
+    attn_tile_kernel<<<dim3((unsigned) ntile, (unsigned) Hkv), 256,
+                       ((size_t) TK * D + (size_t) per * D + (size_t) per * TK + 16) * sizeof(float), s>>>(
+        q, rel, sink, H, Hkv, D, n_rel, rel_bias, extent, (const __half*) K, (const __half*) V, ring,
+        (long long) (ring > 0 ? lo % ring : lo), (int) (p - lo), nk, TK, scale, S, part);
+    attn_combine_kernel<<<(unsigned) H, 256, 0, s>>>(S, part, ntile, D, gate, out);
+    check("attention_split");
 }
 void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s) {
     sigmoid_mul_kernel<<<blocks_of(n), 256, 0, s>>>(x, g, n);
