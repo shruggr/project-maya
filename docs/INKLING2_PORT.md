@@ -6,6 +6,51 @@ ggml block-type kernels (`src/ds4/ds4_iq.cu`, `ds4_iq_cpu.cpp`, `ds4_gguf_cpu.cp
 
 Branch: `inkling2-engine`.
 
+## Status (2026-11-20, commit 85ef75e)
+
+Measured on this PC; `--max-context 32768`, `default.prof` loads by itself.
+
+| | |
+|---|---|
+| Decode, short context | 36.9 tok/s |
+| Decode after a 2.7k-token prompt | 32.8 tok/s |
+| Decode at 16k / 32k context | 26.0 / 22.0 tok/s |
+| Chat turns through serve/server.py (my_e2e: document, follow-up, code) | 31.7 / 32.7 / 32.0 tok/s |
+| Prompt, 2698 tokens | ~945 tok/s (~1190 at 16k) |
+| Parity with llama.cpp | PARITY OK, short and long, natural and forced picks |
+| DeepSeek (maya-ds4) here, for comparison | 35.6 tok/s without drafting, 57.5 with DSpark |
+
+Done:
+- Load: layer split, the expert pack, RAM experts pinned.
+- Host-free decode step: device picks, a mailbox CPU lane, mapped hand-off.
+- Dynamic VRAM/RAM expert cache: decayed counts, one mover per GPU, `--no-swap` turns it off.
+- Batched prompt path: RAM experts streamed into VRAM.
+- Prefix reuse with checkpointed rewind (`--rewind`); F16 KV.
+- `--serve` (maya-hy4's protocol, docs/INKLING2_SERVING.md).
+- Split-K decode attention.
+- Verify window: `Model::window` / `keep`, T ≤ 9 tokens.
+- The DSpark drafter as a standalone module (src/inkling2/inkling2_dspark.*; docs/INKLING2_DSPARK.md).
+
+Not done (drafting is not wired yet):
+1. One code path for T = 1 and windows. Window rows match the token step only to cosine 0.995-0.9999 (same tokens),
+   because the window uses unfused row kernels.
+2. The CPU lane over a window: a RAM expert picked by several rows is read once a row today.
+3. The drafter's taps out of the window step and the prompt path (all rows) to the drafter's GPU.
+4. Drafting in the decode and serve loops: the k policy from t(T), sampled acceptance, and `--dspark` flags.
+5. End-to-end drafted measurement.
+
+t(T) at 3k context, ms per window pass, for T = 1..9: 30.4, 43.1, 50.7, 58.4, 68.1, 76.4, 83.8, 93.5, 100.0.
+Unique experts grow by ~4.3 per layer per row (~4.3 ms at bandwidth); the rest of the ~8 ms per row is unmeasured
+(there are no phase marks in the window step yet).
+
+Engine flags: `--pack --max-context (--ctx) --layer-split --gpus --reserve-gb --vram-experts --profile (none) --profile-out
+--threads --log-floor --prefill-chunk --try-chunks --repeat --rewind --short-prompt --no-swap --eos --serve --tokens
+--tokens-file --n-predict --layers --verbose`; tests `--parity [--parity-force-picks --parity-force-only --parity-decode
+--parity-detail --parity-max] --rewind-test --short-bench --window-test`. Environment: `INKLING2_PHASES` (device phase
+table, token step), `INKLING2_TIMELINE`, `INKLING2_PROF`, `INKLING2_OLD_STEP`, `INKLING2_SWAP_BATCH`,
+`INKLING2_SWAP_BURST_MS`, `INKLING2_ATTN_OLD`, `INKLING2_ATTN_TK`, `INKLING2_VERIFY_LOAD`, `INKLING2_EXPERT_CHECK`,
+`INKLING2_NO_WARMUP`.
+
 ## Goal and targets
 
 - Text chat (thinking, tool calls) from unsloth's `UD-Q2_K_XL` GGUF set, served by `serve/server.py` like Hy4.
