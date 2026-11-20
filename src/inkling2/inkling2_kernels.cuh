@@ -140,6 +140,27 @@ void lane_add_rows(const unsigned* flag, unsigned v, const int* ids, const int* 
 void hist_set4(float* const hist[4], const float* const h0[4], const float* const in[4], const int C[4], int keep,
                cudaStream_t s);
 
+/// The rows a window's attention takes in one launch pair over `keys` keys with S_floats of scratch (0: not one)
+int attention_rows_fit(int H, int D, int64_t keys, size_t S_floats);
+/// kv_finish for T rows (T 1: a token): in_k / in_v [T][Hkv D] the projections (left as they are: a window is cut back
+/// from them), hk0 / hv0 the histories before the rows, hk1 / hv1 (other buffers) the histories after them; dk / dv
+/// [T][Hkv][4] or null; the rows' K / V into the caches at p0 .. (nothing else is written)
+void kv_finish_rows(const float* in_k, const float* in_v, int T, const float* hk0, const float* hv0, float* hk1, float* hv1,
+                    const float* k_conv, const float* v_conv, const float* dk, const float* dv, int Hkv, int D, float thr,
+                    float eps, uint16_t* K, uint16_t* V, int ring, int64_t p0, cudaStream_t s);
+/// clip2 for T rows (q [T][H][D], rel [T][H][n_rel]), row t times mul[t]
+void clip2_rows(float* q, int T, int H, int D, const float* qs, float qthr, float* rel, int n_rel, const float* rs,
+                float rthr, const float* mul, cudaStream_t s);
+/// conv_add for T rows: y [T][C] the inputs (left as they are), h0 the history before the rows, h1 (another buffer)
+/// the history after them; cur [T][C] += the rows' conv - or, with blk [T][C]: blk = cur, cur = the conv
+void conv_add_rows(const float* y, int T, const float* h0, float* h1, const float* w, int C, float* cur, float* blk,
+                   cudaStream_t s);
+/// The drafter's taps of a window: dst [T][n][E] (rows ld floats apart) from n sources of [T][E] (n <= 8); bit k of
+/// vol: source k is host memory the device maps, written by another device (read fresh)
+void taps_gather(const float* const* src, unsigned vol, int n, int T, int E, float* dst, size_t ld, cudaStream_t s);
+/// argmax of each of `rows` rows of x (ld apart, n values): out[2 r] the index as a float, out[2 r + 1] the value
+void argmax_rows(const float* x, size_t ld, int rows, int n, float* out, cudaStream_t s);
+
 /// A chunk's expert outputs by entry, whichever set computed them: ent[e] = y[row_of[e]] for the n entries with a row
 /// (row_of >= 0; rows of E) - then out[t] = sum_j w[t][j] ent[t nu + j], the picks in their order: a token's sum does
 /// not depend on which experts were in VRAM and which pass streamed the others

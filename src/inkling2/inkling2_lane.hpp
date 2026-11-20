@@ -31,4 +31,14 @@ struct CpuEntry {
 /// out [n_embd] = sum over the entries of w down(situ(gate x, up x)) (no entries: zeros); x [n_embd]
 void cpu_experts(hy4::Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& entries, const float* x, float* out);
 
+/// A window's rows at once: entry (row, slot, w) - the rows' picks outside VRAM, each row's in its picks' order.  An
+/// expert several rows picked is read once for all of them (ds4_iq_cpu's multi-token rows: each row's sums the ones it
+/// gets alone).  x [T][n_embd], out [T][n_embd] (a row without entries: zeros).
+struct CpuRowEntry {
+    int row = 0, slot = 0;
+    float w = 0.0f;
+};
+void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<CpuRowEntry>& entries, const float* x, int T,
+                      float* out);
+
 }  // namespace inkling2

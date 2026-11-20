@@ -134,16 +134,21 @@ dashboard restarts it with a new `--max-context`. So `maya-inkling2` must take:
 The line protocol (as maya-hy4's, src/hy4/hy4_main.cpp `serve`):
 
 - start: any `NOTE <text>` / `INFO key=value ...` lines (`INFO engine=inkling2 engine_kind=inkling2 model=Inkling-2-Small
-  ctx=<n> vram_gb=<x> dspark=0 mtp=0 ...`; `logit_bias=1` / `logprobs=<n>` only if it does those - else the server
+  ctx=<n> vram_gb=<x> dspark=1 mtp=0 ...` (`dspark=1`: the drafter is loaded and drafting, the default; `--dspark off`
+  or no drafter index: `dspark=0`); `logit_bias=1` / `logprobs=<n>` only if it does those - else the server
   refuses such requests), `VRAM ...` lines optional, then `READY <max_context> stop` (`pause`, `multi=<n>` only if
   supported). stderr is the log.
 - the server sends `GEN <max_new> [key=value ...] <id,id,...>` - the whole prompt each time (the engine reuses the
   prefix it already holds); keys: `temperature` (absent = greedy, `temperature=0` greedy), `top_p` (only < 1),
-  `top_k` (1..64), `min_p`, `seed`, `penalty_repeat` / `penalty_freq` / `penalty_present` / `penalty_last_n`; unknown
+  `top_k` (1..64), `min_p`, `seed`, `penalty_repeat` / `penalty_freq` / `penalty_present` / `penalty_last_n`;
+  for the drafter `spec=0|1` (this request drafts or not; the default: it does) and `dspark_cum=F` / `spec_cum=F` (the
+  floor on the running product of the drafts' probabilities, default 0.5); unknown
   keys must be ignored (`think_budget` / `think_end` never come for Inkling). `STOP` (end the request now), `WRAP`
   (the server is stopping), `QUIT` (exit). No `GENI` (text only).
 - the engine answers `PP <read> <total> <ms> <tok_s> <reused>` while it reads the prompt (also a heartbeat),
-  `T <id>` a generated token (flushed each), `STAT tok_s=.. ms_tok=.. ...` now and then, and ends every request with
+  `T <id>` a generated token (flushed each; a round with drafts gives several at once), `STAT tok_s=.. ms_tok=.. ...`
+  now and then (with the drafter also `draft_rounds= draft_ms= verify_ms=` and, once drafts were verified,
+  `drafts=<kept / offered> draft_acc= draft_off=`, maya-ds4's names), and ends every request with
   `DONE <generated> <prompt_tokens> <prompt_ms> <decode_ms> <finish> <drafts_acc> <drafts_off> <reused> 0 0`
   (finish `stop` | `length` | `cancel`) - or `ERR <message>` (then a DONE may follow). It stops at its EOS (200006) and
   should stop at 199999 too; ids past 200057 must never be sampled (the padded rows).

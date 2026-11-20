@@ -426,6 +426,12 @@ __global__ void attn_tile_kernel(const float* __restrict__ q, const float* __res
 // ... for a window's T rows: block = (a tile of TK keys, a kv head) - the tile's K rows in shared memory once for the
 // T x per queries (read where they lie), each query's softmax within the tile over the keys its row sees, then the
 // tile's V rows in the same shared memory for the parts.  st [T H][tiles][2], part [T H][tiles][D]
+constexpr int kATK = 16;      // keys a tile of the window attention
+// kAU: keys a thread of the scores takes (the query's values read once for its kAU dots; each dot summed in the
+// dimensions' order whatever kAU is, so the instances give the same bits).  Measured, ms of attention a pass at 2.7k
+// context for T = 1 / 2 / 4 / 8 / 9 rows: 1 key 3.8 / 5.8 / 9.7 / 18.0 / 20.0, 2 keys 3.4 / 4.0 / 5.6 / 10.0 / 11.4,
+// 4 keys 3.2 / 3.6 / 4.3 / 7.0 / 7.7, 8 keys 3.9 / 4.0 / 4.3 / 5.8 / 6.4 - 4 up to four rows, 8 from five.
+template <int kAU>
 __global__ void attn_tile_rows_kernel(const float* __restrict__ q, const float* __restrict__ rel,
                                       const float* __restrict__ sink, int T, int H, int Hkv, int D, int n_rel,
                                       const float* __restrict__ rel_bias, int extent, const __half* __restrict__ K,
@@ -446,25 +452,35 @@ __global__ void attn_tile_rows_kernel(const float* __restrict__ q, const float* 
         }
     }
     __syncthreads();
-    for (int e = tid; e < TP * TK; e += blockDim.x) {
-        const int tr = e / TK, jj = e % TK, t = tr / per, h = g * per + tr % per, j = j0 + jj;
-        const int d = d0 + t - j;   // (row t's position less the key's)
-        float a = -INFINITY;
-        if (j < nk && d >= 0 && (window == 0 || d < window)) {
-            const float* qr = q + ((size_t) t * H + h) * D;
-            a = 0.0f;
-            for (int i = 0; i < D; ++i) a += qr[i] * sk[jj * D + i];
-            a *= scale;
-            if (d < extent) {
-                const float* bb = rel_bias + (size_t) d * n_rel;
-                const float* rr = rel + ((size_t) t * H + h) * n_rel;
-                float bs = 0.0f;
-                for (int i = 0; i < n_rel; ++i) bs += rr[i] * bb[i];
-                a += bs;
-            }
-            a -= sink[(size_t) t * H + h];
+    // (a thread: a query and kAU of the tile's keys - the query's values read once for the kAU dots, each dot summed in
+    //  the dimensions' order)
+    for (int e = tid; e < TP * (TK / kAU); e += blockDim.x) {
+        const int tr = e / (TK / kAU), jg = (e % (TK / kAU)) * kAU, t = tr / per, h = g * per + tr % per;
+        const float* qr = q + ((size_t) t * H + h) * D;
+        const float* kr = sk + (size_t) jg * D;
+        float acc[kAU];
+        for (int u = 0; u < kAU; ++u) acc[u] = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            const float qv = qr[i];
+            for (int u = 0; u < kAU; ++u) acc[u] += qv * kr[u * D + i];
         }
-        sw[e] = a;
+        for (int u = 0; u < kAU; ++u) {
+            const int j = j0 + jg + u;
+            const int d = d0 + t - j;   // (row t's position less the key's)
+            float a = -INFINITY;
+            if (j < nk && d >= 0 && (window == 0 || d < window)) {
+                a = acc[u] * scale;
+                if (d < extent) {
+                    const float* bb = rel_bias + (size_t) d * n_rel;
+                    const float* rr = rel + ((size_t) t * H + h) * n_rel;
+                    float bs = 0.0f;
+                    for (int i = 0; i < n_rel; ++i) bs += rr[i] * bb[i];
+                    a += bs;
+                }
+                a -= sink[(size_t) t * H + h];
+            }
+            sw[tr * TK + jg + u] = a;
+        }
     }
     __syncthreads();
     if (tid < TP) {
@@ -491,11 +507,13 @@ __global__ void attn_tile_rows_kernel(const float* __restrict__ q, const float* 
         o[0] = smb[tid];
         o[1] = sum;
     }
-    if (tid < D) {
+    if (tid < D) {   // (the tile's values of this dimension in registers; the keys past the last: zeros)
         const int n = min(TK, nk - j0);
+        float vc[kATK];
+        for (int jj = 0; jj < kATK; ++jj) vc[jj] = jj < n && jj < TK ? sk[jj * D + tid] : 0.0f;
         for (int tr = 0; tr < TP; ++tr) {
             float v = 0.0f;
-            for (int jj = 0; jj < n; ++jj) v += sw[tr * TK + jj] * sk[jj * D + tid];
+            for (int jj = 0; jj < kATK; ++jj) v += sw[tr * TK + jj] * vc[jj];
             part[(((size_t) (tr / per) * H + g * per + tr % per) * ntile + tile) * D + tid] = v;
         }
     }
@@ -518,6 +536,163 @@ __global__ void attn_combine_kernel(const float* __restrict__ st, const float* _
     v /= sum;
     if (gate) v *= 1.0f / (1.0f + expf(-gate[(size_t) h * D + tid]));
     out[(size_t) h * D + tid] = v;
+}
+// ... the window step's: the tiles summed in their order by every thread (no tree over the threads), so a row's
+// result does not depend on how many tiles the launch has before or after the row's own keys - empty tiles add zeros
+__global__ void attn_combine_seq_kernel(const float* __restrict__ st, const float* __restrict__ part, int ntile, int D,
+                                        const float* __restrict__ gate, float* __restrict__ out) {
+    extern __shared__ float sm[];   // [256] the maximum's tree, [ntile] each tile's factor (an exp a tile, not a thread)
+    float* sh = sm;
+    float* se = sm + 256;
+    const int h = blockIdx.x, tid = threadIdx.x;
+    const float* sth = st + (size_t) h * ntile * 2;
+    float m = 0.0f;
+    for (int b = tid; b < ntile; b += blockDim.x) m = fmaxf(m, sth[2 * b]);
+    m = block_max(m, sh);
+    for (int b = tid; b < ntile; b += blockDim.x) se[b] = expf(sth[2 * b] - m);
+    __syncthreads();
+    if (tid >= D) return;
+    float v = 0.0f, sum = 0.0f;
+    for (int b = 0; b < ntile; ++b) {
+        v += part[((size_t) h * ntile + b) * D + tid] * se[b];
+        sum += sth[2 * b + 1] * se[b];
+    }
+    sum += expf(-m);
+    v /= sum;
+    if (gate) v *= 1.0f / (1.0f + expf(-gate[(size_t) h * D + tid]));
+    out[(size_t) h * D + tid] = v;
+}
+// ---- the window step's fused forms: the decode step's launches over T rows (T 1: a token) --------------------------
+// block = (a kv head, K or V, a row): the row's conv from the window's inputs and the histories before it, the clip /
+// the norm, the F16 cache row; the last row's blocks write the histories after the window into h1
+__global__ void kv_finish_rows_kernel(const float* __restrict__ in_k, const float* __restrict__ in_v,
+                                      const float* __restrict__ hk0, const float* __restrict__ hv0,
+                                      float* __restrict__ hk1, float* __restrict__ hv1, const float* __restrict__ k_conv,
+                                      const float* __restrict__ v_conv, const float* __restrict__ dk,
+                                      const float* __restrict__ dv, int T, int Hkv, int D, float thr, float eps,
+                                      __half* __restrict__ K, __half* __restrict__ V, int ring, long long p0) {
+    __shared__ float sh[256];
+    const int h = blockIdx.x, isv = blockIdx.y, t = blockIdx.z, i = threadIdx.x, C = Hkv * D, c = h * D + i;
+    const float* y = isv ? in_v : in_k;
+    const float* hist = isv ? hv0 : hk0;
+    float* hnew = isv ? hv1 : hk1;
+    const float* w = isv ? v_conv : k_conv;
+    const float* dyn = isv ? dv : dk;
+    float o = 0.0f;
+    if (i < D) {
+        float in[4];   // (in[k]: the input at t - 3 + k)
+        for (int k = 0; k < 4; ++k) {
+            const int tt = t - 3 + k;
+            in[k] = tt >= 0 ? y[(size_t) tt * C + c] : hist[(size_t) (3 + tt) * C + c];
+        }
+        const float h0 = in[0], h1 = in[1], h2 = in[2], v = in[3];
+        o = w[4 * c] * h0 + w[4 * c + 1] * h1 + w[4 * c + 2] * h2 + w[4 * c + 3] * v;
+        if (dyn) {
+            const float* d = dyn + ((size_t) t * Hkv + h) * 4;
+            o += d[0] * v + d[1] * h2 + d[2] * h1 + d[3] * h0;
+        }
+        o = (v + o) * (dyn ? 0.333333343f : 0.44721359f);   // (1 / sqrt(9), 1 / sqrt(5))
+        if (t == T - 1)
+            for (int r = 0; r < 3; ++r) {
+                const int q = T + r;
+                hnew[(size_t) r * C + c] = q < 3 ? hist[(size_t) q * C + c] : y[(size_t) (q - 3) * C + c];
+            }
+    }
+    const float ss = block_sum(o * o, sh);
+    const float f = isv ? rsqrtf(ss / (float) D + eps) : fminf(1.0f, thr / (sqrtf(ss) + 1e-6f));
+    if (i < D) {
+        const long long p = p0 + t;
+        (isv ? V : K)[(size_t) (ring > 0 ? p % ring : p) * C + c] = __float2half_rn(o * f);
+    }
+}
+struct RowMul {
+    float m[16];
+};
+__global__ void clip2_rows_kernel(float* __restrict__ q, int H, int D, const float* __restrict__ qs, float qthr,
+                                  float* __restrict__ rel, int n_rel, const float* __restrict__ rs, float rthr, RowMul mul) {
+    __shared__ float sh[256];
+    const int i = threadIdx.x, h = blockIdx.x, t = blockIdx.y;
+    float* qr = q + ((size_t) t * H + h) * D;
+    float* rr = rel + ((size_t) t * H + h) * n_rel;
+    const float v = i < D ? qr[i] * qs[(size_t) h * D + i] : 0.0f;
+    const float r = i < n_rel ? rr[i] * rs[(size_t) h * n_rel + i] : 0.0f;
+    const float fq = fminf(1.0f, qthr / (sqrtf(block_sum(v * v, sh)) + 1e-6f));
+    const float fr = fminf(1.0f, rthr / (sqrtf(block_sum(r * r, sh)) + 1e-6f));
+    if (i < D) qr[i] = v * fq * mul.m[t];
+    if (i < n_rel) rr[i] = r * fr * mul.m[t];
+}
+// block = (channels, a row): the row's conv (no taps) from the window's inputs y and the histories h0, then cur += it
+// - or, with blk, blk = cur and cur = it (a block's first layer: the stream saved, a new one); the last row's blocks
+// write the histories after the window into h1
+__global__ void conv_add_rows_kernel(const float* __restrict__ y, const float* __restrict__ h0p, float* __restrict__ h1p,
+                                     const float* __restrict__ w, int C, int T, float* __restrict__ cur,
+                                     float* __restrict__ blk) {
+    const int t = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float in[4];
+    for (int k = 0; k < 4; ++k) {
+        const int tt = t - 3 + k;
+        in[k] = tt >= 0 ? y[(size_t) tt * C + c] : h0p[(size_t) (3 + tt) * C + c];
+    }
+    const float h0 = in[0], h1 = in[1], h2 = in[2], v = in[3];
+    const float o = (v + w[4 * c] * h0 + w[4 * c + 1] * h1 + w[4 * c + 2] * h2 + w[4 * c + 3] * v) * 0.44721359f;
+    float* cr = cur + (size_t) t * C + c;
+    if (blk) {
+        blk[(size_t) t * C + c] = *cr;
+        *cr = o;
+    } else {
+        *cr += o;
+    }
+    if (t == T - 1)
+        for (int r = 0; r < 3; ++r) {
+            const int q = T + r;
+            h1p[(size_t) r * C + c] = q < 3 ? h0p[(size_t) q * C + c] : y[(size_t) (q - 3) * C + c];
+        }
+}
+// a window's taps for the drafter: dst [T][n][E] (rows ld apart) from n sources [T][E] each (src.p[k]; host memory the
+// device maps where src.vol bit k is set - another GPU wrote it before this GPU's hand-off came)
+struct TapSrc {
+    const float* p[8];
+    unsigned vol;
+};
+__global__ void taps_gather_kernel(TapSrc src, int n, int T, int E, float* __restrict__ dst, size_t ld) {
+    const size_t total = (size_t) T * n * E;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
+        const int e = (int) (i % (size_t) E), k = (int) (i / (size_t) E % (size_t) n), t = (int) (i / ((size_t) E * n));
+        const float* sp = src.p[k] + (size_t) t * E + e;
+        dst[(size_t) t * ld + (size_t) k * E + e] = (src.vol >> k) & 1u ? *(const volatile float*) sp : *sp;
+    }
+}
+// each row's argmax: out[2 t] the index as a float (ties: the lower), out[2 t + 1] its value; rows ld apart
+__global__ void argmax_rows_kernel(const float* __restrict__ x, size_t ld, int n, float* __restrict__ out) {
+    __shared__ float bv[1024];
+    __shared__ int bi[1024];
+    const float* xr = x + (size_t) blockIdx.x * ld;
+    float best = -INFINITY;
+    int at = n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        if (xr[i] > best) {
+            best = xr[i];
+            at = i;
+        }
+    bv[threadIdx.x] = best;
+    bi[threadIdx.x] = at;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) {
+            const float o = bv[threadIdx.x + st];
+            const int oi = bi[threadIdx.x + st];
+            if (o > bv[threadIdx.x] || (o == bv[threadIdx.x] && oi < bi[threadIdx.x])) {
+                bv[threadIdx.x] = o;
+                bi[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out[2 * blockIdx.x] = (float) bi[0];
+        out[2 * blockIdx.x + 1] = bv[0];
+    }
 }
 // one block: the states' norms and dots, then each query's mix, its own norm and gain
 __global__ void mix_rms_kernel(const float* __restrict__ blocks, size_t ldb, int nb, const float* __restrict__ cur, int T,
@@ -912,14 +1087,25 @@ bool attention_split_rows(const float* q, const float* rel, const float* sink, i
                           const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
                           int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
                           cudaStream_t s) {
-    const int nk = (int) (p0 + T - lo0), per = H / Hkv, TK = 16, ntile = (nk + TK - 1) / TK, TP = T * per;
+    // (the tiles at multiples of TK positions, whatever the first key is: a row's tiles hold the same keys in a token's
+    //  launch and in a window's, the keys it does not see masked - with the combine below, the same sums to the bit)
+    const int TK = kATK;
+    lo0 -= lo0 % TK;
+    const int nk = (int) (p0 + T - lo0), per = H / Hkv, ntile = (nk + TK - 1) / TK, TP = T * per;
     if (TP > 256 || D > 256 || (size_t) T * H * ntile * (size_t) (D + 2) > S_floats) return false;
     float* part = S + (size_t) T * H * ntile * 2;
-    attn_tile_rows_kernel<<<dim3((unsigned) ntile, (unsigned) Hkv), 256,
-                            ((size_t) TK * D + (size_t) TP * TK + (size_t) TP + 16) * sizeof(float), s>>>(
-        q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, (const __half*) K, (const __half*) V, ring,
-        (long long) (ring > 0 ? lo0 % ring : lo0), (int) (p0 - lo0), window, nk, TK, scale, S, part);
-    attn_combine_kernel<<<(unsigned) (T * H), 256, 0, s>>>(S, part, ntile, D, gate, out);
+    const size_t shb = ((size_t) TK * D + (size_t) TP * TK + (size_t) TP + 16) * sizeof(float);
+    const dim3 grid((unsigned) ntile, (unsigned) Hkv);
+    const long long base = (long long) (ring > 0 ? lo0 % ring : lo0);
+    if (T <= 4)
+        attn_tile_rows_kernel<4><<<grid, 256, shb, s>>>(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, (const __half*) K,
+                                                        (const __half*) V, ring, base, (int) (p0 - lo0), window, nk, TK, scale,
+                                                        S, part);
+    else
+        attn_tile_rows_kernel<8><<<grid, 256, shb, s>>>(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, (const __half*) K,
+                                                        (const __half*) V, ring, base, (int) (p0 - lo0), window, nk, TK, scale,
+                                                        S, part);
+    attn_combine_seq_kernel<<<(unsigned) (T * H), 256, (256 + (size_t) ntile) * sizeof(float), s>>>(S, part, ntile, D, gate, out);
     check("attention_split_rows");
     return true;
 }
@@ -1068,6 +1254,53 @@ void lane_add(const unsigned* flag, unsigned v, const int* ids, const int* slot,
               cudaStream_t s) {
     lane_add_kernel<<<blocks_of((size_t) n), 256, 0, s>>>(flag, v, ids, slot, nu, src, y, n);
     check("lane_add");
+}
+int attention_rows_fit(int H, int D, int64_t keys, size_t S_floats) {
+    const int64_t ntile = (keys + 15 + 15) / 16;   // (the first tile's start rounded down)
+    return (int) std::min<int64_t>(256 / std::max(1, H / 8), (int64_t) (S_floats / ((size_t) H * (size_t) ntile * (size_t) (D + 2))));
+}
+void kv_finish_rows(const float* in_k, const float* in_v, int T, const float* hk0, const float* hv0, float* hk1, float* hv1,
+                    const float* k_conv, const float* v_conv, const float* dk, const float* dv, int Hkv, int D, float thr,
+                    float eps, uint16_t* K, uint16_t* V, int ring, int64_t p0, cudaStream_t s) {
+    if (D > 256) {
+        g_err.fetch_add(1);
+        return;
+    }
+    kv_finish_rows_kernel<<<dim3((unsigned) Hkv, 2, (unsigned) T), 256, 0, s>>>(in_k, in_v, hk0, hv0, hk1, hv1, k_conv, v_conv,
+                                                                              dk, dv, T, Hkv, D, thr, eps, (__half*) K,
+                                                                              (__half*) V, ring, (long long) p0);
+    check("kv_finish_rows");
+}
+void clip2_rows(float* q, int T, int H, int D, const float* qs, float qthr, float* rel, int n_rel, const float* rs,
+                float rthr, const float* mul, cudaStream_t s) {
+    if (D > 256 || n_rel > 256 || T > 16) {
+        g_err.fetch_add(1);
+        return;
+    }
+    RowMul m;
+    for (int t = 0; t < 16; ++t) m.m[t] = t < T ? mul[t] : 1.0f;
+    clip2_rows_kernel<<<dim3((unsigned) H, (unsigned) T), 256, 0, s>>>(q, H, D, qs, qthr, rel, n_rel, rs, rthr, m);
+    check("clip2_rows");
+}
+void conv_add_rows(const float* y, int T, const float* h0, float* h1, const float* w, int C, float* cur, float* blk,
+                   cudaStream_t s) {
+    conv_add_rows_kernel<<<dim3(blocks_of((size_t) C), (unsigned) T), 256, 0, s>>>(y, h0, h1, w, C, T, cur, blk);
+    check("conv_add_rows");
+}
+void taps_gather(const float* const* src, unsigned vol, int n, int T, int E, float* dst, size_t ld, cudaStream_t s) {
+    if (n > 8) {
+        g_err.fetch_add(1);
+        return;
+    }
+    TapSrc ts;
+    for (int k = 0; k < 8; ++k) ts.p[k] = k < n ? src[k] : nullptr;
+    ts.vol = vol;
+    taps_gather_kernel<<<blocks_of((size_t) T * n * E), 256, 0, s>>>(ts, n, T, E, dst, ld);
+    check("taps_gather");
+}
+void argmax_rows(const float* x, size_t ld, int rows, int n, float* out, cudaStream_t s) {
+    argmax_rows_kernel<<<(unsigned) rows, 1024, 0, s>>>(x, ld, n, out);
+    check("argmax_rows");
 }
 int errors() { return g_err.exchange(0); }
 

@@ -5,6 +5,7 @@
 #   src/hy4/hy4_lane.cpp    the CPU lane's thread pool
 add_executable(maya-inkling2 src/inkling2/inkling2_main.cpp src/inkling2/inkling2_model.cu
                              src/inkling2/inkling2_kernels.cu src/inkling2/inkling2_lane.cpp
+                             src/inkling2/inkling2_dspark.cu
                              src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp
                              src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
 target_include_directories(maya-inkling2 PRIVATE ${_strata_gpu_include_directories} include src/inkling2 src/hy4

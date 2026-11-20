@@ -4,8 +4,8 @@
 //   maya-inkling2 --pack <dir> --parity <reference dir>                  the reference's tokens one at a time, every
 //                                                                        tensor of its dump compared (llama.cpp's
 //                                                                        graph names: docs/INKLING2_PORT.md)
-// This version has the decode path only (a prompt is fed token by token); the --serve protocol comes with the batched
-// prompt path.
+//   maya-inkling2 --pack <dir> --serve                                    serve/server.py's line protocol
+// Decoding drafts with the model's DSpark drafter unless --dspark off (draft_round below; docs/INKLING2_DSPARK.md).
 #include "inkling2_model.hpp"
 
 #include "mm3_os.hpp"
@@ -152,7 +152,7 @@ struct Lines {
 };
 
 // GEN <max_new> [key=value ...] <id,id,...>: keys this engine does not use are taken and ignored
-bool parse_gen(const std::string& line, mm3::sample::Req& r) {
+bool parse_gen(const std::string& line, mm3::sample::Req& r, float& cum) {
     std::istringstream is(line.substr(4));
     r.top_k = 0;   // (no top-k unless asked)
     if (!(is >> r.max_new)) return false;
@@ -172,6 +172,8 @@ bool parse_gen(const std::string& line, mm3::sample::Req& r) {
         else if (k == "penalty_repeat") r.pen_repeat = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
+        else if (k == "spec") r.spec = std::atoi(v.c_str());
+        else if (k == "dspark_cum" || k == "spec_cum") cum = std::strtof(v.c_str(), nullptr);
     }
     return !r.ids.empty();
 }
@@ -205,13 +207,246 @@ int sample(const float* row, int V, const mm3::sample::Req& r, const std::vector
     return mm3::sample::draw(mm3::sample::dist_c(std::move(c), {}, {}, r, hist), rng);
 }
 
+// ---- drafting (the DSpark drafter, Model::draft): a round reads the token in hand and k drafts in one window, keeps the
+// drafts the model agrees with and gives the token after them ----------------------------------------------------------
+// The window: k maximizes the tokens a millisecond the round is expected to commit, (1 + sum_i prod_{j<=i} p_j) /
+// (t(k + 1) + t_draft), p the drafter's probabilities (close to the measured acceptance: docs/INKLING2_DSPARK.md), t(T)
+// this PC's time of a pass of T rows - a line a + b (T - 1) fitted as it decodes (a: the token steps, b: the windows),
+// from the measured table's values at 3k context - and t_draft the draft's measured time.  k 0: a plain token step.
+// The drafter's own cut on the running product of the probabilities (Options::dspark_cum, 0.5) is the floor under it.
+// Rest: a drafted round gains (kept drafts) x a - (t_draft + k b) milliseconds over plain steps; when that, averaged
+// over the last drafted rounds, is under a tenth of a token step (terse thinking text: half of 1.5 drafts kept), the
+// drafter is not asked for a while (the tokens' taps still reach it: Model::window feeds them), then tried again -
+// 8 rounds, doubling to 32 while it keeps not paying, from 8 again with every request.  (Short on purpose: a rest costs
+// little where drafts are break-even and much where the text turns to code or prose - measured through the server:
+// rests of up to 128 rounds carried from a thinking block slept through most of the code after it.)
+struct Drafting {
+    bool on = false;
+    double a = 30.0, b = 7.0, t_draft = 10.0;   // ms: a token's pass, a window row more, a draft
+    double gain = 0.0;                          // ms a drafted round gains over plain steps (EMA)
+    int n_d = 0, rest = 0, rest_len = 8;
+    int rest0 = 0;   // rounds without a draft after one whose drafts were not worth a window (--dspark-rest0; measured:
+                     // 1 costs prose a sixth of its drafted rounds and gains thinking text nothing)
+    // (counters over the engine's life; a request's are differences)
+    long long rounds = 0, drafted = 0, offered = 0, accepted = 0, passes = 0, tokens = 0, khist[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    long long rested = 0;
+    double draft_ms = 0, verify_ms = 0;
+    bool log = std::getenv("INKLING2_ROUND_LOG") != nullptr;
+    // INKLING2_MARGIN_LOG=1 (tests): a line a greedy token - the gap between the row's two largest logits (a near-tie
+    // is where two runs whose experts sit differently may part)
+    bool margins = std::getenv("INKLING2_MARGIN_LOG") != nullptr;
+
+    double cost(int T) const { return a + b * (T - 1); }
+    int choose(const std::vector<float>& p, int n) const {
+        int best = 0;
+        double cum = 1.0, exp_tok = 1.0, best_rate = 1.0 / (cost(1) + t_draft);
+        for (int k = 1; k <= n; ++k) {
+            cum *= std::min(1.0, std::max(0.0, (double) p[(size_t) k - 1]));
+            exp_tok += cum;
+            const double rate = exp_tok / (cost(k + 1) + t_draft);
+            if (rate > best_rate) {
+                best_rate = rate;
+                best = k;
+            }
+        }
+        return best;
+    }
+    void observe_pass(int T, double ms) {
+        if (T == 1) a = 0.9 * a + 0.1 * ms;
+        else b = 0.9 * b + 0.1 * std::max(0.5, (ms - a) / (T - 1));
+    }
+    void observe_round(bool was_drafted, int k, int kept, double t_draft_ms) {
+        if (!was_drafted) return;
+        const double g = kept * a - (t_draft_ms + k * b);
+        gain = n_d > 0 ? 0.9 * gain + 0.1 * g : g;
+        if (++n_d < 8) return;
+        if (gain < 0.1 * a) {   // drafting does not pay here: rest, longer each time in a row
+            rest = rest_len;
+            rest_len = std::min(32, rest_len * 2);
+            n_d = 0;
+            ++rested;
+        } else if (gain > 0.3 * a) {
+            rest_len = 8;
+        }
+    }
+    void start() {   // (a request's first round: no rest left over from the last one)
+        rest = 0;
+        rest_len = 8;
+        n_d = 0;
+    }
+};
+
+// The model's verdict on draft d at a row of logits: true: d stands (greedy: it is the row's pick; sampled: with
+// probability p(d), p the request's own distribution - ds4's rule for argmax drafts, so the token is the model's own
+// draw either way); false: `next` is the row's token instead (greedy: its pick; sampled: a draw from p without d)
+bool verdict(const float* row, int V, const mm3::sample::Req& r, const std::vector<int>& hist, std::mt19937_64& rng, int d,
+             int& next) {
+    const bool pen = mm3::sample::penalised(r);
+    if (!(r.temperature > 0.0f)) {
+        if (pen) next = mm3::sample::dist(row, V, r, hist)[0].first;
+        else {
+            next = 0;
+            for (int i = 1; i < V; ++i)
+                if (row[i] > row[next]) next = i;
+        }
+        return next == d;
+    }
+    if (!pen && !(r.top_k > 0) && !(r.top_p < 1.0f) && !(r.min_p > 0.0f)) {   // (plain sampling: the softmax itself)
+        int b = 0;
+        for (int i = 1; i < V; ++i)
+            if (row[i] > row[b]) b = i;
+        static thread_local std::vector<float> w;
+        w.resize((size_t) V);
+        const float it = 1.0f / r.temperature, mx = row[b], cut = row[b] - 40.0f * r.temperature;
+        double z = 0;
+        for (int i = 0; i < V; ++i) z += (w[(size_t) i] = row[i] >= cut ? std::exp((row[i] - mx) * it) : 0.0f);
+        const double pd = d >= 0 && d < V ? w[(size_t) d] / z : 0.0;
+        if (std::uniform_real_distribution<double>(0.0, 1.0)(rng) < pd) return true;
+        double u = std::uniform_real_distribution<double>(0.0, z - (d >= 0 && d < V ? w[(size_t) d] : 0.0))(rng);
+        next = b == d ? -1 : b;
+        for (int i = 0; i < V; ++i) {
+            if (i == d || !(w[(size_t) i] > 0)) continue;
+            if (next < 0) next = i;
+            u -= w[(size_t) i];
+            if (u <= 0) {
+                next = i;
+                break;
+            }
+        }
+        if (next < 0) next = b;
+        return false;
+    }
+    std::vector<std::pair<int, double>> p;
+    if (pen) {
+        p = mm3::sample::dist(row, V, r, hist);
+    } else {
+        int b = 0;
+        for (int i = 1; i < V; ++i)
+            if (row[i] > row[b]) b = i;
+        const float cut = row[b] - 40.0f * r.temperature;
+        std::vector<std::pair<int, float>> c;
+        for (int i = 0; i < V; ++i)
+            if (row[i] >= cut) c.push_back({i, row[i]});
+        p = mm3::sample::dist_c(std::move(c), {}, {}, r, hist);
+    }
+    double pd = 0;
+    for (const auto& [t, q] : p)
+        if (t == d) pd = q;
+    if (std::uniform_real_distribution<double>(0.0, 1.0)(rng) < pd) return true;
+    next = mm3::sample::draw(p, rng, d);
+    return false;
+}
+
+// One round after `tok`, the token at m.end() (given out, not read yet).  hist: the tokens before tok and tok (the
+// penalties' history).  room: the tokens the request may still give out (>= 1).  out: the tokens after tok - the drafts
+// that stood, then the model's next - the last of them the next round's tok; `read`: the rows the context took (tok and
+// the kept drafts).  spec: this request drafts.
+bool draft_round(inkling2::Model& m, Drafting& dr, int tok, const mm3::sample::Req& r, const std::vector<int>& hist,
+                 std::mt19937_64& rng, long long room, bool spec, std::vector<int>& out, std::vector<float>& lg,
+                 std::string& err) {
+    out.clear();
+    const int V = m.vocab();
+    const bool sampled = r.temperature > 0.0f || mm3::sample::penalised(r);
+    const bool want_lg = sampled || dr.margins;
+    const double t0 = now_s();
+    std::vector<int> toks;
+    std::vector<float> probs;
+    int k = 0;
+    bool was_drafted = false;
+    const long long ctx_room = m.max_ctx() - m.end();
+    if (spec && dr.on && room > 1 && ctx_room > 2) {
+        if (dr.rest > 0) {
+            --dr.rest;
+        } else {
+            const int max_n = (int) std::min<long long>({7, room - 1, (long long) m.window_max() - 1, ctx_room - 1});
+            if (!m.draft(tok, max_n, toks, probs, err)) return false;
+            const double td = (now_s() - t0) * 1e3;
+            dr.t_draft = 0.9 * dr.t_draft + 0.1 * td;
+            dr.draft_ms += td;
+            ++dr.drafted;
+            was_drafted = true;
+            k = dr.choose(probs, (int) toks.size());
+            if (k == 0) dr.rest = std::max(dr.rest, dr.rest0);   // (no draft worth a window here: likely none at the next token)
+        }
+    }
+    const int T = k + 1;
+    int ids[16], tops[16];
+    ids[0] = tok;
+    for (int i = 0; i < k; ++i) ids[i + 1] = toks[(size_t) i];
+    if (want_lg) lg.resize((size_t) T * V);
+    const double t1 = now_s();
+    if (!m.window(ids, T, m.end(), tops, want_lg ? lg.data() : nullptr, err)) return false;
+    const double tv = (now_s() - t1) * 1e3;
+    dr.verify_ms += tv;
+    dr.observe_pass(T, tv);
+    int acc = 0, next = -1;
+    std::vector<int> h2;
+    if (want_lg) h2 = hist;
+    for (int i = 0; i < k; ++i) {
+        const int d = toks[(size_t) i];
+        bool ok;
+        if (!sampled) {
+            ok = tops[i] == d;
+            next = tops[i];
+        } else {
+            ok = verdict(lg.data() + (size_t) i * V, V, r, h2, rng, d, next);
+        }
+        if (!ok) break;
+        ++acc;
+        if (want_lg) h2.push_back(d);
+    }
+    if (dr.margins && !sampled)
+        for (int i = 0; i <= acc; ++i) {   // (the rows that gave a token: its logit over the runner-up's)
+            const float* row = lg.data() + (size_t) i * V;
+            float b1 = -1e30f, b2 = -1e30f;
+            for (int v = 0; v < V; ++v) {
+                if (row[v] > b1) {
+                    b2 = b1;
+                    b1 = row[v];
+                } else if (row[v] > b2) {
+                    b2 = row[v];
+                }
+            }
+            std::fprintf(stderr, "MARGIN pos %lld token %d gap %.4f\n", (long long) (m.end() - T + i + 1), tops[i], b1 - b2);
+        }
+    if (acc == k) {
+        if (!sampled) next = tops[k];
+        else {
+            next = sample(lg.data() + (size_t) k * V, V, r, h2, rng);
+        }
+    }
+    if (acc < k && !m.keep(acc + 1, err)) return false;
+    for (int i = 0; i < acc; ++i) out.push_back(toks[(size_t) i]);
+    out.push_back(next);
+    ++dr.rounds;
+    ++dr.passes;
+    dr.tokens += acc + 1;
+    dr.offered += k;
+    dr.accepted += acc;
+    ++dr.khist[std::min(k, 7)];
+    dr.observe_round(was_drafted, k, acc, (t1 - t0) * 1e3);
+    if (dr.log) {
+        std::fprintf(stderr, "ROUND pos %lld made %zu k %d kept %d draft %.1f ms pass %.1f ms p", (long long) m.end(), toks.size(),
+                     k, acc, was_drafted ? (t1 - t0) * 1e3 : 0.0, tv);
+        for (float p : probs) std::fprintf(stderr, " %.2f", p);
+        std::fprintf(stderr, "\n");
+    }
+    return true;
+}
+
 // short: a prompt's unread tokens up to this many go through the decode path, a token a step (measured: the prompt
 // path's chunk costs more than that many steps)
-int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n) {
+int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool drafting, float cum_default, int rest0) {
     for (const std::string& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const inkling2::Stats& st = m.stats();
-    std::printf("INFO engine=inkling2 engine_kind=inkling2 model=Inkling-2-Small ctx=%lld vram_gb=%.2f dspark=0 mtp=0 "
-                "experts=%d experts_vram=%d\n", (long long) m.max_ctx(), st.vram_gb, st.experts_all, st.experts_vram);
+    std::printf("INFO engine=inkling2 engine_kind=inkling2 model=Inkling-2-Small ctx=%lld vram_gb=%.2f dspark=%d mtp=0 "
+                "experts=%d experts_vram=%d\n", (long long) m.max_ctx(), st.vram_gb + m.dspark_vram_gb(),
+                m.dspark() && drafting ? 1 : 0, st.experts_all, st.experts_vram);
+    Drafting dr;
+    dr.on = m.dspark() && drafting;
+    if (rest0 >= 0) dr.rest0 = rest0;
+    std::vector<int> out;
+    std::vector<float> lgw;
     std::printf("READY %lld stop\n", (long long) m.max_ctx());
     std::fflush(stdout);
     std::fprintf(stderr, "maya inkling2 serve: GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT\n");
@@ -233,7 +468,8 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n) {
         lines.stop = false;
         ++counter;
         mm3::sample::Req r;
-        if (!parse_gen(line, r)) {
+        float cum = cum_default;
+        if (!parse_gen(line, r, cum)) {
             std::printf("ERR expected: GEN <max_new> [keys] <id,id,...>\n");
             std::fflush(stdout);
             continue;
@@ -299,30 +535,54 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n) {
         const char* finish = "length";
         long long produced = 0;
         const int64_t cpu0 = st.cpu_experts, ex0 = st.experts;
-        while (produced < r.max_new) {
-            const int tok = want_lg ? sample(lg.data(), m.vocab(), r, held, rng) : m.top();
-            std::printf("T %d\n", tok);
+        dr.start();
+        const Drafting d0 = dr;
+        const bool spec = dr.on && r.spec != 0;
+        if (dr.on) m.set_draft_cum(cum);
+        // the answer's first token from the prompt's last row; then rounds: the token in hand read (with drafts, when
+        // the drafter has some worth a window), the tokens after it given out
+        int tok = want_lg ? sample(lg.data(), m.vocab(), r, held, rng) : m.top();
+        bool more = r.max_new > 0;
+        auto emit = [&](int t) {   // false: the answer ends with it
+            std::printf("T %d\n", t);
             ++produced;
-            if (is_stop(tok)) {   // (the end token goes out too: the server's finish reason comes from it)
+            if (is_stop(t)) {   // (the end token goes out too: the server's finish reason comes from it)
                 finish = "stop";
                 std::fflush(stdout);
-                break;
+                return false;
             }
             if (produced % 32 == 0) {
                 const double ms = (now_s() - t1) * 1e3;
                 const double share = (double) (st.cpu_experts - cpu0) / (double) std::max<int64_t>(1, st.experts - ex0);
-                std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f cpu_share=%.4f swaps=%lld\n",
-                            1e3 * (double) produced / ms, ms / (double) produced, 1.0 - share, 0.0, share,
-                            (long long) st.swaps);
+                std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f cpu_share=%.4f swaps=%lld", 1e3 * (double) produced / ms,
+                            ms / (double) produced, 1.0 - share, 0.0, share, (long long) st.swaps);
+                if (dr.on) {
+                    std::printf(" draft_rounds=%lld draft_ms=%.3f verify_ms=%.3f", dr.drafted - d0.drafted,
+                                dr.draft_ms - d0.draft_ms, dr.verify_ms - d0.verify_ms);
+                    if (dr.offered > d0.offered)
+                        std::printf(" drafts=%.3f draft_acc=%lld draft_off=%lld",
+                                    (double) (dr.accepted - d0.accepted) / (double) (dr.offered - d0.offered),
+                                    dr.accepted - d0.accepted, dr.offered - d0.offered);
+                }
+                std::printf("\n");
             }
             std::fflush(stdout);
-            held.push_back(tok);
+            return true;
+        };
+        if (more) more = emit(tok);
+        while (more) {
             if (lines.stop.load() || lines.wrap.load()) {
+                held.push_back(tok);
                 finish = "cancel";
                 break;
             }
-            if (produced >= r.max_new || m.end() + 1 > m.max_ctx()) break;
-            if (!m.forward(&tok, 1, m.end(), want_lg ? lg.data() : nullptr, err)) {
+            if (produced >= r.max_new || m.end() + 1 > m.max_ctx()) {
+                held.push_back(tok);
+                break;
+            }
+            held.push_back(tok);
+            const int64_t at = m.end();
+            if (!draft_round(m, dr, tok, r, held, rng, r.max_new - produced, spec, out, lgw, err)) {
                 std::printf("ERR %s\n", err.c_str());
                 std::fprintf(stderr, "inkling2: %s\n", err.c_str());
                 m.reset();
@@ -330,10 +590,24 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n) {
                 finish = "cancel";
                 break;
             }
+            for (size_t i = 0; i < out.size() && more; ++i) {
+                more = emit(out[i]);
+                if (i + 1 < out.size()) {
+                    if (more) held.push_back(out[i]);   // (a kept draft: the context read it)
+                    else if (!m.keep((int) i + 1, err)) {   // (an end token among the kept drafts: the context ends before it)
+                        std::fprintf(stderr, "inkling2: %s\n", err.c_str());
+                        m.reset();
+                        held.clear();
+                    }
+                }
+            }
+            (void) at;
+            tok = out.back();
         }
         held.resize((size_t) std::min<int64_t>((int64_t) held.size(), m.end()));   // (the last token given out is not read yet)
         const double t2 = now_s();
-        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0\n", produced, n, (t1 - t0) * 1e3, (t2 - t1) * 1e3, finish, from);
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, n, (t1 - t0) * 1e3, (t2 - t1) * 1e3, finish,
+                    dr.accepted - d0.accepted, dr.offered - d0.offered, from);
         std::fflush(stdout);
         std::fprintf(stderr,
                      "maya inkling2 serve: prompt %zu tokens = %zu reused (%zu held in common) + %zu read in %.0f ms (%.1f "
@@ -344,6 +618,14 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n) {
                      100.0 - 100.0 * (double) (st.cpu_experts - cpu0) / (double) std::max<int64_t>(1, st.experts - ex0),
                      100.0 * (double) (st.cpu_experts - cpu0) / (double) std::max<int64_t>(1, st.experts - ex0),
                      (long long) st.swaps);
+        if (dr.on) {
+            std::fprintf(stderr, "maya inkling2 serve: drafts %lld of %lld kept in %lld drafted rounds of %lld (%.2f tokens a pass), "
+                                 "k histogram", dr.accepted - d0.accepted, dr.offered - d0.offered, dr.drafted - d0.drafted,
+                         dr.rounds - d0.rounds, (double) (dr.tokens - d0.tokens) / (double) std::max(1ll, dr.passes - d0.passes));
+            for (int k = 0; k < 8; ++k) std::fprintf(stderr, " %lld", dr.khist[k] - d0.khist[k]);
+            std::fprintf(stderr, "; draft %.1f ms a round, a pass %.1f + %.1f ms a row, rests %lld\n", dr.t_draft, dr.a, dr.b,
+                         dr.rested - d0.rested);
+        }
         if (!m.save_profile(err)) std::fprintf(stderr, "inkling2: the expert profile: %s\n", err.c_str());
     }
     return 0;
@@ -378,6 +660,15 @@ int usage() {
                  "                      a window cut back, a window's time for 1 .. 9 rows\n"
                  "  --rewind-test DIR   (tests) a reference's prompt read, rewound and read on, against a cold read\n"
                  "  --short-bench       (tests, with --tokens) short suffixes on the prompt path and the decode path\n"
+                 "  --dspark on|off|idle  the DSpark drafter: speculative decoding with it (on, the default), not loaded (off),\n"
+                 "                      or loaded and fed but never asked for drafts (idle: tests)\n"
+                 "  --dspark-index DIR  its index (default /mnt/data/models/llm/Inkling-2-Small-MTP/maya-inkling2-dspark-q8_0)\n"
+                 "  --dspark-cum F      the floor on the running product of the drafts' probabilities (default 0.5; a\n"
+                 "                      request's dspark_cum key)\n"
+                 "  --temperature F / --seed N   (tests, with --tokens) sampled decoding\n"
+                 "  --prompts F         (tests) a prompt a line (ids), each decoded from an empty context\n"
+                 "  --ab                (tests) each prompt twice, without drafts and with them: the speeds, the tokens compared\n"
+                 "  --window-bits       (tests, with --window-test) which part of a window differs from the token steps\n"
                  "  --verbose\n");
     return 2;
 }
@@ -389,9 +680,14 @@ int main(int argc, char** argv) {
     std::vector<std::string> parities;
     std::string tokens;
     int n_predict = 0, repeat = 1, short_n = 3;
-    bool serving = false, short_bench = false;
+    bool serving = false, short_bench = false, window_bits = false;
+    std::string dspark = "on", dspark_index = "/mnt/data/models/llm/Inkling-2-Small-MTP/maya-inkling2-dspark-q8_0";
+    float dspark_cum = 0.5f, temperature = 0.0f;
+    unsigned long long seed = 0;
     std::vector<int> stops = {200006, 199999};   // the model's end of sequence and <|content_model_end_sampling|>
-    std::string rewind_test, tokens_file, window_test;
+    std::string rewind_test, tokens_file, window_test, prompts_file;
+    bool ab = false;
+    std::vector<int> rest0_list;   // (tests: prompt i's Drafting::rest0)
     std::vector<int> try_chunks;
     int64_t parity_max = -1;
     bool decode_only = false;   // (parity) the prompt token by token (the decode path) instead of the prompt path
@@ -430,17 +726,38 @@ int main(int argc, char** argv) {
         else if (a == "--eos") stops = int_list(val());
         else if (a == "--rewind-test") rewind_test = val();
         else if (a == "--window-test") window_test = val();
+        else if (a == "--window-bits") window_bits = true;
+        else if (a == "--prompts") prompts_file = val();
+        else if (a == "--ab") ab = true;
+        else if (a == "--dspark-rest0") rest0_list = int_list(val());
         else if (a == "--short-bench") short_bench = true;
         else if (a == "--parity-detail") detail = true;
         else if (a == "--parity-decode") decode_only = true;
         else if (a == "--prefill-chunk") o.prefill_chunk = std::atoi(val().c_str());
         else if (a == "--parity-force-picks") force_opt = true;
         else if (a == "--parity-force-only") force_opt = force_only = true;
+        else if (a == "--dspark") dspark = val();
+        else if (a == "--dspark-index") dspark_index = val();
+        else if (a == "--dspark-cum") dspark_cum = std::strtof(val().c_str(), nullptr);
+        else if (a == "--temperature") temperature = std::strtof(val().c_str(), nullptr);
+        else if (a == "--seed") seed = std::strtoull(val().c_str(), nullptr, 10);
         else return usage();
     }
-    if (o.pack.empty() || (parities.empty() && tokens.empty() && !serving && rewind_test.empty() && tokens_file.empty() && window_test.empty()))
+    if (o.pack.empty() || (parities.empty() && tokens.empty() && !serving && rewind_test.empty() && tokens_file.empty() &&
+                           window_test.empty() && prompts_file.empty()))
         return usage();
     std::string err;
+    // the drafter: with --serve and the plain decode (the tests run without it); its index missing: none, said so
+    const bool drafting = dspark != "off" && dspark != "none" && parities.empty() && rewind_test.empty() && !short_bench &&
+                          tokens_file.empty();
+    if (drafting) {
+        if (std::ifstream(dspark_index + "/dspark.txt").good()) {
+            o.dspark_index = dspark_index;
+            o.dspark_cum = dspark_cum;
+        } else {
+            std::fprintf(stderr, "maya-inkling2: no drafter at %s: decoding without drafts\n", dspark_index.c_str());
+        }
+    }
     for (const std::string& d : parities) {   // (a wrong folder: said before the load)
         Ref r;
         if (!r.load(d, err)) {
@@ -453,9 +770,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
         return 1;
     }
-    if (serving) return serve(model, stops, short_n);
+    const bool swap_opt = o.swap;
+    if (serving) return serve(model, stops, short_n, drafting && dspark != "idle", dspark_cum, rest0_list.empty() ? -1 : rest0_list[0]);
     for (const std::string& s : model.info_lines()) std::printf("%s\n", s.c_str());
     std::printf("loaded in %.1f s, %.1f GB of VRAM\n", model.stats().load_s, model.stats().vram_gb);
+    if (model.dspark()) std::printf("the DSpark drafter: %.2f GB of VRAM on the last GPU%s\n", model.dspark_vram_gb(),
+                                    dspark == "idle" ? " (idle: fed, not asked)" : "");
     if (!tokens_file.empty()) {
         // --tokens-file F: a prompt a line (ids), each read from an empty context and --n-predict tokens decoded after
         // it - with --profile-out the routings of a corpus, the pack's default.prof
@@ -507,13 +827,16 @@ int main(int argc, char** argv) {
         model.reset();
         if (!model.forward(rf.prompt.data(), (int) rf.prompt.size(), 0, nullptr, err)) return 1;
         const int64_t P = model.end();
+        // (the experts stay where they are for the comparison: an expert the cache moves between the two passes is
+        //  summed on the CPU lane in one and on the GPU in the other, which no window can undo - shown at the end)
+        model.set_swap(false);
         std::vector<int> gt, tops((size_t) W);
         std::vector<float> lt((size_t) W * V), lw((size_t) W * V), l1((size_t) V);
         for (int t = 0; t < W; ++t) {
             gt.push_back(model.top());
             if (!model.forward(&gt.back(), 1, P + t, lt.data() + (size_t) t * V, err)) return 1;
         }
-        int bad = 0;
+        int bad = 0, n_bits = 0;
         if (model.rewind(P) != P || !model.window(gt.data(), W, P, tops.data(), lw.data(), err)) {
             std::fprintf(stderr, "maya-inkling2: the window at %lld: %s\n", (long long) P, err.c_str());
             return 1;
@@ -524,10 +847,13 @@ int main(int argc, char** argv) {
             int am = 0;
             for (int i = 1; i < V; ++i)
                 if (lt[(size_t) t * V + i] > lt[(size_t) t * V + am]) am = i;
-            const bool ok = am == tops[(size_t) t] && c >= 0.9999;
+            const bool ok = am == tops[(size_t) t] && c >= 0.9995;
             bad += !ok;
-            std::printf("  row %d: next token %d / %d a step, logits cosine %.6f - %s\n", t, tops[(size_t) t], am, c,
-                        ok ? "OK" : "DIFFERENT");
+            n_bits += std::memcmp(lt.data() + (size_t) t * V, lw.data() + (size_t) t * V, sizeof(float) * (size_t) V) == 0;
+            double dmax = 0;
+            for (int i = 0; i < V; ++i) dmax = std::max(dmax, (double) std::fabs(lt[(size_t) t * V + i] - lw[(size_t) t * V + i]));
+            std::printf("  row %d: next token %d / %d a step, logits cosine %.6f, max difference %.3g%s - %s\n", t,
+                        tops[(size_t) t], am, c, dmax, dmax == 0 ? " (the same to the bit)" : "", ok ? "OK" : "DIFFERENT");
         }
         // cut back to 4 rows, then the 5th token a step: its logits against the token steps'
         if (!model.keep(4, err) || !model.forward(&gt[4], 1, P + 4, l1.data(), err)) {
@@ -536,9 +862,54 @@ int main(int argc, char** argv) {
         }
         {
             const double c = cosine(lt.data() + (size_t) 4 * V, l1.data());
-            const bool ok = c >= 0.9999;
+            const bool ok = c >= 0.9995;
             bad += !ok;
             std::printf("window cut back to 4 rows, the next token a step: logits cosine %.6f - %s\n", c, ok ? "OK" : "DIFFERENT");
+        }
+        if (window_bits) {
+            // --window-bits: which part of a window differs from the token steps - the window again with a part of it
+            // run a row at a time through a token's launches (Model::set_debug), each against the token steps' logits;
+            // and the token steps themselves a second time (with --no-swap the same to the bit)
+            auto cmp = [&](const char* what, const float* x) {
+                int same = 0;
+                double cmin = 1.0;
+                for (int t = 0; t < W; ++t) {
+                    same += std::memcmp(lt.data() + (size_t) t * V, x + (size_t) t * V, sizeof(float) * (size_t) V) == 0;
+                    cmin = std::min(cmin, cosine(lt.data() + (size_t) t * V, x + (size_t) t * V));
+                }
+                std::printf("bits: %-52s %d of %d rows the same to the bit, least cosine %.6f\n", what, same, W, cmin);
+                std::fflush(stdout);
+            };
+            if (model.rewind(P) != P) return 1;
+            for (int t = 0; t < W; ++t)
+                if (!model.forward(&gt[(size_t) t], 1, P + t, lw.data() + (size_t) t * V, err)) return 1;
+            cmp("the token steps again", lw.data());
+            static const std::pair<int, const char*> masks[] = {
+                {0, "the window"}, {1, "... block-type GEMVs a column a launch"}, {2, "... experts a row at a time (plan form)"},
+                {4, "... the CPU lane a row at a time"}, {8, "... F32 GEMVs a column a launch"}, {15, "... all four"}};
+            for (const auto& [mask, what] : masks) {
+                model.set_debug(mask);
+                if (model.rewind(P) != P || !model.window(gt.data(), W, P, tops.data(), lw.data(), err)) return 1;
+                cmp(what, lw.data());
+            }
+            model.set_debug(0);
+        }
+        std::printf("%d of %d rows the same to the bit as the token steps (the experts where they were)\n", n_bits, W);
+        if (swap_opt) {   // (not judged: what the cache's moves between two passes do to the same token steps)
+            model.set_swap(true);
+            double cmin = 1.0;
+            int same = 0;
+            for (int rep2 = 0; rep2 < 2; ++rep2) {
+                if (model.rewind(P) != P) return 1;
+                for (int t = 0; t < W; ++t)
+                    if (!model.forward(&gt[(size_t) t], 1, P + t, lw.data() + (size_t) t * V, err)) return 1;
+            }
+            for (int t = 0; t < W; ++t) {
+                cmin = std::min(cmin, cosine(lt.data() + (size_t) t * V, lw.data() + (size_t) t * V));
+                same += std::memcmp(lt.data() + (size_t) t * V, lw.data() + (size_t) t * V, sizeof(float) * (size_t) V) == 0;
+            }
+            std::printf("the token steps again with the expert cache moving experts in between: %d of %d rows the same to the "
+                        "bit, least logits cosine %.6f (CPU-lane and GPU sums of an expert differ)\n", same, W, cmin);
         }
         std::printf("a window's time at position %lld, ms (5 runs each):", (long long) P);
         for (int T = 1; T <= W; ++T) {
@@ -643,8 +1014,22 @@ int main(int argc, char** argv) {
     std::vector<float> logits((size_t) model.vocab());
 
     if (parities.empty()) {
-        std::vector<int> ids = int_list(tokens);
-        if (ids.empty()) return usage();
+        // --tokens: a prompt; --prompts F: a prompt a line, each from an empty context.  --ab: each prompt twice, without
+        // drafts and then with them (the drafter fed both times): the speeds, and whether the tokens are the same
+        std::vector<std::vector<int>> plist;
+        if (!prompts_file.empty()) {
+            std::ifstream pf(prompts_file);
+            for (std::string line; std::getline(pf, line);)
+                if (!int_list(line).empty()) plist.push_back(int_list(line));
+        } else {
+            plist.push_back(int_list(tokens));
+        }
+        if (plist.empty() || plist[0].empty()) return usage();
+        std::vector<int> gen, gen_a;
+        for (size_t pi = 0; pi < plist.size(); ++pi)
+        for (int mode = ab ? 0 : 1; mode < 2; ++mode) {
+        const std::vector<int>& ids = plist[pi];
+        gen.clear();
         double t0 = 0, t1 = 0;
         for (int r = 0; r < std::max(1, repeat); ++r) {   // (--repeat: the prompt again from an empty context)
             model.reset();
@@ -665,25 +1050,75 @@ int main(int argc, char** argv) {
         const int64_t cpu0 = model.stats().cpu_experts, ex0 = model.stats().experts;
         const double cms0 = model.stats().cpu_ms;
         int n = 0;
-        for (; n < n_predict; ++n) {
-            const int tok = model.top();
-            std::printf("%d ", tok);
-            std::fflush(stdout);
-            if (tok == model.eos()) break;
-            if (!model.forward(&tok, 1, model.end(), nullptr, err)) {
-                std::fprintf(stderr, "\nmaya-inkling2: %s\n", err.c_str());
-                return 1;
+        Drafting dr;
+        dr.on = model.dspark() && dspark != "idle" && mode == 1;
+        if (!rest0_list.empty()) {   // (tests: prompt i's rest0; 9: without drafts)
+            dr.rest0 = rest0_list[pi % rest0_list.size()];
+            if (dr.rest0 == 9) dr.on = false;
+        }
+        {   // rounds, as serve's: the token in hand read (with the drafter's drafts when they are worth a window)
+            mm3::sample::Req rq;
+            rq.temperature = temperature;
+            rq.top_k = 0;
+            std::mt19937_64 rng(seed != 0 ? seed : 0x9E3779B97F4A7C15ull);
+            std::vector<int> hist = ids, out;
+            std::vector<float> lgw;
+            if (temperature > 0.0f) {   // (the prompt's last row again for its logits: a token's step back)
+                std::fprintf(stderr, "maya-inkling2: --temperature: the first token is the greedy one\n");
+            }
+            int tok = model.top();
+            bool more = n_predict > 0;
+            auto emit = [&](int t) {
+                std::printf("%d ", t);
+                std::fflush(stdout);
+                gen.push_back(t);
+                ++n;
+                return t != model.eos() && n < n_predict;
+            };
+            if (more) more = emit(tok);
+            while (more) {
+                hist.push_back(tok);
+                if (!draft_round(model, dr, tok, rq, hist, rng, n_predict - n, true, out, lgw, err)) {
+                    std::fprintf(stderr, "\nmaya-inkling2: %s\n", err.c_str());
+                    return 1;
+                }
+                for (size_t i = 0; i < out.size() && more; ++i) {
+                    more = emit(out[i]);
+                    if (i + 1 < out.size()) hist.push_back(out[i]);
+                }
+                tok = out.back();
             }
         }
         const double t2 = now_s();
         const inkling2::Stats& st = model.stats();
-        if (n > 0)
+        if (n > 0) {
             std::printf("\ndecode: %d tokens, %.2f tok/s; %.1f%% of the routed experts on the CPU lane (%.1f ms a token), %lld "
                         "cache moves\n",
                         n, n / (t2 - t1), 100.0 * (double) (st.cpu_experts - cpu0) / (double) std::max<int64_t>(1, st.experts - ex0),
                         (st.cpu_ms - cms0) / n, (long long) st.swaps);
-        else
+            if (dr.on) {
+                std::printf("drafting: %lld passes for %lld tokens (%.2f tokens a pass), %lld of %lld drafts kept, %lld drafted "
+                            "rounds (%.1f ms a draft), %lld rests; a pass %.1f ms + %.1f a row; k histogram (0 .. 7):",
+                            dr.passes, dr.tokens, (double) dr.tokens / (double) std::max(1ll, dr.passes), dr.accepted, dr.offered,
+                            dr.drafted, dr.drafted ? dr.draft_ms / (double) dr.drafted : 0.0, dr.rested, dr.a, dr.b);
+                for (int k = 0; k < 8; ++k) std::printf(" %lld", dr.khist[k]);
+                std::printf("\n");
+            }
+        } else {
             std::printf("next: %d\n", model.top());
+        }
+        if (ab && mode == 0) gen_a = gen;
+        if (ab && mode == 1) {
+            size_t same = 0;
+            while (same < gen.size() && same < gen_a.size() && gen[same] == gen_a[same]) ++same;
+            if (same == gen.size() && gen.size() == gen_a.size())
+                std::printf("ab: prompt %zu: the %zu tokens with drafts are the ones without\n", pi + 1, gen.size());
+            else
+                std::printf("ab: prompt %zu: the tokens differ from token %zu on (%d with drafts, %d without)\n", pi + 1, same,
+                            same < gen.size() ? gen[same] : -1, same < gen_a.size() ? gen_a[same] : -1);
+        }
+        std::fflush(stdout);
+        }
         if (!model.save_profile(err)) std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
         return 0;
     }

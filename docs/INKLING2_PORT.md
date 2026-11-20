@@ -6,19 +6,20 @@ ggml block-type kernels (`src/ds4/ds4_iq.cu`, `ds4_iq_cpu.cpp`, `ds4_gguf_cpu.cp
 
 Branch: `inkling2-engine`.
 
-## Status (2026-11-20, commit 85ef75e)
+## Status (2026-11-20, after commit f620cbc: speculative decoding wired)
 
-Measured on this PC; `--max-context 32768`, `default.prof` loads by itself.
+Measured on this PC; `--max-context 32768`, `default.prof` loads by itself, the drafter on by default.
 
-| | |
-|---|---|
-| Decode, short context | 36.9 tok/s |
-| Decode after a 2.7k-token prompt | 32.8 tok/s |
-| Decode at 16k / 32k context | 26.0 / 22.0 tok/s |
-| Chat turns through serve/server.py (my_e2e: document, follow-up, code) | 31.7 / 32.7 / 32.0 tok/s |
-| Prompt, 2698 tokens | ~945 tok/s (~1190 at 16k) |
-| Parity with llama.cpp | PARITY OK, short and long, natural and forced picks |
-| DeepSeek (maya-ds4) here, for comparison | 35.6 tok/s without drafting, 57.5 with DSpark |
+| | without drafts (`--dspark off`) | with the DSpark drafter (default) |
+|---|---|---|
+| Decode, short context (12-token prompt, 512 tokens) | 37.5 tok/s | - |
+| Prose: the 2.7k-token reference prompt continued, 256 tokens | 33.8 tok/s | 62.3 - 66.0 tok/s |
+| Code: a chat request for a Python module, 256 tokens | 36.3 tok/s | 53.3 - 57.3 tok/s |
+| Thinking: a chat question at effort 0.9, 256 tokens of thinking notes | 37.3 tok/s (39.2 with the cache warm) | 35.3 - 36.1 tok/s (39.2 with the cache warm) |
+| Chat turns through serve/server.py (my_e2e: document, follow-up, code; temperature 1) | 32.0 / 33.8 / 32.1 tok/s | 38.2 / 40.5 / 45.7 tok/s |
+| Prompt, 2698 tokens | ~940 tok/s | the same (every row's taps fed to the drafter) |
+| Parity with llama.cpp | PARITY OK, short and long, natural and forced picks | |
+| DeepSeek (maya-ds4) here, for comparison | 35.6 tok/s | 57.5 |
 
 Done:
 - Load: layer split, the expert pack, RAM experts pinned.
@@ -27,29 +28,59 @@ Done:
 - Batched prompt path: RAM experts streamed into VRAM.
 - Prefix reuse with checkpointed rewind (`--rewind`); F16 KV.
 - `--serve` (maya-hy4's protocol, docs/INKLING2_SERVING.md).
-- Split-K decode attention.
-- Verify window: `Model::window` / `keep`, T ≤ 9 tokens.
-- The DSpark drafter as a standalone module (src/inkling2/inkling2_dspark.*; docs/INKLING2_DSPARK.md).
+- **One step for T = 1 .. 9 rows** (`Impl::layer_win`): a token's step is a window of one row. Row versions of the fused
+  kernels (`kv_finish_rows`, `clip2_rows`, `conv_add_rows`, `mix_rms_rows`), the attention's tiles at fixed positions
+  with a sequential combine, the histories written from one buffer to another (the old one is what `keep()` cuts
+  back from). A window's rows are **the token steps' logits to the bit** while the experts stay where they are
+  (`--window-test`: 9 of 9 rows; `--window-bits` shows it part by part).
+- The CPU lane over a window (`cpu_experts_rows`): a RAM expert several rows picked is read once for them.
+- The drafter's taps: every row of every step and of every prompt chunk, F32 [rows][8][4608] on the last GPU, fed to
+  `Dspark::feed_dev` once the rows are kept.
+- Drafting in the decode loop and in `--serve` (`draft_round` in inkling2_main.cpp): draft -> window -> keep -> feed;
+  the window by expected tokens a millisecond; greedy and sampled acceptance; `--dspark on|off|idle`,
+  `--dspark-index`, `--dspark-cum`; INFO `dspark=1`, DONE `drafts_acc` / `drafts_off`. docs/INKLING2_DSPARK.md
+  ("In the engine") has the numbers.
 
-Not done (drafting is not wired yet):
-1. One code path for T = 1 and windows. Window rows match the token step only to cosine 0.995-0.9999 (same tokens),
-   because the window uses unfused row kernels.
-2. The CPU lane over a window: a RAM expert picked by several rows is read once a row today.
-3. The drafter's taps out of the window step and the prompt path (all rows) to the drafter's GPU.
-4. Drafting in the decode and serve loops: the k policy from t(T), sampled acceptance, and `--dspark` flags.
-5. End-to-end drafted measurement.
+t(T) at 2.7k context, ms a pass of T rows (`--window-test`, the drafter's taps on):
 
-t(T) at 3k context, ms per window pass, for T = 1..9: 30.4, 43.1, 50.7, 58.4, 68.1, 76.4, 83.8, 93.5, 100.0.
-Unique experts grow by ~4.3 per layer per row (~4.3 ms at bandwidth); the rest of the ~8 ms per row is unmeasured
-(there are no phase marks in the window step yet).
+| T | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|
+| before (commit 85ef75e) | 30.4 | 43.1 | 50.7 | 58.4 | 68.1 | 76.4 | 83.8 | 93.5 | 100.0 |
+| now | 29.9 | 38.9 | 45.5 | 51.3 | 59.2 | 65.5 | 71.2 | 77.4 | 83.7 |
+| now, `--dspark off` (no taps) | 29.1 | 38.8 | 45.5 | 50.8 | 59.1 | 65.9 | 71.6 | 77.5 | 83.0 |
+
+A row more costs 6.7 ms (8.7 before). What is left of it (`INKLING2_PHASES=1`, a line a window size): the routed
+experts 4.7 ms (4.3 more unique experts a layer, at the cards' memory bandwidth: the floor), the input projections'
+extra columns 0.5, the router / publish / grouping 0.45, the attention 0.33 (2.2 before), the output projection 0.23,
+the lane 0.2.
+
+Two passes over the same tokens differ when the expert cache moved an expert between them (its sum on the CPU lane is
+not its sum on the GPU: logits cosine 0.995-0.9999, windows or not). A drafted run moves experts at other moments
+than an undrafted one (a poll a pass, not a token), so:
+- with `--no-swap` the drafted greedy answer is the undrafted one token for token (`--ab --no-swap`: three prompts,
+  256 tokens each);
+- with the cache on, the two part where the row's two best logits are close: prose at token 21 (gap 0.057), code at
+  98 (0.059) or 111 (0.13), thinking at 7 (0.027) or 112 (0.99) - two drafted loads each, the gaps from the undrafted
+  run (`INKLING2_MARGIN_LOG=1`; the median gap is 3.4 / 4.8 / 1.7, and an expert on the other side moves a logit by
+  up to 1.4);
+- two undrafted loads part the same way once the cache's moves fall differently: the prose prompt (the first after
+  the load) gave the same 256 tokens in four loads, the code prompt after it the same 165, the thinking prompt 7.
+
+Not done:
+1. Nothing overlaps the draft (8 ms on the last GPU, the others idle) with the pass that follows it.
+2. The drafter takes 3.1 GB of the last GPU (2.6 without the taps' buffers and the 32k caches): about 250 of that
+   GPU's experts live in RAM instead.
+3. Sampled requests copy every window row's logits to the host for the verdict (0.8 MB a row).
+4. Thinking text is break-even (half of 1.5 offered drafts kept): the drafter rests there, it does not gain.
 
 Engine flags: `--pack --max-context (--ctx) --layer-split --gpus --reserve-gb --vram-experts --profile (none) --profile-out
 --threads --log-floor --prefill-chunk --try-chunks --repeat --rewind --short-prompt --no-swap --eos --serve --tokens
---tokens-file --n-predict --layers --verbose`; tests `--parity [--parity-force-picks --parity-force-only --parity-decode
---parity-detail --parity-max] --rewind-test --short-bench --window-test`. Environment: `INKLING2_PHASES` (device phase
-table, token step), `INKLING2_TIMELINE`, `INKLING2_PROF`, `INKLING2_OLD_STEP`, `INKLING2_SWAP_BATCH`,
-`INKLING2_SWAP_BURST_MS`, `INKLING2_ATTN_OLD`, `INKLING2_ATTN_TK`, `INKLING2_VERIFY_LOAD`, `INKLING2_EXPERT_CHECK`,
-`INKLING2_NO_WARMUP`.
+--tokens-file --n-predict --layers --dspark --dspark-index --dspark-cum --verbose`; tests `--parity [--parity-force-picks
+--parity-force-only --parity-decode --parity-detail --parity-max] --rewind-test --short-bench --window-test
+[--window-bits] --prompts --ab --temperature --seed --dspark-rest0`. Environment: `INKLING2_PHASES` (device phase
+table, a line a window size), `INKLING2_ROUND_LOG` (a line a drafting round), `INKLING2_TIMELINE`, `INKLING2_PROF`,
+`INKLING2_OLD_STEP`, `INKLING2_SWAP_BATCH`, `INKLING2_SWAP_BURST_MS`, `INKLING2_VERIFY_LOAD`, `INKLING2_EXPERT_CHECK`,
+`INKLING2_NO_WARMUP`; `INKLING2_ATTN_OLD` / `INKLING2_ATTN_TK` now reach only the step with a tap or a pick hook.
 
 ## Goal and targets
 

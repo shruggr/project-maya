@@ -6,7 +6,9 @@
 // sliding-window layers' in a ring of the window, the global layers' a row a position) and the short convolutions'
 // histories.  The experts that do not fit are copied into RAM at the load and run on the CPU lane.
 //
-// This version runs the decode path only: one token a step through every layer (a prompt is fed token by token).
+// A step takes 1 .. window_max() tokens (forward: one; window: a verify window, cut back with keep); a prompt goes
+// through the layers a chunk at a time.  With Options::dspark_index the DSpark drafter (inkling2_dspark.hpp) sits on
+// the last GPU and is fed every kept position's taps: draft() gives the tokens after the next one.
 #pragma once
 
 #include <cstdint>
@@ -32,6 +34,10 @@ struct Options {
     int prefill_chunk = 512;      // a prompt's tokens a forward takes through the layers at once (<= 1: token by token)
     int layers = 0;               // (tests) only the first `layers` layers are loaded and run (0: all)
     double log_floor = 0;         // log_scaling_n_floor in place of the pack's (0: the pack's)
+    std::string dspark_index;     // the drafter's index folder (inkling2_dspark.hpp; empty: no drafter): loaded on the
+                                  // last GPU, fed every position's taps by the steps and the prompt path
+    float dspark_cum = 0.5f;      // its cut on the running product of the drafts' probabilities (Model::set_draft_cum)
+    double dspark_reserve_gb = 3.4;   // VRAM the last GPU keeps for it beyond reserve_gb (fewer experts there)
     bool swap = true;             // the expert cache: the experts routed to lately move into VRAM, colder ones out
     bool verbose = false;
 };
@@ -69,6 +75,20 @@ public:
     bool window(const int* ids, int T, int64_t pos0, int* tops, float* logits_rows, std::string& err);
     bool keep(int rows, std::string& err);
     int window_max() const;
+    /// (tests) a window's rows through a token's launches, a part at a time: 1 the block types' GEMVs, 2 the experts,
+    /// 4 the CPU lane, 8 the F32 GEMVs
+    void set_debug(int mask);
+    /// The expert cache's moves on / off from here on (Options::swap).  Off, the experts stay where they are: two passes
+    /// over the same tokens then give the same bits (an expert's sum on the CPU lane is not its sum on the GPU).
+    void set_swap(bool on);
+    /// The drafter (Options::dspark_index) is loaded and fed
+    bool dspark() const;
+    /// Drafts after `anchor`, the token at end() (not read yet): up to max_n (<= 7) tokens for end() + 1 .. with the
+    /// drafter's probability for each, cut where their running product falls under the cum floor.  None (true) when
+    /// there is no drafter, or it does not hold the context's rows (a step with a tap or a pick hook ran).
+    bool draft(int anchor, int max_n, std::vector<int>& toks, std::vector<float>& probs, std::string& err);
+    void set_draft_cum(float c);
+    double dspark_vram_gb() const;
     /// Back to an empty context (position 0)
     void reset();
     /// Back to a position at or before pos (<= end()): the caches keep every position and the short convolutions'

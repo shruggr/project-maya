@@ -457,6 +457,96 @@ engine, which picks between A, M and B.
 llama.cpp's own drafter costs 91 ms a block here (83 ms Q8_0): the PR's head as written is slower than three target
 tokens of ours, which is why the fold and a device-side head loop matter. Injecting 2998 positions took 1.7 s.
 
+## In the engine (2026-11-20: wired, measured)
+
+`maya-inkling2` drafts by default (`--dspark on|off|idle`, `--dspark-index DIR`, `--dspark-cum F`; a request's
+`spec=0|1` and `dspark_cum=F` keys). The module loads on the last GPU with the engine's own output matrix
+(`DsparkOptions::output_dev`); the engine keeps 3.4 GB of that GPU for it (`Options::dspark_reserve_gb`: the drafter
+reports 3.09 GB at a 32k context), so about 250 of its experts go to RAM.
+
+**Taps.** Every row of every step leaves its 8 taps on the last GPU as F32 [rows][8][4608]: a layer whose output is
+a tap (4, 10, ..., 40) publishes its rows to host memory the last GPU maps (the last GPU's own tap layer: a copy), the
+head adds its input (the fused mix + norm, `result_norm`), one gather interleaves them. Two buffers by turns: the
+drafter reads the last step's on its own stream while the next step writes the other. They are fed
+(`Dspark::feed_dev`) when the rows are kept - at the next draft, step or rewind - so `Model::keep` only shortens what
+is pending. The prompt path does the same a chunk at a time (the taps through pinned host buffers, a chunk in flight
+each; the head's mix + norm for every row), fed by the last GPU's stage. A rewind rolls the drafter back to the
+context's end (`Dspark::rollback`), its rings as long as the engine's.
+
+**A round** (`draft_round`, inkling2_main.cpp; the decode loop and `--serve` share it): `Model::draft(tok)` ->
+`Model::window([tok, d_1 .. d_k])` -> the verdicts -> `Model::keep(m + 1)` -> out: `d_1 .. d_m`, next.
+
+- The window: k maximizes (1 + sum_{i<=k} prod_{j<=i} p_j) / (t(k + 1) + t_draft), p the drafter's probabilities, under
+  the drafter's own cut on their running product (0.5). t(T) = a + b (T - 1), a and b fitted as it decodes (a from
+  the passes of one row, b from the windows; 30 and 7 ms to start), t_draft the draft's measured time. k = 0: a plain
+  step.
+- Greedy: a draft stands while it is the row's argmax (after the request's penalties). Sampled: ds4's rule for argmax
+  drafts - it stands with probability p(d), p the request's own chain on the target's row, else the row's token is
+  drawn from p without d. Never drawn drafts.
+- Rest: a drafted round gains (kept drafts) x a - (t_draft + k b) ms; when its average over the last drafted rounds is
+  under a tenth of a step, no drafts for 8 rounds (doubling to 32 while it keeps not paying, from 8 again with every
+  request). The taps still flow. Rests are short on purpose: where drafts are break-even a rest gains little, and a
+  long one sleeps through the code after a thinking block (measured through the server with rests up to 128 rounds).
+- An end token among the kept drafts: the context is cut back to before it (`keep`), as an undrafted answer leaves it.
+
+**The window's cost** (2.7k context, ms a pass; `--window-test`, `INKLING2_PHASES=1` for the parts):
+
+| T | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|
+| before | 30.4 | 43.1 | 50.7 | 58.4 | 68.1 | 76.4 | 83.8 | 93.5 | 100.0 |
+| now | 29.9 | 38.9 | 45.5 | 51.3 | 59.2 | 65.5 | 71.2 | 77.4 | 83.7 |
+| now, `--dspark off` (no taps) | 29.1 | 38.8 | 45.5 | 50.8 | 59.1 | 65.9 | 71.6 | 77.5 | 83.0 |
+
+| part (ms a pass, with the phase marks) | T 1 before | T 1 now | T 2 before | T 2 now | T 4 before | T 4 now | T 8 before | T 8 now |
+|---|---|---|---|---|---|---|---|---|
+| mix + rms | 1.45 | 1.45 | 1.45 | 1.45 | 1.43 | 1.44 | 1.43 | 1.44 |
+| input projections | 6.32 | 6.23 | 6.56 | 6.56 | 7.32 | 7.31 | 9.87 | 9.88 |
+| convs + clips + cache rows | 0.60 | 0.61 | 1.82 | 0.64 | 1.85 | 0.63 | 1.93 | 0.71 |
+| attention | 4.90 | 4.21 | 6.95 | 4.67 | 11.26 | 5.34 | 20.02 | 6.45 |
+| gate + output + residual | 2.70 | 2.62 | 3.31 | 2.94 | 3.62 | 3.27 | 4.58 | 4.23 |
+| mix + rms + router + publish + plan / grouping | 2.91 | 2.93 | 3.80 | 4.09 | 4.76 | 5.10 | 6.56 | 6.95 |
+| GPU experts + sum | 8.45 | 8.45 | 14.61 | 14.62 | 23.35 | 23.49 | 41.14 | 41.43 |
+| lane wait | 2.60 | 2.76 | 2.90 | 2.87 | 2.75 | 2.94 | 3.38 | 3.38 |
+| lane sum + conv + residual | 0.35 | 0.35 | 0.68 | 0.36 | 0.68 | 0.37 | 0.71 | 0.38 |
+| between layers / hand-offs / head / host | 2.92 | 2.82 | 2.64 | 2.34 | 3.00 | 2.45 | 4.01 | 2.95 |
+| the pass | 33.2 | 32.4 | 44.7 | 40.6 | 60.0 | 52.3 | 93.6 | 77.8 |
+
+(The grouping moved from the experts' part into the router's between the two columns.) What changed: the fused row
+kernels (convs, clips, residuals: -2.5 ms a window), and the attention's scores - a thread took one (query, key) dot
+and read the query from memory for each; it now takes a query and 4 keys (up to four rows) or 8, the query's value
+read once for them: 2.2 -> 0.33 ms a row, and a token's own attention 4.9 -> 4.2 ms. The combine's exp a tile and a
+thread was not the cost (measured: no change). The experts are the floor: 4.3 more unique experts a layer a row at
+the cards' bandwidth, 4.7 ms.
+
+**Exactness.** With the experts where they are (`--window-test` holds the cache still for it) a window's 9 rows are
+the 9 token steps' logits to the bit, and so is a window cut back and read on. With the cache moving experts between
+two passes the same token steps differ from themselves (0 of 9 rows the same, least cosine 0.9958): an expert's sum
+on the CPU lane is not its sum on the GPU. `--ab --no-swap`: the three prompts' 256 drafted tokens are the undrafted
+ones. With the cache on a drafted answer leaves the undrafted one at a close call (prose token 21, the two best logits
+0.057 apart; code 98 at 0.059; thinking 7 at 0.027) - as a second undrafted load does (code from token 165, thinking
+from 7): docs/INKLING2_PORT.md, Status.
+
+**Speed** (greedy, 256 tokens, a fresh load each side; tok/s):
+
+| prompt | without drafts | with drafts | | tokens a pass | drafts kept | k = 0 .. 7 chosen |
+|---|---|---|---|---|---|---|
+| prose: the 2.7k-token prompt continued | 33.8 | 62.3 (66.0 another load) | 1.84x (1.95x) | 3.92 (4.18) | 190 of 207 | 9 13 14 5 4 0 5 15 |
+| code: a chat request for a Python module | 36.3 | 53.3 (57.3) | 1.47x (1.58x) | 3.04 (3.49) | 171 of 243 | 17 15 12 6 10 9 4 11 |
+| thinking: a chat question, effort 0.9 | 37.3 | 36.1 (35.3) | 0.97x (0.95x) | 1.26 (1.32) | 53 of 116 | 145 25 15 12 3 0 1 1 |
+
+The brackets are a second fresh load (an earlier build of the same windows): the answers differ from load to load at
+near-ties (the cache's moves), and with them the drafts kept. The thinking prompt run 13 times in one load, the cache
+warm: 39.2 tok/s with drafts, 39.1 - 39.3 without - break-even, as the projection said; its fresh-load loss is the CPU
+lane's share (8 - 13 % against 7 %: the drafter's 3.1 GB on the last GPU, and fewer cache moves a token). A draft costs
+8.0 - 8.5 ms a round, a pass 26 - 30 ms + 7 - 8 a row as fitted while decoding (6.7 a row in `--window-test`).
+
+Through serve/server.py (my_e2e.py: a 2.7k-token document and two follow-ups, temperature 1, thinking on; sampled,
+so the answers differ): 38.2 / 40.5 / 45.7 tok/s after the first token with drafts, 32.0 / 33.8 / 32.1 without
+(`--dspark off`); drafts kept 194 of 363, 256 of 435, 297 of 397; tokens a pass 1.96 / 2.10 / 2.23.
+
+Left: the draft (8 ms on the last GPU while the others idle) could overlap the first GPU's part of the pass; the
+drafter's VRAM; a sampled window's logits go to the host a row (0.8 MB) for the verdict.
+
 ## Reference parity plan (steps 1-3 and 5 done as above; the tensor dumps of step 4 are not)
 
 1. **A checkout of the PR's head, beside the existing one** (the saved diff does not apply to master b94959a64:
