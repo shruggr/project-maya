@@ -48,6 +48,7 @@ MSVC_SKIP_DIRS = ("include/strata/hip_compat/", "tests/hip/")   # the AMD build'
 MSVC_SKIP_FILES = {
     "tests/mm3_lane_test.cpp": "CMakeLists.txt builds it only if(NOT WIN32)",
     "src/ik2/ik2_cpu_deep.cpp": "CMakeLists.txt builds it only with GCC / Clang (and OpenMP)",
+    "src/ik2/hip/ik2_hip_model.cu": "CMakeLists.txt builds src/ik2/hip (maya-ik2's AMD build) only if(STRATA_ENABLE_HIP): ROCm's clang",
 }
 # taken by nvcc 12.8 (host and device code) and cl.exe 19.44 alike
 ALLOWED_BUILTINS = {"__builtin_bit_cast", "__builtin_addressof", "__builtin_offsetof", "__builtin_huge_val",
