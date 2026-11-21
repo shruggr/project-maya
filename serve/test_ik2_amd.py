@@ -71,7 +71,7 @@ class Family(unittest.TestCase):
         import maya
         self.assertEqual(maya.config_family(AMD), "ik2")
         self.assertEqual(maya.setup_title(AMD), "Inkling-2-Small")
-        self.assertNotIn("ik2", maya.FAMILIES)                           # (no setup flow for it yet)
+        self.assertNotIn("ik2", maya.FAMILIES)                           # (its setup is AMD only: not a row everywhere)
         maya.select_build_backend("hip")
         self.assertEqual(maya.exe_for_target("maya-inkling2").name, "maya-inkling2")
         self.assertEqual(maya.bench_exe(AMD), Path(AMD["exe"]))

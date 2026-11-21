@@ -267,15 +267,28 @@ matches a regex.
 
 ## Serving
 
-`serve/server.py --engine maya --config <file>` runs the engine like any other. No setup flow in `maya.py` yet: the
-pack and the config are made by hand.
+`serve/server.py --engine maya --config <file>` runs the engine like any other. The setup makes everything, on AMD
+under Linux only (`./maya.sh --setup --backend hip --gpus 0,1,2,3 --model inkling-2-small`, or Inkling 2 Small in its
+model list; the Models page lists it under the other quants on an AMD install): the PC (VRAM + RAM must hold the
+model, ~190 GB, since the experts VRAM does not hold are copied into RAM - below that it stops, `--force-fit` goes on),
+the context (up to the model's 1M, recommended by the memory left beside the model at 32 KB a token), the engine
+(`build-hip/maya-inkling2`), unsloth's UD-Q2_K_XL set (`tools/inkling2/download.json`, in
+`<models>/Inkling-2-Small-GGUF/UD-Q2_K_XL`), Thinking Machines' `mtp.safetensors` and `config.json` in
+`<models>/Inkling-2-Small-MTP` converted by `tools/inkling2/convert_dspark.py --type q8_0`, the pack, its expert
+profile (`default.prof`, copied from `data/expert-profile-inkling2.bin` where the pack has none) and
+`maya-inkling2-hip.json` with `--dspark-index`. Files already there are used as they are (a pack made by hand
+included: `--repack` builds it again). `maya_quants.py`'s ids: `inkling-2-small`, `inkling-2-small-ud-q2_k_xl`. On
+NVIDIA the model's engine is `maya-ik2`, which has no setup: the setup says so and stops.
+
+By hand, the same steps:
 
     python tools/inkling2/pack_gguf.py --model <the GGUF set's folder>   # <model>/maya-inkling2: the pack, its tokenizer/
 
 ```json
 {
  "exe": "/home/shruggr/project-maya/build-hip/maya-inkling2",
- "args": ["--pack", "/mnt/data/models/llm/Inkling-2-Small-GGUF/UD-Q2_K_XL/maya-inkling2", "--max-context", "32768"],
+ "args": ["--pack", "/mnt/data/models/llm/Inkling-2-Small-GGUF/UD-Q2_K_XL/maya-inkling2", "--max-context", "32768",
+          "--dspark-index", "/mnt/data/models/llm/Inkling-2-Small-MTP/maya-inkling2-dspark-q8_0"],
  "cwd": "/home/shruggr/project-maya",
  "tokenizer": "/mnt/data/models/llm/Inkling-2-Small-GGUF/UD-Q2_K_XL/maya-inkling2/tokenizer",
  "model_name": "inkling-2-small",

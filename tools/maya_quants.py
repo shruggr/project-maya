@@ -18,8 +18,8 @@ from pathlib import Path
 
 FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 # ("ik2": Thinking Machines' Inkling-2-Small, one family with two engines - maya-ik2 (CUDA: unsloth's GGUFs in place,
-#  docs/INKLING2.md) and maya-inkling2 (AMD: a pack of unsloth's UD-Q2_K_XL, docs/INKLING2_AMD.md); no setup flow yet:
-#  its config is written by hand)
+#  docs/INKLING2.md; no setup yet, its config is written by hand) and maya-inkling2 (AMD: a pack of unsloth's
+#  UD-Q2_K_XL, docs/INKLING2_AMD.md; maya.py's set_up_ik2))
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
 MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
          "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash",   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
@@ -220,6 +220,9 @@ QWEN_UD_IDS = ("qwen-ud-iq2_xs", "qwen3.8-flash-next-ud-iq2_xs", "qwen3.8-ud-iq2
 # Hy4-flash: AngelSlim's Q4_K_M GGUF (two shards) - the setup ids it is asked for by (the first: the Models page's).
 # "hy4-flash" and "hy4" alone are the model: its files are then asked (Maya's quants and this one), or --hy4-quant
 HY4_IDS = ("hy4-flash-q4_k_m", "hy4-q4_k_m")
+# Inkling-2-Small on AMD (maya-inkling2): unsloth's UD-Q2_K_XL, its one set of files there - the setup ids it is asked
+# for by (the first: the Models page's); the model's own name and "inkling2" alone are the same files
+IK2_IDS = ("inkling-2-small-ud-q2_k_xl", "inkling2-ud-q2_k_xl", "ik2-ud-q2_k_xl", "inkling-2-small", "inkling2")
 # --mm3-quant also takes the tier as DeepSeek's --ds4-quant does (maya-xs), beside its first names (gguf-xs)
 MM3_QUANT_ALIASES = {"maya-xs": "gguf-xs", "maya-s": "gguf-s"}
 
@@ -280,6 +283,8 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
         return "hy4", "q4_k_m"
     if low == "hy4":                                   # (the model by its short name: its files then asked)
         return "hy4", None
+    if low in IK2_IDS:
+        return "ik2", "ud-q2_k_xl"
     for f in ("deepseek", "minimax", "qwen", "hy4"):
         if low == MODEL[f].lower():
             return f, None
