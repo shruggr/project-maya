@@ -886,9 +886,10 @@ IK2_DSPARK_GGUF = "Inkling-2-Small-DSpark-Q8_0.gguf"
 IK2_CONFIG = "maya-inkling2-hip.json"
 IK2_MODEL_NAME = "inkling-2-small"
 # the contexts offered: up to the model's trained 1M (the pack's inkling2.txt context_length, the official config's
-# model_max_length); recommended by this PC's memory (ik2_recommended_context), from IK2_DEFAULT_CONTEXT up
+# model_max_length); recommended as DeepSeek's (ik2_recommended_context): 256K where this PC's memory holds it, else 64K
 IK2_CONTEXTS = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
-IK2_DEFAULT_CONTEXT = 32768
+IK2_DEFAULT_CONTEXT = 65536                         # (DS4_DEFAULT_CONTEXT)
+IK2_RECOMMENDED_CONTEXT = 262144                    # (DS4_RECOMMENDED_CONTEXT)
 # its cache a context token: the 8 global layers keep every position, K and V of 8 heads x 128 in F16 (the 40
 # sliding-window layers keep 1024 positions whatever the context), in VRAM - the experts give it up to RAM
 IK2_KV_BYTES = 8 * 2 * 8 * 128 * 2
@@ -10053,13 +10054,14 @@ def ik2_kv_gb(ctx: int, drafting: bool = False) -> float:
 
 def ik2_recommended_context(gpus: list, ram: float, need: float, drafting: bool = False) -> int:
     """The context the setup recommends on this PC, as DeepSeek's (ds4_recommended_context): the largest of
-    IK2_CONTEXTS from IK2_DEFAULT_CONTEXT up to the model's own whose cache fits in what this PC's memory (fit_memory:
-    VRAM + RAM less what the OS keeps) holds beyond the model (need) - its cache sits in VRAM, the experts it displaces
-    go to RAM.  Else IK2_DEFAULT_CONTEXT, also when the RAM could not be read."""
+    IK2_CONTEXTS from IK2_DEFAULT_CONTEXT (64K) up to IK2_RECOMMENDED_CONTEXT (256K) whose cache fits in what this
+    PC's memory (fit_memory: VRAM + RAM less what the OS keeps) holds beyond the model (need) - its cache sits in VRAM,
+    the experts it displaces go to RAM.  Else IK2_DEFAULT_CONTEXT, also when the RAM could not be read.  Larger
+    contexts, up to the model's 1M, are offered, not recommended."""
     if ram <= 0:
         return IK2_DEFAULT_CONTEXT
     spare = fit_memory(gpus, ram)[0] - need
-    fits = [c for c in IK2_CONTEXTS if c >= IK2_DEFAULT_CONTEXT and ik2_kv_gb(c, drafting) <= spare]
+    fits = [c for c in IK2_CONTEXTS if IK2_DEFAULT_CONTEXT <= c <= IK2_RECOMMENDED_CONTEXT and ik2_kv_gb(c, drafting) <= spare]
     return max(fits) if fits else IK2_DEFAULT_CONTEXT
 
 

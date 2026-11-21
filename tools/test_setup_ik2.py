@@ -181,14 +181,13 @@ class Context(unittest.TestCase):
         self.assertAlmostEqual(maya.ik2_kv_gb(262144), 8.0)
 
     def test_recommended_by_this_pcs_memory(self):
-        """The largest context whose cache fits in VRAM + RAM (less what the OS keeps) beyond the model - by the PC's
-        memory alone, nothing of one PC's: from 32K up to the model's 1M."""
+        """As DeepSeek's: the largest context from 64K up to 256K whose cache fits in VRAM + RAM (less what the OS
+        keeps) beyond the model, else 64K - by the PC's memory alone, nothing of one PC's."""
         rec = lambda gpus, ram, drafting=False: maya.ik2_recommended_context(   # noqa: E731
             gpus, ram, maya.ik2_memory_gb(drafting), drafting)
-        self.assertEqual(rec(AMD, 125), 1048576)                        # (57 GB beyond the model: 1M's 32 GB fits)
-        self.assertEqual(rec(AMD, 125, True), 1048576)                  # (... with the drafter's 38 GB too)
+        self.assertEqual(rec(AMD, 125), 262144)                         # (57 GB beyond the model: 256K, the most recommended)
+        self.assertEqual(rec(AMD, 125, True), 262144)                   # (... with the drafter's cache too)
         self.assertEqual(rec(AMD, 80), 262144)                          # (12 GB beyond it: 256K's 8)
-        self.assertEqual(rec(AMD[:2], 150), 524288)                     # (two cards, more RAM: 18 GB beyond)
         self.assertEqual(rec(AMD[:3], 106), 131072)                     # (6 GB beyond it)
         self.assertEqual(rec(AMD, 70), 65536)                           # (2 GB beyond it)
         self.assertEqual(rec(AMD, 66), maya.IK2_DEFAULT_CONTEXT)        # (nothing beyond it: the default)
@@ -460,7 +459,7 @@ class SetUp(unittest.TestCase):
         self.assertEqual(self.built, ["maya-inkling2"])
         cfg = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(maya.flag_value(cfg["args"], "--dspark-index"), str(lay.mtp / maya.IK2_DSPARK))
-        self.assertEqual(maya.flag_value(cfg["args"], "--max-context"), "1048576")   # (recommended: 57 GB beyond it)
+        self.assertEqual(maya.flag_value(cfg["args"], "--max-context"), "262144")    # (recommended as DeepSeek: 256K, the most)
         self.assertIn("pack already built", out)
 
     def test_refused_below_the_memory(self):
