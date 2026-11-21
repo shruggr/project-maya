@@ -431,6 +431,7 @@ Free VRAM after the load and after a long prompt, MiB a GPU (GPUs 0, 1, 2 / GPU 
 |---|---|---|---|
 | 32K | R - 324 / R - 642 (R = 1500: 1176 / 858) | 606 / 608 | 606 / 608 (30,000 tokens) |
 | 256K | 310 - 340 with R = 1024 | 602 / 602 | 602 / 602 (80,000 tokens) |
+| 512K ("Long contexts": the prompt path's buffers as before) | - | 600 / 608 | 600 / 608 (307,710 tokens) |
 | 1M | - | does not load: the experts VRAM leaves would need 131 GB of RAM, 121 GB is there (see "Long contexts") | - |
 
 The rest above 600 is the experts' rounding: what no further expert fits (an expert is 9.6 - 12.1 MiB) and the
@@ -438,6 +439,39 @@ allocation's 2 MiB page. The experts in VRAM: 10,574 of 18,432 at 32K (10,565 be
 free instead of 0.6), 9,646 at 256K (9,630 before) - the old plan's slacks and the drafter's 3.09 GB over-counted
 about as much as the runtime's share it missed. The load is about a minute longer than before (247 - 293 s against
 166 - 225): the dense tensors and the experts are read in two passes over the files.
+
+## Long contexts on this PC (measured, 2026-11-21)
+
+**1M does not load here.** At `--max-context 1048576` the global layers' K / V rows take 8 GiB a GPU, the decode
+step's split-attention scratch 1.5 GiB a GPU (IK2_ATTN_BYTES: 16-key tiles over every key) and the drafter 9.4 GiB of
+the last GPU, so the experts VRAM leaves would need 131 GB of RAM; this PC has 125 GB, 121 of it to be had, and the
+engine keeps 8 GiB for the rest (maya-ds4's RAM margin): it stops at its start (the plan's check, after the dense
+load and before the experts are read). Without the drafter it would still need about 121.5 GB. The largest context
+that fits with the drafter is about 630K (each position more takes 45 KB of VRAM a context: the K / V rows, the
+attention scratch, the drafter's rows - so about as much more RAM for experts); the setup recommends up to 256K (S16).
+
+**512K end to end** (`--max-context 524288`, the drafter on, the engine's defaults - the run named
+`--prefill-chunk 512`, `INKLING2_STAGE=24` and `INKLING2_S_FLOOR_MI=44`, which the defaults now are; with the larger
+2048 / 64 / 176 Mi of E9's measurement it did not load: the RAM experts 114 GB and the 8 GiB margin against 121 GB). 8,602 experts in VRAM, 99.8 GiB in RAM;
+loaded in 396 s. The 2.7k-token prompt: 796 tok/s, 200 drafted tokens at 61.3 tok/s. Then a 307,710-token prompt -
+the guide repeated 19 times with two maintainer's notes between the copies (OSPREY-4, port 51877; "Silver Lynx"), a
+question about them at the end, thinking effort 0: read in 1106.7 s (278 tok/s); 133 tokens decoded at 7.9 tok/s
+(30.8% of the picks on the CPU lane; drafting rests there: 1.31 tokens a pass, a pass 117 ms, a draft 19.2 ms). The
+answer is coherent and about the document - it offers to explain how to add VRAM and RAM to see whether a model
+fits, the "Recommended" column against "Whole model", and what the context costs - but declines to quote the notes
+("internal maintainer details"): the long context is read and understood; the needle itself was not retrieved. The
+free VRAM stayed at 600 / 608 MiB after both prompts and decodes. CONTEXT_TESTED["inkling2"] is 524288 (W2).
+
+Earlier (2026-11-20, the drafter on, `--max-context 262144`, through `--serve`): a 262,000-token prompt read at 336
+tok/s, 64 tokens at 10.0 tok/s, the decode path's rows the prompt path's.
+
+**The speed calibration** (`./maya.sh --speed-calibration`'s `speed_calibration` -> tools/calibrate_ds4.py, run on a
+scratch copy of the config the setup writes: 64K, `--reserve-mib 3072`, `--dspark none`): the DSpark drafter is
+faster on this PC, 48.4 against 35.0 tokens/s combined (+38%; chat 36.7 against 34.3, code 55.0 against 35.0, tool
+calls 60.5 against 35.8; 69% of the drafts accepted), so the config drafts. Its first run stopped at rendering the
+tool calls' requests: it read the pack's chat template as it lies - for this pack the GGUF's, which refuses bare tool
+declarations ("Tool declarations require a function object") and is not what the server renders with; it now takes
+the server's own choice (serve/server.py's chat_template_path: thinkingmachines' template).
 
 ## The measured values (2026-11-21)
 
@@ -682,7 +716,7 @@ with where it comes from (2026-11-20). Sources:
 | # | Value | What it does | Source | Where it comes from |
 |---|---|---|---|---|
 | W1 | 32K .. 1M | Contexts on the Models page | MAYA | = S14 (models.py's DS4_CONTEXTS) |
-| W2 | `CONTEXT_TESTED["inkling2"]` 131072 | Where the page starts saying "untested" | MEASURED | The v1.2 benchmark: a server at --max-context 262144, prompts up to 109,464 tokens; the measurement phase raises it |
+| W2 | `CONTEXT_TESTED["inkling2"]` 524288 | Where the page starts saying "untested" | MEASURED | Run end to end at --max-context 524288 with a 307,710-token prompt ("Long contexts" above); 1M does not load on this PC (its RAM) |
 | W3 | `IK2_KEYS` + reserve_mib, prefill_chunk, cpu_threads, dspark_cum (maya-inkling2 only) | Settings the page edits | MAYA | DS4_KEYS; dspark_cum is dspark_conf's counterpart, in DeepSeek's Draft confidence row |
 | W4 | VRAM kept free (--reserve-mib) for maya-inkling2 | - | MAYA | DeepSeek's row |
 | W5 | `--dspark` read as "on" when absent; off and none read as Off | Current Drafting state | MAYA | The engine's default, as maya-ds4's; the page writes none (DeepSeek's) |

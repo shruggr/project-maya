@@ -151,14 +151,14 @@ class Settings(unittest.TestCase):
             c = models.describe(path, None)
         self.assertEqual((e["kv_bytes"], e["kv_gpu_bytes"], e["dspark_kv_bytes"], e["dspark_gb"]),
                          (models.IK2_KV_BYTES, models.IK2_ATTN_BYTES, models.IK2_DSPARK_KV_BYTES, models.IK2_DSPARK_GB))
-        self.assertEqual(e["context_range"]["tested"], 131072)            # (CONTEXT_TESTED["inkling2"])
+        self.assertEqual(e["context_range"]["tested"], 524288)            # (CONTEXT_TESTED["inkling2"])
         self.assertNotIn("kv_bytes", c)
 
     def test_contexts_and_tested(self):
-        """DeepSeek's contexts (from 32K); maya-inkling2's end-to-end runs reach 128K so far (CONTEXT_TESTED)."""
+        """DeepSeek's contexts (from 32K); maya-inkling2's end-to-end runs reach 512K so far (CONTEXT_TESTED)."""
         self.assertEqual(models.IK2_CONTEXTS, models.DS4_CONTEXTS)
-        self.assertEqual(models.CONTEXT_TESTED["inkling2"], 131072)
-        self.assertEqual(models.context_range(1048576, 32768, "inkling2")["tested"], 131072)
+        self.assertEqual(models.CONTEXT_TESTED["inkling2"], 524288)
+        self.assertEqual(models.context_range(1048576, 32768, "inkling2")["tested"], 524288)
 
     def test_refused_without_the_drafter(self):
         shutil.rmtree(self.index)

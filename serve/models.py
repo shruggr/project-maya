@@ -52,10 +52,10 @@ CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does n
 # GLM engine's 256K, and maya-mm3's 256K (MiniMax-M3.1 is offered up to its 1M; past 256K it has not been run end to
 # end yet)
 # (maya-hy4: Tencent's own Q4_K_M run end to end up to 256K; Maya's sizes up to 32K so far - the model is trained for 1M)
-# (maya-inkling2: run end to end with a server at --max-context 262144 and prompts up to 109,464 tokens - the v1.2
-#  benchmark, docs/INKLING2_AMD.md - so 128K, the largest offered context those prompts reach into, for now; the
-#  measurement of longer prompts raises it)
-CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 32768, "hy4-q4": 262144, "inkling2": 131072}
+# (maya-inkling2: run end to end at --max-context 524288 with a 307,710-token prompt, and at 262144 through --serve with
+#  prompts up to 262,000 tokens - docs/INKLING2_AMD.md, "Long contexts"; 1M has not been run: on the PC it was measured
+#  on, 125 GB of RAM, its experts outside VRAM do not fit)
+CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 32768, "hy4-q4": 262144, "inkling2": 524288}
 CONTEXT_TESTED_DEFAULT = 262144
 QWEN_KV =("fp16", "int8", "k8v4", "q4_0")                        # the Qwen path's --kv
 MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --kv-cache (one format for K and V)
