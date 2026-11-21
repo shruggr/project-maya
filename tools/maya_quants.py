@@ -16,12 +16,17 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4")
+FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
+# ("ik2": Thinking Machines' Inkling-2-Small, one family with two engines - maya-ik2 (CUDA: unsloth's GGUFs in place,
+#  docs/INKLING2.md) and maya-inkling2 (AMD: a pack of unsloth's UD-Q2_K_XL, docs/INKLING2_AMD.md); no setup flow yet:
+#  its config is written by hand)
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
 MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
-         "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
+         "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash",   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
+         "ik2": "Inkling-2-Small"}
 SHOWN = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
-         "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)", "hy4": "Hy4-Flash"}   # the model's name on screen (the chat header: serve/web/lib.js's
+         "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)", "hy4": "Hy4-Flash",
+         "ik2": "Inkling 2 Small"}   # the model's name on screen (the chat header: serve/web/lib.js's
                                                          # modelName(id, true), "Qwen-3.8-Flash-Next"); its ids stay
 SEP = " · "
 
@@ -203,7 +208,9 @@ OTHERS = {("deepseek", "gguf-q8"): "UD-Q8_K_XL", ("deepseek", "gguf-q4"): "UD-Q4
           ("deepseek", "abliterated-256g"): "orcarouter Abliterated Mix-256G",
           ("minimax", "exl3"): "EXL3 3.5 bpw", ("qwen", "q5_k_m"): "Q5_K_M",
           ("qwen", "ud-iq2_xs"): "unsloth UD-IQ2_XS",   # (the base model in unsloth's GGUF: maya.QWEN_UD)
-          ("hy4", "q4_k_m"): "Q4_K_M"}                  # (AngelSlim's Q4_K_M of Hy4-flash: maya.HY4)
+          ("hy4", "q4_k_m"): "Q4_K_M",                  # (AngelSlim's Q4_K_M of Hy4-flash: maya.HY4)
+          # (unsloth's GGUFs of Inkling-2-Small: maya-ik2 reads Q4 / Q3 in place, maya-inkling2 a pack of Q2)
+          ("ik2", "ud-q4_k_xl"): "UD-Q4_K_XL", ("ik2", "ud-q3_k_xl"): "UD-Q3_K_XL", ("ik2", "ud-q2_k_xl"): "UD-Q2_K_XL"}
 # files of the base model rather than CYBER-FROST: the model's name on screen without "(CYBER-FROST)"
 SHOWN_KEY = {("qwen", "ud-iq2_xs"): "Qwen-3.8-Flash-Next"}
 # CYBER-FROST-3.8-PS: its one GGUF (peasantsmith/CYBER-FROST-3.8-PS-GUFF) - the setup ids it is asked for by
@@ -279,6 +286,11 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
     return None
 
 
+IK2_FAMILY_NAMES = ("ik2", "inkling2")
+IK2_EXES = ("maya-ik2", "maya-inkling2")
+IK2_QUANT = re.compile(r"UD-(?:I?Q\d\w*)", re.I)   # (a quant's name in unsloth's file or folder names: UD-Q4_K_XL)
+
+
 def family_of(cfg: dict) -> str:
     """"minimax" for a MiniMax-M3.1-Flash config (maya-mm3), "qwen" for CYBER-FROST-3.8-PS (the `maya` engine with its
     n-gram table, --ple-gguf), "hy4" for Hy4-flash (maya-hy4, whose --pack is its own), "ik2" for Inkling-2-Small
@@ -289,7 +301,10 @@ def family_of(cfg: dict) -> str:
     exe = Path(str(cfg.get("exe", ""))).name
     if inst.get("family") == "hy4" or exe.startswith("maya-hy4"):
         return "hy4"
-    if inst.get("family") == "ik2" or exe.startswith("maya-ik2"):   # (Inkling-2-Small: run by hand so far, no setup)
+    # (Inkling-2-Small: run by hand so far, no setup.  Both its engines - maya-ik2 on CUDA, maya-inkling2 on AMD, whose
+    #  --pack would otherwise read as DeepSeek's below; "inkling2" is that engine's family name in configs written
+    #  before the two were one family)
+    if inst.get("family") in IK2_FAMILY_NAMES or exe.startswith(IK2_EXES):
         return "ik2"
     if inst.get("family") == "minimax" or exe.startswith("maya-mm3"):
         return "minimax"
@@ -313,6 +328,14 @@ def config_key(cfg: dict) -> str | None:
         return inst.get("mm3_quant") or "exl3"
     if fam == "hy4":
         return inst.get("hy4_quant") or "maya-xs"
+    if fam == "ik2":    # (the record's, else the quant the model's path names: --model a GGUF, --pack a folder in its set's)
+        key = inst.get("ik2_quant") or inst.get("inkling2_quant")
+        if not key:
+            args = [str(a) for a in cfg.get("args") or []]
+            path = next((args[i + 1] for i, a in enumerate(args[:-1]) if a in ("--model", "--pack")), "")
+            hit = IK2_QUANT.findall(path)
+            key = hit[-1] if hit else None
+        return str(key).lower() if key else None
     if fam == "qwen":   # (its keys are lower case: a hand-edited "UD-IQ2_XS" is the same files and the same name)
         return str(inst.get("qwen_quant") or "q5_k_m").lower()
     if fam == "hy4":

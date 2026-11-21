@@ -802,6 +802,9 @@ QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 HY4 = Q.MODEL["hy4"]                               # "Hy4-Flash" (its id: the installer record, --model)
 HY4_SHOWN = Q.SHOWN["hy4"]
 HY4_EXE = BUILD / ("maya-hy4.exe" if WIN else "maya-hy4")
+# Inkling 2 Small's engine (its AMD engine, maya-inkling2: src/inkling2, built by hand for now - docs/INKLING2_AMD.md; a start does
+# not compile it again, refresh_engine)
+INK_EXE = BUILD / ("maya-inkling2.exe" if WIN else "maya-inkling2")
 HY4_MANIFEST = ROOT / "tools" / "hy4" / "download.json"
 HY4_PACK_TOOLS = ("tools/hy4/pack_gguf.py", "tools/ds4/pack_gguf.py", "tools/strata_tokenizer.py")
 HY4_PACK = "maya-hy4"                              # (the pack's folder in the model's: hy4.txt, tensors.txt, tokenizer/)
@@ -875,7 +878,7 @@ def exe_for_target(target: str) -> Path:
     fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
     if target == "maya-glm-helper":                    # (GLM's AMD helper program for the two-GPU mode: mixed_builds)
         return BUILD / ("maya-glm-helper.exe" if WIN else "maya-glm-helper")
-    return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE, "maya-hy4": HY4_EXE}[target]
+    return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE, "maya-hy4": HY4_EXE, "maya-inkling2": INK_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 
 
@@ -1078,12 +1081,13 @@ def fix_config_names(cfg: dict) -> bool:
 
 def select_build_backend(backend: str) -> None:
     """Separate build folders and stamps prevent reusing a binary from the other backend."""
-    global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE, HY4_EXE
+    global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE, HY4_EXE, INK_EXE
     BUILD = ROOT / {"hip": "build-hip", "metal": "build-metal"}.get(backend, "build")
     EXE = BUILD / ("maya-metal" if backend == "metal" else "maya.exe" if WIN else "maya")
     DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
     MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
     HY4_EXE = BUILD / ("maya-hy4.exe" if WIN else "maya-hy4")
+    INK_EXE = BUILD / ("maya-inkling2.exe" if WIN else "maya-inkling2")
     STAMP = BUILD / "MAYA-BUILD.json"
 
 
@@ -1931,8 +1935,9 @@ def config_family(cfg: dict) -> str:
     return Q.family_of(cfg)
 
 
-# each model's name on the setup's screen, under its logo (Qwen's: the model, whichever of its files - never its id)
-FAMILY_TITLE = {**Q.MODEL, "qwen": "Qwen-3.8-Flash-Next"}
+# each model's name on the setup's screen, under its logo (Qwen's: the model, whichever of its files - never its id) -
+# the setup's models (FAMILIES); a model it does not set up yet (Inkling 2) is named by maya_quants' MODEL
+FAMILY_TITLE = {**{f: Q.MODEL[f] for f in FAMILIES}, "qwen": "Qwen-3.8-Flash-Next"}
 
 
 def setup_title(cfg: dict) -> str:
@@ -1940,7 +1945,7 @@ def setup_title(cfg: dict) -> str:
     is GLM-5.3's own name, not GLM-5.3-Flash."""
     if G53.config_is_glm_dsa(cfg):
         return G53.SHOWN
-    return FAMILY_TITLE.get(config_family(cfg), "")
+    return FAMILY_TITLE.get(config_family(cfg)) or Q.MODEL.get(config_family(cfg), "")
 
 
 # the models whose engine answers several requests at once (--parallel): GLM-5.3-Flash's, DeepSeek-V4.1-Flash's
@@ -1951,7 +1956,8 @@ PARALLEL_FAMILIES = ("glm", "deepseek", "minimax")
 
 def check_parallel(a, family: str) -> None:
     if getattr(a, "parallel", None) is not None and family not in PARALLEL_FAMILIES:
-        model = DS4 if family == "deepseek" else MM3 if family == "minimax" else HY4 if family == "hy4" else QWEN_SHOWN
+        model = DS4 if family == "deepseek" else MM3 if family == "minimax" else HY4 if family == "hy4" else \
+            Q.SHOWN["ik2"] if family == "ik2" else QWEN_SHOWN
         fail(f"--parallel is supported by GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash; {model} serves "
              "one request at a time",
              "remove --parallel; saved conversations do not enable simultaneous decoding")
@@ -6345,6 +6351,8 @@ BENCH_TOPICS = [
 def bench_exe(cfg: dict) -> Path:
     """Which engine binary a HIP config's --bench should relaunch - config_family(cfg)'s target, through the same
     exe_for_target every build step uses, so this can't drift out of sync with either."""
+    if config_family(cfg) == "ik2":                    # (Inkling 2: the engine its config names - built by hand, no setup)
+        return Path(cfg["exe"])
     return exe_for_target({"deepseek": "maya-ds4", "minimax": "maya-mm3", "hy4": "maya-hy4"}.get(config_family(cfg), "maya"))
 
 
