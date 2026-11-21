@@ -885,22 +885,29 @@ IK2_DSPARK = "maya-inkling2-dspark-q8_0"           # (the drafter's index the en
 IK2_DSPARK_GGUF = "Inkling-2-Small-DSpark-Q8_0.gguf"
 IK2_CONFIG = "maya-inkling2-hip.json"
 IK2_MODEL_NAME = "inkling-2-small"
-# the contexts offered: up to the model's trained 1M (the pack's inkling2.txt context_length, the official config's
-# model_max_length); recommended as DeepSeek's (ik2_recommended_context): 256K where this PC's memory holds it, else 64K
-IK2_CONTEXTS = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
+# the contexts offered: DeepSeek's (DS4_CONTEXTS: from 32K), up to the model's trained 1M (the pack's inkling2.txt
+# context_length, the official config's model_max_length); recommended as DeepSeek's (ik2_recommended_context): 256K
+# where this PC's memory holds it, else 64K
+IK2_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]
 IK2_DEFAULT_CONTEXT = 65536                         # (DS4_DEFAULT_CONTEXT)
 IK2_RECOMMENDED_CONTEXT = 262144                    # (DS4_RECOMMENDED_CONTEXT)
 # its cache a context token: the 8 global layers keep every position, K and V of 8 heads x 128 in F16 (the 40
 # sliding-window layers keep 1024 positions whatever the context), in VRAM - the experts give it up to RAM
 IK2_KV_BYTES = 8 * 2 * 8 * 128 * 2
 IK2_DSPARK_KV_BYTES = 2 * 8 * 128 * 2 + 8 * 48 * (4 + 2)   # (... and the drafter's, on the last GPU: Dspark::ctx_bytes)
-# VRAM + RAM that hold the whole model (190.9 GiB of tensors): the experts VRAM does not hold are copied into RAM -
-# the engine never reads them from the SSD, and stops at its start when RAM cannot hold them; the drafter takes
-# IK2_DSPARK_GB of the last GPU beside it (the engine's Options::dspark_reserve_gb), whose experts then go to RAM
-IK2_MEMORY_GB = 190
+# VRAM + RAM that hold the whole model, the context aside (as DS4_MEMORY_GB: GiB, the unit of mem_gb and the GPUs'
+# vram_gb), tools/inkling2/download.json's "memory_gb": ceil(files + margin + drafter) = ceil(190.9 + 8 + 2.9) = 202 -
+#   files    204,969,055,296 bytes = 190.9 GiB, the six shards' sizes in download.json: every tensor, each once (in VRAM,
+#            or the experts VRAM does not hold copied into RAM - the engine never reads them from the SSD);
+#   margin   8 GiB, IK2_RAM_MARGIN_GIB: the RAM the engine leaves the rest beyond its RAM experts (it stops at its
+#            start when the RAM cannot hold both);
+#   drafter  3.09 GB = 2.9 GiB of the last GPU at a 32K context, measured (docs/INKLING2_DSPARK.md, "In the engine"): the
+#            calibration may turn drafting on, so it is counted (its experts then go to RAM)
+IK2_MEMORY_GB = 202
+IK2_RAM_MARGIN_GIB = 8                              # (the engine's ram_margin(), maya-ds4's: INKLING2_RAM_MARGIN_GB)
 IK2_DSPARK_GB = 3.4
-# its expert profile (uint32 [48][384] routings, the most routed in VRAM at the load): the pack's default.prof,
-# copied from here where the pack has none (the engine reads it by itself)
+# its expert profile (uint32 [48][384] routings, the most routed in VRAM at the load): the pack's expert-profile.bin
+# (maya-ds4's name), copied from here where the pack has none - the engine reads it by itself and writes back to it
 IK2_PROFILE = ROOT / "data" / "expert-profile-inkling2.bin"
 FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4")
 # (Inkling 2 Small, "ik2": set up on AMD only - its picker row on --backend hip, before Hy4-flash's; set_up_ik2)
@@ -5229,7 +5236,7 @@ def needs_speed_calibration(cfg: dict) -> bool:
             "speed_calibration" not in (cfg.get("installer") or {})
     if config_family(cfg) == "qwen":
         return False
-    if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
+    if config_family(cfg) in ("deepseek", "minimax", "ik2"):   # (their DSpark drafter: measured once too)
         return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {}) and             not (config_family(cfg) == "minimax" and parallel_of(cfg) > 1)   # (maya-mm3 --parallel: no drafting)
     if g53_one_gpu_drafting(cfg):                      # (GLM-5.3 on one APU: drafting on or off, measured once)
         return "speed_calibration" not in (cfg.get("installer") or {})
@@ -5270,7 +5277,7 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
                 cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
             return q4x_calibration(cfg_path, why) is not None
         return False
-    if config_family(cfg) in ("deepseek", "minimax"):
+    if config_family(cfg) in ("deepseek", "minimax", "ik2"):
         return speed_calibration_ds4(cfg_path, cfg, why)
     if g53_one_gpu_drafting(cfg):
         return speed_calibration_g53(cfg_path, cfg, why)
@@ -5725,8 +5732,8 @@ def prefill_calibration(cfg_path: Path, why: str = "") -> bool:
 
 
 def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
-    """DeepSeek's and MiniMax's speed calibration (tools/calibrate_ds4.py): the sustained decode speed with the DSpark
-    drafter and without it (--dspark none / off), measured on this PC's GPUs; the config keeps the faster - the drafter
+    """DeepSeek's, MiniMax's and Inkling 2 Small's speed calibration (tools/calibrate_ds4.py): the sustained decode
+    speed with the DSpark drafter and without it (--dspark none / off), measured on this PC's GPUs; the config keeps the faster - the drafter
     only when it wins by more than CDS.MIN_GAIN - and the result (installer.speed_calibration)."""
     if config_family(cfg) == "minimax" and parallel_of(cfg) > 1:
         warn("with --parallel above 1 maya-mm3 decodes without the DSpark drafter: no speed calibration")
@@ -5881,7 +5888,7 @@ def keep_drafting(cfg_path: Path, on: bool) -> None:
                                                  "decodes without drafting") + ", as chosen")
         say(f"       ({ME} --speed-calibration measures which is faster on this PC any time)")
         return
-    ds4 = config_family(cfg) in ("deepseek", "minimax")   # (DSpark: DeepSeek's and MiniMax's drafter)
+    ds4 = config_family(cfg) in ("deepseek", "minimax", "ik2")   # (DSpark: DeepSeek's, MiniMax's and Inkling's drafter)
     if config_family(cfg) == "qwen":                       # (CYBER-FROST: the MTP drafter in its pack, or none)
         args = cfg.get("args") or []
         if "--mtp-max-t" in args[:-1]:
@@ -5991,7 +5998,7 @@ def server_command(cfg_path: Path, a) -> tuple:
         args = cfg.get("args") or []
     if not unattended and needs_speed_calibration(cfg):     # a drafter set up without its speed calibration: measured once
         drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter",
-                   "hy4": "the MTP block or the DFly2 drafter"}.get(
+                   "ik2": "Inkling 2's DSpark drafter", "hy4": "the MTP block or the DFly2 drafter"}.get(
             config_family(cfg), "DFlash2")
         if speed_calibration(cfg_path, f"once, for a setup that drafts with {drafter}"):
             cfg = read_json(cfg_path)
@@ -10041,9 +10048,10 @@ def ik2_drafter_entry() -> dict:
             "download_gb": sum(v[0] for v in dr["files"].values()) / 1e9}
 
 
-def ik2_memory_gb(drafting: bool = True) -> float:
-    """VRAM + RAM that hold Inkling 2 Small (IK2_MEMORY_GB), with the drafter's room on the last GPU when it drafts."""
-    return ik2_entry()["memory_gb"] + (IK2_DSPARK_GB if drafting else 0.0)
+def ik2_memory_gb() -> float:
+    """VRAM + RAM that hold Inkling 2 Small, the context aside (download.json's "memory_gb": IK2_MEMORY_GB, the drafter
+    counted - as ds4_memory_gb's)."""
+    return ik2_entry()["memory_gb"]
 
 
 def ik2_kv_gb(ctx: int, drafting: bool = False) -> float:
@@ -10052,15 +10060,15 @@ def ik2_kv_gb(ctx: int, drafting: bool = False) -> float:
     return ctx * (IK2_KV_BYTES + (IK2_DSPARK_KV_BYTES if drafting else 0)) / 2**30
 
 
-def ik2_recommended_context(gpus: list, ram: float, need: float, drafting: bool = False) -> int:
+def ik2_recommended_context(vram: float, ram: float, need: float, drafting: bool = False) -> int:
     """The context the setup recommends on this PC, as DeepSeek's (ds4_recommended_context): the largest of
-    IK2_CONTEXTS from IK2_DEFAULT_CONTEXT (64K) up to IK2_RECOMMENDED_CONTEXT (256K) whose cache fits in what this
-    PC's memory (fit_memory: VRAM + RAM less what the OS keeps) holds beyond the model (need) - its cache sits in VRAM,
-    the experts it displaces go to RAM.  Else IK2_DEFAULT_CONTEXT, also when the RAM could not be read.  Larger
-    contexts, up to the model's 1M, are offered, not recommended."""
+    IK2_CONTEXTS from IK2_DEFAULT_CONTEXT (64K) up to IK2_RECOMMENDED_CONTEXT (256K) whose cache fits in what VRAM +
+    RAM hold beyond the model (need: ik2_memory_gb) - its cache sits in VRAM, the experts it displaces go to RAM.  Else
+    IK2_DEFAULT_CONTEXT, also when the RAM could not be read.  Larger contexts, up to the model's 1M, are offered, not
+    recommended."""
     if ram <= 0:
         return IK2_DEFAULT_CONTEXT
-    spare = fit_memory(gpus, ram)[0] - need
+    spare = vram + ram - need
     fits = [c for c in IK2_CONTEXTS if IK2_DEFAULT_CONTEXT <= c <= IK2_RECOMMENDED_CONTEXT and ik2_kv_gb(c, drafting) <= spare]
     return max(fits) if fits else IK2_DEFAULT_CONTEXT
 
@@ -10209,11 +10217,13 @@ def ik2_pack_step(a, d: Path, files: list) -> Path:
 
 
 def ik2_seed_profile(pack: Path) -> Path | None:
-    """A pack with no expert profile yet (default.prof): the shipped IK2_PROFILE copied into it, where the engine reads
-    it by itself (the most routed experts placed in VRAM at the load; the expert cache moves them as it routes).  Only
-    a profile of the pack's geometry (its layers x routed experts).  The profile written, or None."""
-    dst = pack / "default.prof"
-    if dst.exists() or not IK2_PROFILE.is_file():
+    """A pack with no expert profile yet (expert-profile.bin, maya-ds4's name; or default.prof, the name before, which
+    the engine still reads): the shipped IK2_PROFILE copied into it, where the engine reads it by itself (the most
+    routed experts placed in VRAM at the load; the expert cache moves them as it routes) and writes this PC's routing
+    back into it, as ds4_seed_profile's.  Only a profile of the pack's geometry (its layers x routed experts).  The
+    profile written, or None."""
+    dst = pack / "expert-profile.bin"
+    if dst.exists() or (pack / "default.prof").exists() or not IK2_PROFILE.is_file():
         return None
     try:
         geo = dict(ln.partition(" ")[::2] for ln in (pack / "inkling2.txt").read_text(encoding="utf-8").splitlines())
@@ -10230,24 +10240,27 @@ def ik2_seed_profile(pack: Path) -> Path | None:
 
 
 def write_config_ik2(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path,
-                     index: Path | None, drafting: bool, quant: str = IK2_QUANT) -> Path:
+                     index: Path | None, quant: str = IK2_QUANT) -> Path:
     """maya-inkling2-hip.json and its start script.  The drafter's index is written whenever it is there
-    (--dspark-index: the engine drafts with it, --dspark off without - the Models page switches it), the model's own
-    sampling and thinking level at every setup; a setup again keeps what the config before says that this one does
-    not ask - where the server listens, its key, the env, and the engine settings set by hand (the VRAM kept free, the
-    layer split, the CPU lane's threads, an expert profile, the prompt chunk, the drafts' floor).  The VRAM kept free
-    (--reserve-mib, maya-ds4's flag): DeepSeek's on AMD (--vram-reserve-mib, else hip_reserve_mib).  The GPUs: the
-    server shows the engine the config's "gpu" cards and splits the layers over them (--layer-split auto)."""
+    (--dspark-index), with --dspark none until the speed calibration finds that drafting pays here (DeepSeek's
+    setup's rule - the Models page switches it), the model's own sampling and thinking level at every setup; a setup
+    again keeps what the config before says that this one does not ask - where the server listens, its key, the env,
+    and the engine settings set by hand (the VRAM kept free, the layer split, the CPU lane's threads, an expert
+    profile, the prompt chunk, drafting and the drafts' floor).  The VRAM kept free (--reserve-mib, maya-ds4's flag):
+    DeepSeek's on AMD (--vram-reserve-mib, else hip_reserve_mib).  The GPUs: the server shows the engine the config's
+    "gpu" cards and splits the layers over them (--layer-split auto)."""
     step(8, "the configuration and the start script")
     port = a.port or 8080
     cfg_path = ROOT / IK2_CONFIG
     old = read_json(cfg_path) if cfg_path.exists() else {}
     args = ["--pack", str(pack), "--max-context", str(ctx)]
     if index is not None:
-        args += ["--dspark", "on" if drafting else "off", "--dspark-index", str(index)]
+        args += ["--dspark-index", str(index)]
     kept = keep_args([str(x) for x in old.get("args") or []], args,
                      ("--reserve-mib", "--vram-experts", "--layer-split", "--cpu-threads", "--expert-profile",
-                      "--prefill-chunk", "--dspark-cum", "--rewind", "--short-prompt"))
+                      "--prefill-chunk", "--dspark", "--dspark-cum", "--rewind", "--short-prompt"))
+    if "--dspark" not in args[:-1] and index is not None:
+        args += ["--dspark", "none"]                   # (until the speed calibration finds that drafting pays here)
     # (the VRAM kept free on each GPU: as DeepSeek's setup writes it on AMD - --vram-reserve-mib, else hip_reserve_mib)
     if getattr(a, "vram_reserve_mib", None) is not None:   # given now: written, and a later setup keeps it
         set_arg(args, "--reserve-mib", a.vram_reserve_mib)
@@ -10257,7 +10270,7 @@ def write_config_ik2(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         set_arg(args, "--reserve-mib", mib)
         ok(f"VRAM kept free on each GPU: {mib} MiB (the desktop and other programs on an AMD GPU allocate beside the "
            "engine; --vram-reserve-mib changes it)")
-    inst = {"family": "ik2", "ik2_quant": quant, "quant": Q.OTHERS[("ik2", quant)], "drafting": "on" if drafting else "off"}
+    inst = {"family": "ik2", "ik2_quant": quant, "quant": Q.OTHERS[("ik2", quant)]}
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
     cfg = {"exe": str(INK_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": IK2_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]], "backend": "hip",
@@ -10287,49 +10300,38 @@ def write_config_ik2(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
 
 
 def set_up_ik2(a, prev: dict) -> Path | None:
-    """Inkling 2 Small's steps 1-8, on AMD only (its engine maya-inkling2; on NVIDIA the model's engine is maya-ik2,
-    which has no setup yet - check_pc says so and stops): the PC (AMD on Linux; the memory - the experts VRAM does not
-    hold are copied into RAM, never read from the SSD, so a PC whose VRAM and RAM together cannot hold the model stops
-    here, --force-fit goes on), the context (up to the model's 1M, recommended by this PC's memory), the engine
-    (build-hip/maya-inkling2), unsloth's UD-Q2_K_XL set, the model's DSpark drafter (converted to the engine's Q8_0
-    copy), the pack with its expert profile, the config.  Files already there are used as they are: nothing is
-    downloaded, converted or packed again.  Drafting: on (the default, its gain measured on prose and code) or
-    --drafting off; no speed calibration yet."""
+    """Inkling 2 Small's steps 1-9, on AMD only (its engine maya-inkling2; on NVIDIA the model's engine is maya-ik2,
+    which has no setup yet - check_pc says so and stops): the PC (AMD on Linux; the memory, as DeepSeek's setup: below
+    VRAM + RAM that hold the model it warns and goes on - here the engine then stops at its start, since the experts
+    VRAM does not hold are copied into RAM, never read from the SSD), the context (up to the model's 1M, recommended as
+    DeepSeek's), the engine (build-hip/maya-inkling2), unsloth's UD-Q2_K_XL set, the model's DSpark drafter (converted
+    to the engine's Q8_0 copy), the pack with its expert profile, the config, and the speed calibration - the drafter
+    or none, as DeepSeek's (--drafting measure | on | off).  Files already there are used as they are: nothing is
+    downloaded, converted or packed again."""
     quant = IK2_QUANT
     name = Q.shown("ik2", quant)
     pc = check_pc(a, "ik2")                            # 1
-    inst = prev.get("installer") or {}
     prev_args = [str(x) for x in prev.get("args") or []]
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     total, _ = mem_gb()
     vram = sum(float(g.get("vram_gb") or 0) for g in pc["gpus"])
-    how = getattr(a, "drafting", None)
-    # (on by default; a setup before that chose off keeps it off - --drafting on / off says it now)
-    drafting = how != "off" if how else not (inst.get("drafting") == "off" or flag_value(prev_args, "--dspark") in
-                                             ("off", "none"))
-    need = ik2_memory_gb(drafting)
-    if total > 0 and vram + total < need:
-        why = (f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{need:.0f} GB that hold {name} - the "
-               "experts VRAM does not hold are copied into RAM (the engine never reads them from the SSD), so it would "
-               "stop at its start")
-        if not getattr(a, "force_fit", False):
-            fail(why, f"more of the AMD GPUs ({ME} --setup --gpus 0,1,...) or more RAM; nothing was downloaded. To "
-                      "try anyway: --force-fit")
-        warn(why + " - going on (--force-fit)")
+    need = ik2_memory_gb()
+    if total > 0 and vram + total < need:              # (DeepSeek's check: said, the setup goes on)
+        warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{need:.0f} GB that hold {name} - the "
+             "experts VRAM does not hold are copied into RAM (the engine never reads them from the SSD), so it would "
+             f"stop at its start. More of the AMD GPUs ({ME} --setup --gpus 0,1,...) or more RAM make it fit")
     else:
         ok(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: they hold {name} (about {need:.0f} GB), the experts "
            "VRAM does not hold in RAM")
     step(2, "your choices")                            # 2
     ok(f"files: {name} (unsloth's GGUF; on this engine the one set of files)")
-    rec = ik2_recommended_context(pc["gpus"], total, need, drafting)
+    rec = ik2_recommended_context(vram, total, need, True)   # (the drafter's cache counted: the calibration may draft)
     ctx = choose_context(a, prev_ctx, IK2_CONTEXTS, rec)
     ok(f"context: {ctx} tokens" + (" (recommended for this PC's memory)" if ctx == rec else "") +
-       f"; its cache: {ik2_kv_gb(ctx, drafting):.1f} GB of VRAM across the GPUs, whose experts then live in RAM")
-    if ctx > rec and total > 0 and ik2_kv_gb(ctx, drafting) > fit_memory(pc["gpus"], total)[0] - need:
+       f"; its cache: {ik2_kv_gb(ctx, True):.1f} GB of VRAM across the GPUs, whose experts then live in RAM")
+    if ctx > rec and total > 0 and ik2_kv_gb(ctx, True) > vram + total - need:
         warn(f"a {context_label(ctx)} context's cache leaves too little of this PC's memory for the model's experts: "
              f"{context_label(rec)} fits (the engine may stop at its start)")
-    if how == "measure":
-        warn(f"no speed calibration for {IK2_SHOWN} yet: it drafts with its DSpark drafter (--drafting off: without)")
     models = ik2_models_dir(a, prev)
     d = ik2_dir(a, models, prev, quant)
     mtp = ik2_mtp_dir(models, prev)
@@ -10343,18 +10345,21 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     pack = ik2_pack_step(a, d, files)                  # 6
     if ik2_seed_profile(pack):
         ok("expert profile: the pack starts from Inkling 2's shipped one (the most routed experts placed in VRAM at "
-           "the load); the engine's expert cache moves them as this PC routes")
+           "the load); the engine adds what this PC routes to it")
     step(7, "images")                                  # 7
     ok(f"{IK2_SHOWN} on this engine: text only (tool calls, thinking)")
     if index is None:
-        drafting = False
-        ok("drafting: off - no DSpark drafter (a setup again downloads and converts it)")
-    elif drafting:
-        ok(f"drafting: the model's DSpark drafter drafts a few tokens at a time for the model to check - the same "
-           f"answers, faster on prose and code (about {IK2_DSPARK_GB:g} GB of the last GPU's VRAM)")
-    else:
-        ok("drafting: off (--drafting on, or Drafting on the Models page, drafts with the DSpark drafter)")
-    return write_config_ik2(a, pc, meta, pack, ctx, models, d, index, drafting, quant)   # 8
+        ok("drafting: none - no DSpark drafter (a setup again downloads and converts it)")
+    cfg_path = write_config_ik2(a, pc, meta, pack, ctx, models, d, index, quant)   # 8
+    if CDS.has_drafter(read_json(cfg_path)):           # 9 (as DeepSeek's: the drafter measured on this PC, or chosen)
+        how = drafting_choice(a, "The DSpark drafter", "10-30")
+        if how != "measure":
+            keep_drafting(cfg_path, how == "on")
+        else:
+            if S.UI is not None:
+                S.UI.step(9, "speed calibration: the DSpark drafter or none")
+            speed_calibration(cfg_path, measure_asked(a))
+    return cfg_path
 
 
 # ------------------------------------------------------------------------------------------------ CYBER-FROST-3.8-PS
@@ -10989,8 +10994,8 @@ def main() -> int:
                          "calibration keeps it only if it is faster on this PC (the default with --yes; asked "
                          "otherwise), on = draft with it, off = without it - both skip the measuring.  Hy4-Flash's "
                          "sizes: on = the MTP block where it fits in the VRAM, else the size's DFly2 drafter; mtp / "
-                         "dfly2 = that one alone (another model: the same as on).  Inkling 2 Small: on (the default) "
-                         "or off, nothing to measure yet")
+                         "dfly2 = that one alone (another model: the same as on).  Inkling 2 Small: its DSpark "
+                         "drafter, as DeepSeek's")
     ap.add_argument("--fast-drafting", choices=["on", "off"],
                     help="Hy4-Flash's sizes on a small card (a setup setting, kept in the config): where the DFly2 "
                          "drafter has no room beside the cache's F16 rows at the context chosen, on keeps that context "

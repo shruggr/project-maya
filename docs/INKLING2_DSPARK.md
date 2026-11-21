@@ -459,7 +459,7 @@ tokens of ours, which is why the fold and a device-side head loop matter. Inject
 
 ## In the engine (2026-11-20: wired, measured)
 
-`maya-inkling2` drafts by default (`--dspark on|off|idle`, `--dspark-index DIR`, `--dspark-cum F`; a request's
+`maya-inkling2` drafts by default (`--dspark on|off|none`, maya-ds4's, and `idle` for tests; `--dspark-index DIR`, `--dspark-cum F`; a request's
 `spec=0|1` and `dspark_cum=F` keys). The module loads on the last GPU with the engine's own output matrix
 (`DsparkOptions::output_dev`); the engine keeps 3.4 GB of that GPU for it (`Options::dspark_reserve_gb`: the drafter
 reports 3.09 GB at a 32k context), so about 250 of its experts go to RAM.
@@ -495,7 +495,7 @@ context's end (`Dspark::rollback`), its rings as long as the engine's.
 |---|---|---|---|---|---|---|---|---|---|
 | before | 30.4 | 43.1 | 50.7 | 58.4 | 68.1 | 76.4 | 83.8 | 93.5 | 100.0 |
 | now | 29.9 | 38.9 | 45.5 | 51.3 | 59.2 | 65.5 | 71.2 | 77.4 | 83.7 |
-| now, `--dspark off` (no taps) | 29.1 | 38.8 | 45.5 | 50.8 | 59.1 | 65.9 | 71.6 | 77.5 | 83.0 |
+| now, `--dspark none` (no taps) | 29.1 | 38.8 | 45.5 | 50.8 | 59.1 | 65.9 | 71.6 | 77.5 | 83.0 |
 
 | part (ms a pass, with the phase marks) | T 1 before | T 1 now | T 2 before | T 2 now | T 4 before | T 4 now | T 8 before | T 8 now |
 |---|---|---|---|---|---|---|---|---|
@@ -521,7 +521,7 @@ the cards' bandwidth, 4.7 ms.
 **Exactness.** With the experts where they are (`--window-test` holds the cache still for it) a window's 9 rows are
 the 9 token steps' logits to the bit, and so is a window cut back and read on. With the cache moving experts between
 two passes the same token steps differ from themselves (0 of 9 rows the same, least cosine 0.9958): an expert's sum
-on the CPU lane is not its sum on the GPU. `--ab --no-swap`: the three prompts' 256 drafted tokens are the undrafted
+on the CPU lane is not its sum on the GPU. `--ab --no-expert-cache`: the three prompts' 256 drafted tokens are the undrafted
 ones. With the cache on a drafted answer leaves the undrafted one at a close call (prose token 21, the two best logits
 0.057 apart; code 98 at 0.059; thinking 7 at 0.027) - as a second undrafted load does (code from token 165, thinking
 from 7): docs/INKLING2_AMD.md, Status.
@@ -542,7 +542,7 @@ lane's share (8 - 13 % against 7 %: the drafter's 3.1 GB on the last GPU, and fe
 
 Through serve/server.py (my_e2e.py: a 2.7k-token document and two follow-ups, temperature 1, thinking on; sampled,
 so the answers differ): 38.2 / 40.5 / 45.7 tok/s after the first token with drafts, 32.0 / 33.8 / 32.1 without
-(`--dspark off`); drafts kept 194 of 363, 256 of 435, 297 of 397; tokens a pass 1.96 / 2.10 / 2.23.
+(`--dspark none`, `off` then); drafts kept 194 of 363, 256 of 435, 297 of 397; tokens a pass 1.96 / 2.10 / 2.23.
 
 Left: the draft (8 ms on the last GPU while the others idle) could overlap the first GPU's part of the pass; the
 drafter's VRAM; a sampled window's logits go to the host a row (0.8 MB) for the verdict.

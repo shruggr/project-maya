@@ -551,6 +551,22 @@ struct Model::Impl {
         return (size_t) (o.dspark_reserve_gb * 1e9) +
                (size_t) std::max<int64_t>(0, o.max_ctx - 32768) * Dspark::ctx_bytes();
     }
+    // RAM left to the rest (the system, the page cache's churn): 8 GiB, or INKLING2_RAM_MARGIN_GB=<GiB> (0 to 4096; read
+    // once, logged once; an unreadable value keeps the 8) - maya-ds4's ram_margin and its DS4_RAM_MARGIN_GB
+    static uint64_t ram_margin() {
+        static const uint64_t m = [] {
+            double gib = 8.0;
+            if (const char* v = std::getenv("INKLING2_RAM_MARGIN_GB")) {
+                char* end = nullptr;
+                const double x = std::strtod(v, &end);
+                if (end != v && x >= 0.0 && x <= 4096.0) gib = x;
+                else std::fprintf(stderr, "inkling2: INKLING2_RAM_MARGIN_GB=%s is not a number from 0 to 4096: keeping 8 GiB\n", v);
+                if (gib != 8.0) std::fprintf(stderr, "inkling2: RAM margin %.1f GiB (INKLING2_RAM_MARGIN_GB)\n", gib);
+            }
+            return (uint64_t) (gib * 1073741824.0);
+        }();
+        return m;
+    }
     // The plan: the layers over the GPUs by their bytes, then each GPU's room filled with its layers' experts - the
     // most routed first by the profile (none: each layer's first ones, the layers in turn)
     bool plan(std::string& err) {
@@ -645,9 +661,11 @@ struct Model::Impl {
                 st.ram_gb += (double) (l.blob * (size_t) nr) / 1e9;
             }
         }
+        // (they are copied into RAM - never read from the files - beside ram_margin() for the rest, maya-ds4's rule)
         const uint64_t avail = hy4::ram_available();
-        if (avail > 0 && st.ram_gb * 1e9 + 3e9 > (double) avail) {
-            err = "the experts outside VRAM need " + std::to_string((int) st.ram_gb) + " GB of RAM, " +
+        if (avail > 0 && st.ram_gb * 1e9 + (double) ram_margin() > (double) avail) {
+            err = "the experts outside VRAM need " + std::to_string((int) st.ram_gb) + " GB of RAM and " +
+                  std::to_string((int) (ram_margin() >> 30)) + " GiB are left to the rest, " +
                   std::to_string((int) (avail / 1e9)) + " GB can be had";
             return false;
         }
@@ -827,20 +845,17 @@ struct Model::Impl {
             CK(cudaStreamCreateWithFlags(&G[i].s, cudaStreamNonBlocking));
             CK(cudaMemGetInfo(&G[i].free0, &G[i].total));
         }
-        if (o.profile.empty()) {   // (the pack's own, when it has one)
-            std::ifstream df(o.pack + "/default.prof", std::ios::binary);
-            if (df) o.profile = o.pack + "/default.prof";
-        } else if (o.profile == "none") {
-            o.profile.clear();
-        }
+        // the expert profile (maya-ds4's: <pack>/expert-profile.bin unless --expert-profile names one, "none" none):
+        // read when it is there and whole, else the counts start from nothing - written back either way
+        // (save_profile).  A pack from before the name (its default.prof) is read in its place, once
+        if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";
+        if (o.profile == "none") o.profile.clear();
+        prof_in.assign((size_t) g.n_layer * g.n_expert, 0u);
         if (!o.profile.empty()) {
             std::ifstream f(o.profile, std::ios::binary);
-            prof_in.resize((size_t) g.n_layer * g.n_expert);
-            if (!f || !f.read((char*) prof_in.data(), (std::streamsize) (prof_in.size() * 4))) {
-                err = o.profile + ": not an expert profile of " + std::to_string(g.n_layer) + " x " +
-                      std::to_string(g.n_expert) + " uint32";
-                return false;
-            }
+            if (!f && o.profile == o.pack + "/expert-profile.bin") f.open(o.pack + "/default.prof", std::ios::binary);
+            std::vector<uint32_t> p(prof_in.size());
+            if (f && f.read((char*) p.data(), (std::streamsize) (p.size() * 4))) prof_in = p;
         }
         prof_cnt.assign((size_t) g.n_layer * g.n_expert, 0);
         h_rl.assign((size_t) g.n_expert, 0.0f);
@@ -910,7 +925,7 @@ struct Model::Impl {
         CK(cudaMallocHost((void**) &h_top, 8));
         CK(cudaMallocHost((void**) &h_big, (size_t) g.n_vocab * 4));
         CK(cudaMallocHost((void**) &h_plan, 128));
-        lane.reset(new hy4::Lane(o.cpu_threads));
+        lane.reset(new hy4::Lane(o.cpu_threads > 0 ? o.cpu_threads - 1 : -1));   // (workers besides the caller)
         {   // the RAM experts registered with the driver, a thread a GPU's layers
             const double tr = now_s();
             std::vector<std::thread> rt;
@@ -936,7 +951,7 @@ struct Model::Impl {
             for (auto& x : rt) x.join();
             if (o.verbose) std::fprintf(stderr, "RAM experts registered and streamed once in %.1f s\n", now_s() - tr);
         }
-        if (o.swap && st.ram_gb > 0 && !ram_unreg.load())
+        if (o.expert_cache && st.ram_gb > 0 && !ram_unreg.load())
             for (size_t gi = 0; gi < G.size(); ++gi) {
                 CK(cudaSetDevice(G[gi].dev));
                 CK(cudaStreamCreateWithFlags(&G[gi].s3, cudaStreamNonBlocking));
@@ -2570,7 +2585,7 @@ struct Model::Impl {
             gp.sw_cv.notify_all();
         }
     }
-    bool swap_on() const { return o.swap && !tapf && !pick_hook && st.ram_gb > 0; }
+    bool swap_on() const { return o.expert_cache && !tapf && !pick_hook && st.ram_gb > 0; }
     // the decode thread, between two steps (no layer runs): the finished copies' maps, the next move
     bool swap_poll(std::string& err, int batch = 0) {
         if (!swap_on()) return true;
@@ -2875,10 +2890,10 @@ bool Model::load(const Options& o, std::string& err) {
         const std::vector<uint32_t> keep = m->prof_cnt;
         std::vector<std::vector<float>> use;   // (the dummy chunk's routings are no one's: the cache does not see them)
         for (const auto& l : m->L) use.push_back(l.use);
-        const bool sw = m->o.swap;
-        m->o.swap = false;
+        const bool sw = m->o.expert_cache;
+        m->o.expert_cache = false;
         if (!m->prompt(ids.data(), (int) ids.size(), 0, nullptr, err) || !m->reset(err)) return false;
-        m->o.swap = sw;
+        m->o.expert_cache = sw;
         for (size_t i = 0; i < use.size(); ++i) m->L[i].use = use[i];
         m->prof_cnt = keep;
         m->st = Stats{m->st.load_s + (now_s() - t0), m->st.vram_gb, m->st.ram_gb, m->st.ram_locked};
@@ -2928,22 +2943,31 @@ void Model::set_progress(std::function<bool(int64_t)> f) { m->progress = std::mo
 bool Model::cancelled() const { return m->was_cancelled; }
 int Model::top() const { return m->top_id; }
 bool Model::save_profile(std::string& err) const {
-    if (m->o.profile_out.empty()) return true;
+    // (maya-ds4's: --profile-out gets this run's routing alone, the profile the counts read at the load and this run's
+    //  - unless --profile-readonly)
+    const Options& o = m->o;
+    if (o.profile_out.empty() && (o.profile.empty() || o.profile_readonly)) return true;
     m->counts_flush();
-    std::vector<uint32_t> c = m->prof_cnt;
-    for (size_t i = 0; i < c.size() && i < m->prof_in.size(); ++i) c[i] += m->prof_in[i];
-    const std::string tmp = m->o.profile_out + ".tmp";
-    std::ofstream f(tmp, std::ios::binary);
-    if (!f || !f.write((const char*) c.data(), (std::streamsize) (c.size() * 4)) || !f.flush()) {
-        err = tmp + ": cannot write";
-        return false;
-    }
-    f.close();
-    if (std::rename(tmp.c_str(), m->o.profile_out.c_str()) != 0) {
-        err = m->o.profile_out + ": cannot rename";
-        return false;
-    }
-    return true;
+    const auto write = [&](const std::string& path, const std::vector<uint32_t>& v) {
+        const std::string tmp = path + ".tmp";
+        std::ofstream f(tmp, std::ios::binary);
+        if (!f || !f.write((const char*) v.data(), (std::streamsize) (v.size() * 4)) || !f.flush()) {
+            err = tmp + ": cannot write";
+            return false;
+        }
+        f.close();
+        if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+            std::remove(tmp.c_str());
+            err = path + ": cannot rename";
+            return false;
+        }
+        return true;
+    };
+    if (!o.profile_out.empty() && !write(o.profile_out, m->prof_cnt)) return false;
+    if (o.profile.empty() || o.profile_readonly) return true;
+    std::vector<uint32_t> all = m->prof_cnt;
+    for (size_t i = 0; i < all.size() && i < m->prof_in.size(); ++i) all[i] += m->prof_in[i];
+    return write(o.profile, all);
 }
 int Model::vocab() const { return m->g.n_vocab_unpadded; }
 int64_t Model::max_ctx() const { return m->o.max_ctx; }
@@ -2972,7 +2996,7 @@ bool Model::set_logit_bias(const std::vector<std::pair<int, float>>& entries, st
     return m->set_logit_bias(entries, err);
 }
 void Model::set_debug(int mask) { m->dbg = mask; }
-void Model::set_swap(bool on) { m->o.swap = on; }
+void Model::set_swap(bool on) { m->o.expert_cache = on; }
 bool Model::dspark() const { return m->taps_on; }
 bool Model::draft(int anchor, int max_n, std::vector<int>& toks, std::vector<float>& probs, std::string& err) {
     toks.clear();

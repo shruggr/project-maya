@@ -19,9 +19,10 @@ tokens), `--ab` prose 33.8 -> 62.1, code 36.1 -> 59.2, thinking 37.0 -> 39.3 tok
 official chat template, my_e2e's three turns 42.1 / 38.9 / 50.7 tok/s. The table below is the run before the merge
 (commit f620cbc: speculative decoding wired).
 
-Measured on this PC; `--max-context 32768`, `default.prof` loads by itself, the drafter on by default.
+Measured on this PC; `--max-context 32768`, the pack's expert profile loads by itself, the drafter on by default.
+(The flags as they are named now: the drafter not loaded is `--dspark none`, maya-ds4's name; it was `off` then.)
 
-| | without drafts (`--dspark off`) | with the DSpark drafter (default) |
+| | without drafts (`--dspark none`) | with the DSpark drafter (default) |
 |---|---|---|
 | Decode, short context (12-token prompt, 512 tokens) | 37.5 tok/s | - |
 | Prose: the 2.7k-token reference prompt continued, 256 tokens | 33.8 tok/s | 62.3 - 66.0 tok/s |
@@ -35,7 +36,7 @@ Measured on this PC; `--max-context 32768`, `default.prof` loads by itself, the 
 Done:
 - Load: layer split, the expert pack, RAM experts pinned.
 - Host-free decode step: device picks, a mailbox CPU lane, mapped hand-off.
-- Dynamic VRAM/RAM expert cache: decayed counts, one mover per GPU, `--no-swap` turns it off.
+- Dynamic VRAM/RAM expert cache: decayed counts, one mover per GPU, `--no-expert-cache` turns it off.
 - Batched prompt path: RAM experts streamed into VRAM.
 - Prefix reuse with checkpointed rewind (`--rewind`); F16 KV.
 - `--serve` (maya-hy4's protocol: "Serving" below).
@@ -48,7 +49,7 @@ Done:
 - The drafter's taps: every row of every step and of every prompt chunk, F32 [rows][8][4608] on the last GPU, fed to
   `Dspark::feed_dev` once the rows are kept.
 - Drafting in the decode loop and in `--serve` (`draft_round` in inkling2_main.cpp): draft -> window -> keep -> feed;
-  the window by expected tokens a millisecond; greedy and sampled acceptance; `--dspark on|off|idle`,
+  the window by expected tokens a millisecond; greedy and sampled acceptance; `--dspark on|off|none` (maya-ds4's; `idle`, tests only),
   `--dspark-index`, `--dspark-cum`; INFO `dspark=1`, DONE `drafts_acc` / `drafts_off`. docs/INKLING2_DSPARK.md
   ("In the engine") has the numbers.
 
@@ -58,7 +59,7 @@ t(T) at 2.7k context, ms a pass of T rows (`--window-test`, the drafter's taps o
 |---|---|---|---|---|---|---|---|---|---|
 | before (commit 85ef75e) | 30.4 | 43.1 | 50.7 | 58.4 | 68.1 | 76.4 | 83.8 | 93.5 | 100.0 |
 | now | 29.9 | 38.9 | 45.5 | 51.3 | 59.2 | 65.5 | 71.2 | 77.4 | 83.7 |
-| now, `--dspark off` (no taps) | 29.1 | 38.8 | 45.5 | 50.8 | 59.1 | 65.9 | 71.6 | 77.5 | 83.0 |
+| now, `--dspark none` (no taps) | 29.1 | 38.8 | 45.5 | 50.8 | 59.1 | 65.9 | 71.6 | 77.5 | 83.0 |
 
 A row more costs 6.7 ms (8.7 before). What is left of it (`INKLING2_PHASES=1`, a line a window size): the routed
 experts 4.7 ms (4.3 more unique experts a layer, at the cards' memory bandwidth: the floor), the input projections'
@@ -68,7 +69,7 @@ the lane 0.2.
 Two passes over the same tokens differ when the expert cache moved an expert between them (its sum on the CPU lane is
 not its sum on the GPU: logits cosine 0.995-0.9999, windows or not). A drafted run moves experts at other moments
 than an undrafted one (a poll a pass, not a token), so:
-- with `--no-swap` the drafted greedy answer is the undrafted one token for token (`--ab --no-swap`: three prompts,
+- with `--no-expert-cache` the drafted greedy answer is the undrafted one token for token (`--ab --no-expert-cache`: three prompts,
   256 tokens each);
 - with the cache on, the two part where the row's two best logits are close: prose at token 21 (gap 0.057), code at
   98 (0.059) or 111 (0.13), thinking at 7 (0.027) or 112 (0.99) - two drafted loads each, the gaps from the undrafted
@@ -84,10 +85,14 @@ Not done:
 3. Sampled requests copy every window row's logits to the host for the verdict (0.8 MB a row).
 4. Thinking text is break-even (half of 1.5 offered drafts kept): the drafter rests there, it does not gain.
 
-Engine flags (where maya-ds4 has the same setting, its name, unit and default: `--max-context` 32768, `--reserve-mib`
-600 - the setup writes DeepSeek's AMD figure, 3072 on a discrete card -, `--cpu-threads`, `--expert-profile`,
-`--profile-out`): `--pack --max-context (--ctx) --layer-split --gpus --reserve-mib --vram-experts
---expert-profile (none) --profile-out --cpu-threads --log-floor --prefill-chunk --try-chunks --repeat --rewind --short-prompt --no-swap --eos --serve --tokens
+Engine flags (where maya-ds4 has the same setting, its name, unit, default and behaviour: `--max-context` 32768,
+`--reserve-mib` 600 - the setup writes DeepSeek's AMD figure, 3072 on a discrete card -, `--cpu-threads` 0 (a thread a
+physical core; N: at most N), `--expert-profile` (`<pack>/expert-profile.bin`, read and written back; a pack's
+`default.prof` from before is read in its place), `--profile-readonly`, `--profile-out` (this run's routing alone),
+`--no-expert-cache`, `--dspark on|off|none` (off: loaded, a request drafts when it says `spec=1`; none: not loaded;
+`idle`, tests only, has no maya-ds4 counterpart: loaded and fed, never asked)): `--pack --max-context (--ctx)
+--layer-split --gpus --reserve-mib --vram-experts --expert-profile (none) --profile-readonly --profile-out
+--cpu-threads --log-floor --prefill-chunk --try-chunks --repeat --rewind --short-prompt --no-expert-cache --eos --serve --tokens
 --tokens-file --n-predict --layers --dspark --dspark-index --dspark-cum --verbose`; tests `--parity [--parity-force-picks
 --parity-force-only --parity-decode --parity-detail --parity-max] --rewind-test --short-bench --window-test
 [--window-bits] --prompts --ab --temperature --seed --dspark-rest0`. Environment: `INKLING2_PHASES` (device phase
@@ -272,13 +277,16 @@ matches a regex.
 `serve/server.py --engine maya --config <file>` runs the engine like any other. The setup makes everything, on AMD
 under Linux only (`./maya.sh --setup --backend hip --gpus 0,1,2,3 --model inkling-2-small`, or Inkling 2 Small in its
 model list; the Models page lists it under the other quants on an AMD install): the PC (VRAM + RAM must hold the
-model, ~190 GB, since the experts VRAM does not hold are copied into RAM - below that it stops, `--force-fit` goes on),
-the context (up to the model's 1M, recommended by the memory left beside the model at 32 KB a token), the engine
+model, ~202 GB, `IK2_MEMORY_GB`; since the experts VRAM does not hold are copied into RAM, below that the engine stops
+at its start - the setup warns and goes on, as DeepSeek's does), the context (DeepSeek's: offered from 32K up to the
+model's 1M, recommended from 64K up to 256K by what VRAM + RAM hold beyond the model), the engine
 (`build-hip/maya-inkling2`), unsloth's UD-Q2_K_XL set (`tools/inkling2/download.json`, in
 `<models>/Inkling-2-Small-GGUF/UD-Q2_K_XL`), Thinking Machines' `mtp.safetensors` and `config.json` in
 `<models>/Inkling-2-Small-MTP` converted by `tools/inkling2/convert_dspark.py --type q8_0`, the pack, its expert
-profile (`default.prof`, copied from `data/expert-profile-inkling2.bin` where the pack has none) and
-`maya-inkling2-hip.json` with `--dspark-index`. Files already there are used as they are (a pack made by hand
+profile (`expert-profile.bin`, copied from `data/expert-profile-inkling2.bin` where the pack has none) and
+`maya-inkling2-hip.json` with `--dspark-index` and `--dspark none` until the speed calibration (DeepSeek's,
+`tools/calibrate_ds4.py`: the config started without the drafter and with it, chat, code and tool calls) finds that
+drafting pays on this PC (`--drafting measure|on|off`, `--speed-calibration`). Files already there are used as they are (a pack made by hand
 included: `--repack` builds it again). `maya_quants.py`'s ids: `inkling-2-small`, `inkling-2-small-ud-q2_k_xl`. On
 NVIDIA the model's engine is `maya-ik2`, which has no setup: the setup says so and stops.
 
@@ -311,8 +319,10 @@ By hand, the same steps:
 - **The command.** `Popen([exe, "--serve", *args])` with the config's args, plus `--layer-split auto` when `gpu`
   lists more than one GPU (`engine_args`; not for `maya-ik2`, which stops at that flag), in `cwd`, with
   `HIP_VISIBLE_DEVICES` = the config's GPUs and `lib_dirs` first on the library path. The Models page changes
-  `--max-context`, the GPUs and Drafting (`--dspark on|off` with `--dspark-index`, offered where the drafter's index is
-  on this PC; maya-ik2 has no drafter); every other flag stays as the config has it.
+  `--max-context`, the GPUs and Drafting (`--dspark on|none` with `--dspark-index`, offered where the drafter's index is
+  on this PC; maya-ik2 has no drafter), and for maya-inkling2 DeepSeek's rows for the settings both engines have:
+  `--reserve-mib`, `--prefill-chunk`, `--cpu-threads` and `--dspark-cum` (as DeepSeek's Draft confidence,
+  `--dspark-conf`); every other flag stays as the config has it.
 - **The drafter's index.** The engine drafts only with the index `--dspark-index` names (the setup writes it); without
   one it decodes without drafts and says so at its start.
 - **What the server adds for the model** beyond INKLING2.md's list: a tool result headed by its tool's name
@@ -324,7 +334,7 @@ By hand, the same steps:
 The line protocol (maya-hy4's, `src/hy4/hy4_main.cpp`'s `serve`):
 
 - Start: `NOTE <text>` / `INFO key=value ...` lines (`INFO engine=inkling2 engine_kind=inkling2 model=Inkling-2-Small
-  ctx=<n> vram_gb=<x> dspark=1 logit_bias=1 ...`; `dspark=0` with `--dspark off` or no drafter index), then
+  ctx=<n> vram_gb=<x> dspark=1 logit_bias=1 ...`; `dspark=0` with `--dspark off` / `none` or no drafter index), then
   `READY <max_context> stop`. stderr is the log.
 - The server sends `GEN <max_new> [key=value ...] <id,id,...>`, the whole prompt each time (the engine reuses the
   prefix it holds). Keys: `temperature` (absent or 0: greedy), `top_p`, `top_k`, `min_p`, `seed`, `penalty_*`,

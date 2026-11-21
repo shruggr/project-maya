@@ -1,8 +1,9 @@
 """serve/test_ik2_drafting.py - the Models page's Drafting switch for Inkling 2 Small: maya-inkling2's DSpark drafter
 ("dspark" | "none", as DeepSeek's), offered only where its index is on this PC - the one the config names
 (--dspark-index), the one in the setup's models folder, or the one the setup's layout puts beside the pack - and
-written as --dspark on|off with --dspark-index.  maya-ik2 (CUDA) has no drafter: "none" only, nothing written, and the
-page shows no switch for it.
+written as --dspark on|none with --dspark-index, as DeepSeek's.  maya-inkling2's other DeepSeek settings (the VRAM kept
+free, the prompt chunk, the CPU threads and the drafts' floor, --dspark-cum: DeepSeek's Draft confidence) in DeepSeek's
+rows.  maya-ik2 (CUDA) has none of them: "none" only, nothing written, and the page shows no switch for it.
 
     python -m unittest serve.test_ik2_drafting
 
@@ -96,7 +97,8 @@ class Settings(unittest.TestCase):
         self.assertEqual(models.settings_of(amd(self.pack))["draft"], "none")
         self.assertEqual(models.settings_of(amd(self.pack, *ix))["draft"], "dspark")          # (on: the default)
         self.assertEqual(models.settings_of(amd(self.pack, "--dspark", "on", *ix))["draft"], "dspark")
-        self.assertEqual(models.settings_of(amd(self.pack, "--dspark", "off", *ix))["draft"], "none")
+        self.assertEqual(models.settings_of(amd(self.pack, "--dspark", "off", *ix))["draft"], "none")   # (loaded, not drafting)
+        self.assertEqual(models.settings_of(amd(self.pack, "--dspark", "none", *ix))["draft"], "none")
         self.assertEqual(models.settings_of(amd(self.pack, "--dspark", "on"))["draft"], "none")
 
     def test_written_as_deepseeks(self):
@@ -106,15 +108,42 @@ class Settings(unittest.TestCase):
         self.assertEqual(models.flag(on["args"], "--dspark-index"), str(self.index))
         self.assertEqual(models.settings_of(on)["draft"], "dspark")
         off = models.apply(on, {"draft": "none"})
-        self.assertEqual(models.flag(off["args"], "--dspark"), "off")
+        self.assertEqual(models.flag(off["args"], "--dspark"), "none")   # (DeepSeek's: the drafter not loaded)
         self.assertEqual(models.flag(off["args"], "--dspark-index"), str(self.index))   # (kept: on again later)
         self.assertEqual(models.settings_of(off)["draft"], "none")
         self.assertEqual(models.choices(off)["draft"], ["dspark", "none"])
         self.assertEqual(off["args"][:4], cfg["args"][:4])                 # (the pack and the context as they were)
         again = models.apply(off, {"context": 131072})                     # (another setting: drafting as it was)
-        self.assertEqual(models.flag(again["args"], "--dspark"), "off")
+        self.assertEqual(models.flag(again["args"], "--dspark"), "none")
         with self.assertRaises(ValueError):
             models.apply(cfg, {"draft": "mtp"})
+
+    def test_deepseeks_settings(self):
+        """reserve_mib, prefill_chunk, cpu_threads (DS4_KEYS') and dspark_cum (dspark_conf's counterpart): read from
+        and written to maya-inkling2's flags as DeepSeek's are - empty: the flag dropped, the engine's own default."""
+        cfg = amd(self.pack, "--dspark-index", str(self.index))
+        got = models.settings_of(cfg)
+        self.assertEqual({k: got[k] for k in models.IK2_AMD_ONLY}, dict.fromkeys(models.IK2_AMD_ONLY))
+        out = models.apply(cfg, {"reserve_mib": 3072, "prefill_chunk": 1024, "cpu_threads": 16, "dspark_cum": 0.4})
+        for f, v in (("--reserve-mib", "3072"), ("--prefill-chunk", "1024"), ("--cpu-threads", "16"),
+                     ("--dspark-cum", "0.4")):
+            self.assertEqual(models.flag(out["args"], f), v)
+        self.assertEqual(models.settings_of(out)["dspark_cum"], 0.4)
+        back = models.apply(out, {"reserve_mib": None, "prefill_chunk": None, "cpu_threads": None, "dspark_cum": None})
+        self.assertEqual(back["args"], models.apply(cfg, {})["args"])
+        for bad in ({"dspark_cum": 1.5}, {"prefill_chunk": 4}, {"cpu_threads": 0}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                models.apply(cfg, bad)
+        cuda = dict(CUDA)
+        self.assertNotIn("reserve_mib", models.settings_of(cuda))
+        with self.assertRaises(ValueError):
+            models.apply(cuda, {"reserve_mib": 3072})
+
+    def test_contexts_and_tested(self):
+        """DeepSeek's contexts (from 32K); maya-inkling2's end-to-end runs reach 128K so far (CONTEXT_TESTED)."""
+        self.assertEqual(models.IK2_CONTEXTS, models.DS4_CONTEXTS)
+        self.assertEqual(models.CONTEXT_TESTED["inkling2"], 131072)
+        self.assertEqual(models.context_range(1048576, 32768, "inkling2")["tested"], 131072)
 
     def test_refused_without_the_drafter(self):
         shutil.rmtree(self.index)
@@ -148,7 +177,8 @@ const ser = (v) => v == null || typeof v === "boolean" ? null : Array.isArray(v)
   : "type" in v && "props" in v ? {t: typeof v.type === "function" ? v.type.name : v.type,
                                    p: Object.fromEntries(Object.entries(v.props || {}).map(([k, x]) => [k, ser(x)]))}
   : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, ser(x)]));
-const s = {context: 262144, gpus: [0, 1, 2, 3], env: {}, images: false, draft: "dspark"};
+const s = {context: 262144, gpus: [0, 1, 2, 3], env: {}, images: false, draft: "dspark", reserve_mib: null,
+           prefill_chunk: null, cpu_threads: null, dspark_cum: null};
 const base = {file: "maya-inkling2-hip.json", running: false, backend: "hip", family: "ik2", model: "inkling-2-small",
               quant: "UD-Q2_K_XL", settings: s, context_range: {min: 4096, max: 1048576, tested: 262144}};
 const cases = {
@@ -183,11 +213,17 @@ class PageJs(unittest.TestCase):
 
     def test_amd_has_the_switch(self):
         f = rows_of(self.got["amd"])
-        self.assertEqual(list(f), ["Context size", "Drafting", "Images", "Answers at once", "GPUs"])
+        self.assertEqual(list(f), ["Context size", "Drafting", "Images", "Answers at once", "GPUs", "VRAM kept free",
+                                   "Prompt chunk", "CPU threads", "Draft confidence"])
+        for label, flag in (("VRAM kept free", "--reserve-mib"), ("Prompt chunk", "--prefill-chunk"),
+                            ("CPU threads", "--cpu-threads"), ("Draft confidence", "--dspark-cum")):
+            self.assertEqual(f[label]["flag"], flag)
+        self.assertIn("running product", f["Draft confidence"]["hint"])
         self.assertEqual(f["Drafting"]["flag"], "--dspark")
         self.assertIn("DSpark", f["Drafting"]["hint"])
         self.assertIn('"dspark"', json.dumps(f["Drafting"]))
         n = rows_of(self.got["amd_none"])
+        self.assertNotIn("Draft confidence", n)                            # (shown while it drafts, as DeepSeek's)
         self.assertIn("setup downloads", n["Drafting"]["hint"])
         self.assertNotIn('"dspark"', json.dumps(n["Drafting"]))           # (Off alone)
 

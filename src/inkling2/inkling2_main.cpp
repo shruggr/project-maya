@@ -157,7 +157,6 @@ struct Lines {
 bool parse_gen(const std::string& line, mm3::sample::Req& r, float& cum, std::vector<std::pair<int, float>>& bias) {
     bias.clear();
     std::istringstream is(line.substr(4));
-    r.top_k = 0;   // (no top-k unless asked)
     if (!(is >> r.max_new)) return false;
     for (std::string tok; is >> tok;) {
         const size_t eq = tok.find('=');
@@ -449,12 +448,15 @@ bool draft_round(inkling2::Model& m, Drafting& dr, int tok, const mm3::sample::R
 
 // short: a prompt's unread tokens up to this many go through the decode path, a token a step (measured: the prompt
 // path's chunk costs more than that many steps)
-int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool drafting, float cum_default, int rest0) {
+// spec: a request drafts unless it says (GEN spec=0|1), as maya-ds4's --dspark on / off; drafting: it may draft at
+// all (--dspark idle: the drafter fed, never asked)
+int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool spec_default, bool drafting, float cum_default,
+          int rest0) {
     for (const std::string& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const inkling2::Stats& st = m.stats();
     std::printf("INFO engine=inkling2 engine_kind=inkling2 model=Inkling-2-Small ctx=%lld vram_gb=%.2f dspark=%d mtp=0 "
                 "experts=%d experts_vram=%d\n", (long long) m.max_ctx(), st.vram_gb + m.dspark_vram_gb(),
-                m.dspark() && drafting ? 1 : 0, st.experts_all, st.experts_vram);
+                m.dspark() && drafting && spec_default ? 1 : 0, st.experts_all, st.experts_vram);
     std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
     Drafting dr;
     dr.on = m.dspark() && drafting;
@@ -529,7 +531,7 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool d
             for (size_t i = from; i < n && ok && !cancel; ++i) {
                 ok = m.forward(&r.ids[i], 1, (int64_t) i, i + 1 == n && want_lg ? lg.data() : nullptr, err);
                 cancel = lines.stop.load() || lines.wrap.load();
-                if (ok && (i + 1 - from) % 16 == 0) pp(i + 1);
+                if (ok && (i + 1 - from) % 64 == 0) pp(i + 1);   // (maya-ds4's: a PP line every 64 tokens)
             }
             if (ok && cancel && (size_t) m.end() == n) cancel = false;   // (all read: the answer's first token may still go)
         } else {
@@ -561,7 +563,7 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool d
         const int64_t cpu0 = st.cpu_experts, ex0 = st.experts;
         dr.start();
         const Drafting d0 = dr;
-        const bool spec = dr.on && r.spec != 0;
+        const bool spec = dr.on && (r.spec < 0 ? spec_default : r.spec != 0);
         if (dr.on) m.set_draft_cum(cum);
         // the answer's first token from the prompt's last row; then rounds: the token in hand read (with drafts, when
         // the drafter has some worth a window), the tokens after it given out
@@ -575,7 +577,7 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool d
                 std::fflush(stdout);
                 return false;
             }
-            if (produced % 32 == 0) {
+            if (produced % 8 == 0) {   // (maya-ds4's: a STAT line every 8 tokens)
                 const double ms = (now_s() - t1) * 1e3;
                 const double share = (double) (st.cpu_experts - cpu0) / (double) std::max<int64_t>(1, st.experts - ex0);
                 std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f cpu_share=%.4f swaps=%lld", 1e3 * (double) produced / ms,
@@ -663,9 +665,11 @@ int usage() {
                  "  --reserve-mib N     VRAM each GPU keeps free, MiB (default 600)\n"
                  "  --vram-experts X    the share of a layer's experts in VRAM at most (default 1.0)\n"
                  "  --layer-split a,b,c the first layer of each GPU after the first (auto: by the layers' bytes, the default)\n"
-                 "  --expert-profile F / --profile-out F   an expert profile read (the most routed in VRAM; none: no\n"
-                 "                      profile, default: the pack's default.prof) / written\n"
-                 "  --cpu-threads N     the CPU lane's workers (default: one a physical core)\n"
+                 "  --expert-profile F  the expert profile read (the most routed in VRAM) and written back (default: the\n"
+                 "                      pack's expert-profile.bin; none: no profile)\n"
+                 "  --profile-readonly  the profile is read, never written back\n"
+                 "  --profile-out F     this run's routing alone, written to F\n"
+                 "  --cpu-threads N     the CPU lane's threads (default 0: a thread a physical core; N: at most N)\n"
                  "  --log-floor N       log_scaling_n_floor in place of the pack's\n"
                  "  --layers N          (tests) the first N layers only\n"
                  "  --parity-max N      (parity) the first N positions only\n"
@@ -674,7 +678,7 @@ int usage() {
                  "  --prefill-chunk N   a prompt's tokens a chunk (default 512; 1: token by token)\n"
                  "  --parity-force-picks  (parity) each reference a second time, every layer taking the reference's\n"
                  "                      picks (what is left is not the router's near-ties)\n"
-                 "  --no-swap           the experts stay where the load put them (no cache moves)\n"
+                 "  --no-expert-cache   the experts stay where the load put them (no cache moves)\n"
                  "  --tokens-file F     (tests) a prompt a line; with --profile-out: a corpus' routings\n"
                  "  --serve             the server's line protocol on stdin / stdout (docs/INKLING2_AMD.md, \"Serving\")\n"
                  "  --rewind N          positions a rewind may go back without reading the prompt again (default 4096)\n"
@@ -685,8 +689,9 @@ int usage() {
                  "                      a window cut back, a window's time for 1 .. 9 rows\n"
                  "  --rewind-test DIR   (tests) a reference's prompt read, rewound and read on, against a cold read\n"
                  "  --short-bench       (tests, with --tokens) short suffixes on the prompt path and the decode path\n"
-                 "  --dspark on|off|idle  the DSpark drafter: speculative decoding with it (on, the default), not loaded (off),\n"
-                 "                      or loaded and fed but never asked for drafts (idle: tests)\n"
+                 "  --dspark on|off|none  the DSpark drafter (maya-ds4's): speculative decoding with it (on, the default),\n"
+                 "                      loaded but a request drafts only when it asks (off: GEN spec=1), or not loaded\n"
+                 "                      (none).  idle (tests; maya-ds4 has none): loaded and fed, never asked for drafts\n"
                  "  --dspark-index DIR  its index (tools/inkling2/convert_dspark.py's maya-inkling2-dspark-q8_0; none given:\n"
                  "                      decoding without drafts)\n"
                  "  --dspark-cum F      the floor on the running product of the drafts' probabilities (default 0.5; a\n"
@@ -734,6 +739,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--expert-profile") o.profile = val();
         else if (a == "--profile-out") o.profile_out = val();
+        else if (a == "--profile-readonly") o.profile_readonly = true;
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val().c_str());
         else if (a == "--log-floor") o.log_floor = std::atof(val().c_str());
         else if (a == "--layers") o.layers = std::atoi(val().c_str());
@@ -745,7 +751,7 @@ int main(int argc, char** argv) {
         else if (a == "--try-chunks") try_chunks = int_list(val());
         else if (a == "--verbose") o.verbose = true;
         else if (a == "--serve") serving = true;
-        else if (a == "--no-swap") o.swap = false;
+        else if (a == "--no-expert-cache") o.expert_cache = false;
         else if (a == "--tokens-file") tokens_file = val();
         else if (a == "--rewind") o.rewind = std::atoi(val().c_str());
         else if (a == "--short-prompt") short_n = std::atoi(val().c_str());
@@ -773,8 +779,13 @@ int main(int argc, char** argv) {
                            window_test.empty() && prompts_file.empty()))
         return usage();
     std::string err;
+    // (--tokens-file, a corpus' routings - maya-ds4's --profile-run: the pack's profile only read, the run's counts
+    //  to --profile-out alone)
+    if (!tokens_file.empty()) o.profile_readonly = true;
     // the drafter: with --serve and the plain decode (the tests run without it); its index missing: none, said so
-    const bool drafting = dspark != "off" && dspark != "none" && parities.empty() && rewind_test.empty() && !short_bench &&
+    // (--dspark: on drafts, off loads it for the requests that ask, none leaves it out; idle: loaded, never asked)
+    if (dspark != "on" && dspark != "off" && dspark != "none" && dspark != "idle") return usage();
+    const bool drafting = dspark != "none" && parities.empty() && rewind_test.empty() && !short_bench &&
                           tokens_file.empty();
     if (drafting) {
         if (dspark_index.empty()) {
@@ -798,15 +809,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
         return 1;
     }
-    const bool swap_opt = o.swap;
-    if (serving) return serve(model, stops, short_n, drafting && dspark != "idle", dspark_cum, rest0_list.empty() ? -1 : rest0_list[0]);
+    const bool swap_opt = o.expert_cache;
+    if (serving)
+        return serve(model, stops, short_n, dspark == "on", drafting && dspark != "idle", dspark_cum,
+                     rest0_list.empty() ? -1 : rest0_list[0]);
     for (const std::string& s : model.info_lines()) std::printf("%s\n", s.c_str());
     std::printf("loaded in %.1f s, %.1f GB of VRAM\n", model.stats().load_s, model.stats().vram_gb);
     if (model.dspark()) std::printf("the DSpark drafter: %.2f GB of VRAM on the last GPU%s\n", model.dspark_vram_gb(),
-                                    dspark == "idle" ? " (idle: fed, not asked)" : "");
+                                    dspark == "on" ? "" : " (fed, not asked)");
     if (!tokens_file.empty()) {
         // --tokens-file F: a prompt a line (ids), each read from an empty context and --n-predict tokens decoded after
-        // it - with --profile-out the routings of a corpus, the pack's default.prof
+        // it - with --profile-out the routings of a corpus (data/expert-profile-inkling2.bin)
         std::ifstream tf(tokens_file);
         int np = 0;
         for (std::string line; std::getline(tf, line);) {
@@ -1079,7 +1092,7 @@ int main(int argc, char** argv) {
         const double cms0 = model.stats().cpu_ms;
         int n = 0;
         Drafting dr;
-        dr.on = model.dspark() && dspark != "idle" && mode == 1;
+        dr.on = model.dspark() && dspark == "on" && mode == 1;
         if (!rest0_list.empty()) {   // (tests: prompt i's rest0; 9: without drafts)
             dr.rest0 = rest0_list[pi % rest0_list.size()];
             if (dr.rest0 == 9) dr.on = false;

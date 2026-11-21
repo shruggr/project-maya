@@ -26,9 +26,14 @@ struct Options {
     int64_t max_ctx = 32768;      // positions the global layers' caches hold (maya-ds4's default)
     int64_t reserve_mib = 600;    // VRAM each GPU keeps free beyond the plan, MiB (maya-ds4's --reserve-mib and default)
     double vram_experts = 1.0;    // the share of each layer's routed experts kept in VRAM at most
-    int cpu_threads = -1;         // the CPU lane's workers besides the caller (-1: one a physical core but the first)
-    std::string profile;          // an expert profile (uint32 [layers][experts] routings): the most routed in VRAM
-    std::string profile_out;      // where save_profile writes it (the read one's counts with this run's)
+    // the CPU lane's threads, the caller's among them (maya-ds4's meaning and default): 0 a thread a physical core;
+    // n: at most n, a thread a core
+    int cpu_threads = 0;
+    // expert hit counts (uint32 [layers][experts]): read to place the most routed in VRAM, written back (maya-ds4's)
+    std::string profile;
+    bool profile_readonly = false;    // (--profile-readonly) the profile is read, never written back
+    // (--profile-out) where save_profile() also writes what this run routed alone: the counts read at the load taken off
+    std::string profile_out;
     std::vector<int> layer_split; // the first layer of each GPU after the first (empty: by the experts' bytes)
     int rewind = 4096;            // positions back from the furthest one read that a rewind may reach without the
                                   // prompt being read again (the sliding-window rings keep that many rows more)
@@ -40,7 +45,7 @@ struct Options {
     float dspark_cum = 0.5f;      // its cut on the running product of the drafts' probabilities (Model::set_draft_cum)
     double dspark_reserve_gb = 3.4;   // VRAM the last GPU keeps for it beyond reserve_mib (fewer experts there), at a
                                       // context of 32768: a longer one adds the drafter's rows a position
-    bool swap = true;             // the expert cache: the experts routed to lately move into VRAM, colder ones out
+    bool expert_cache = true;     // experts move between VRAM and the CPU lane as they are used (maya-ds4's)
     bool verbose = false;
 };
 
@@ -80,7 +85,7 @@ public:
     /// (tests) a window's rows through a token's launches, a part at a time: 1 the block types' GEMVs, 2 the experts,
     /// 4 the CPU lane, 8 the F32 GEMVs
     void set_debug(int mask);
-    /// The expert cache's moves on / off from here on (Options::swap).  Off, the experts stay where they are: two passes
+    /// The expert cache's moves on / off from here on (Options::expert_cache).  Off, the experts stay where they are: two passes
     /// over the same tokens then give the same bits (an expert's sum on the CPU lane is not its sum on the GPU).
     void set_swap(bool on);
     /// A request's logit bias (the server's GEN logit_bias=<id>:<bias>,...; its ignore_eos bans the end tokens with
