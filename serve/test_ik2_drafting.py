@@ -1,7 +1,7 @@
-"""serve/test_ik2_drafting.py - the Models page's Drafting switch for Inkling 2 Small: maya-inkling2's DSpark drafter
+"""serve/test_ik2_drafting.py - the Models page's Drafting switch for Inkling 2 Small: maya-ik2's DSpark drafter
 ("dspark" | "none", as DeepSeek's), offered only where its index is on this PC - the one the config names
 (--dspark-index), the one in the setup's models folder, or the one the setup's layout puts beside the pack - and
-written as --dspark on|none with --dspark-index, as DeepSeek's.  maya-inkling2's other DeepSeek settings (the VRAM kept
+written as --dspark on|none with --dspark-index, as DeepSeek's.  maya-ik2's other DeepSeek settings (the VRAM kept
 free, the prompt chunk, the CPU threads and the drafts' floor, --dspark-cum: DeepSeek's Draft confidence) in DeepSeek's
 rows.  maya-ik2 (CUDA) has none of them: "none" only, nothing written, and the page shows no switch for it.
 
@@ -27,18 +27,18 @@ CUDA = {"exe": "/opt/maya/build/maya-ik2", "gpu": [0, 1], "model_name": "inkling
 def layout(root: Path, drafter: bool = True) -> tuple:
     """A models folder as the setup leaves it: the GGUF set's pack, and (drafter) the converted drafter's index beside
     it.  (pack, index)"""
-    pack = root / "Inkling-2-Small-GGUF" / "UD-Q2_K_XL" / "maya-inkling2"
+    pack = root / "Inkling-2-Small-GGUF" / "UD-Q2_K_XL" / "maya-ik2"
     pack.mkdir(parents=True)
     (pack / "inkling2.txt").write_text("arch inkling2\n", encoding="utf-8")
     index = root / models.IK2_MTP_DIR / models.IK2_DSPARK
     if drafter:
         index.mkdir(parents=True)
-        (index / "dspark.txt").write_text("format maya-inkling2-dspark 1\n", encoding="utf-8")
+        (index / "dspark.txt").write_text("format maya-ik2-dspark 1\n", encoding="utf-8")
     return pack, index
 
 
 def amd(pack: Path, *extra, **keys) -> dict:
-    return {"exe": "/home/me/project-maya/build-hip/maya-inkling2", "gpu": [0, 1, 2, 3], "backend": "hip",
+    return {"exe": "/home/me/project-maya/build-hip/maya-ik2", "gpu": [0, 1, 2, 3], "backend": "hip",
             "args": ["--pack", str(pack), "--max-context", "32768", *extra], "model_name": "inkling-2-small", **keys}
 
 
@@ -54,7 +54,7 @@ class Choices(unittest.TestCase):
         pack, index = layout(self.root)
         for cfg in (amd(pack),                                             # (beside the pack: a config by hand)
                     amd(pack, "--dspark-index", str(index)),               # (the one it names)
-                    amd(self.root / "elsewhere" / "maya-inkling2", installer={"models_dir": str(self.root)})):
+                    amd(self.root / "elsewhere" / "maya-ik2", installer={"models_dir": str(self.root)})):
             with self.subTest(args=cfg["args"]):
                 self.assertEqual(models.choices(cfg)["draft"], ["dspark", "none"])
                 self.assertTrue(models.choices(cfg)["drafting"])
@@ -120,7 +120,7 @@ class Settings(unittest.TestCase):
 
     def test_deepseeks_settings(self):
         """reserve_mib, prefill_chunk, cpu_threads (DS4_KEYS') and dspark_cum (dspark_conf's counterpart): read from
-        and written to maya-inkling2's flags as DeepSeek's are - empty: the flag dropped, the engine's own default."""
+        and written to maya-ik2's flags as DeepSeek's are - empty: the flag dropped, the engine's own default."""
         cfg = amd(self.pack, "--dspark-index", str(self.index))
         got = models.settings_of(cfg)
         self.assertEqual({k: got[k] for k in models.IK2_AMD_ONLY},
@@ -142,7 +142,7 @@ class Settings(unittest.TestCase):
 
     def test_mmap_as_deepseeks(self):
         """mmap (DS4_KEYS'): --mmap-experts on | off written, auto (the engine's default) the flag dropped; anything
-        else refused; maya-ik2 has no such setting."""
+        else refused; maya-ik2 on NVIDIA has no such setting."""
         cfg = amd(self.pack, "--dspark-index", str(self.index))
         for v in ("on", "off"):
             with self.subTest(mmap=v):
@@ -157,25 +157,25 @@ class Settings(unittest.TestCase):
             models.apply(dict(CUDA), {"mmap": "on"})
 
     def test_the_pages_figures(self):
-        """maya-inkling2's entry carries its VRAM a position and the drafter's - the setup's figures (maya.py takes
+        """maya-ik2's entry carries its VRAM a position and the drafter's - the setup's figures (maya.py takes
         them from here); maya-ik2's carries none."""
         cfg = amd(self.pack, "--dspark-index", str(self.index))
         with tempfile.TemporaryDirectory() as t:
-            path = Path(t) / "maya-inkling2-hip.json"
+            path = Path(t) / "maya-ik2-hip.json"
             path.write_text(json.dumps(cfg), encoding="utf-8")
             e = models.describe(path, None)
             path.write_text(json.dumps(CUDA), encoding="utf-8")
             c = models.describe(path, None)
         self.assertEqual((e["kv_bytes"], e["kv_gpu_bytes"], e["dspark_kv_bytes"], e["dspark_gb"]),
                          (models.IK2_KV_BYTES, models.IK2_ATTN_BYTES, models.IK2_DSPARK_KV_BYTES, models.IK2_DSPARK_GB))
-        self.assertEqual(e["context_range"]["tested"], 524288)            # (CONTEXT_TESTED["inkling2"])
+        self.assertEqual(e["context_range"]["tested"], 524288)            # (CONTEXT_TESTED["ik2-hip"])
         self.assertNotIn("kv_bytes", c)
 
     def test_contexts_and_tested(self):
-        """DeepSeek's contexts (from 32K); maya-inkling2's end-to-end runs reach 512K so far (CONTEXT_TESTED)."""
+        """DeepSeek's contexts (from 32K); maya-ik2's end-to-end runs reach 512K so far (CONTEXT_TESTED)."""
         self.assertEqual(models.IK2_CONTEXTS, models.DS4_CONTEXTS)
-        self.assertEqual(models.CONTEXT_TESTED["inkling2"], 524288)
-        self.assertEqual(models.context_range(1048576, 32768, "inkling2")["tested"], 524288)
+        self.assertEqual(models.CONTEXT_TESTED["ik2-hip"], 524288)
+        self.assertEqual(models.context_range(1048576, 32768, "ik2-hip")["tested"], 524288)
 
     def test_refused_without_the_drafter(self):
         shutil.rmtree(self.index)
@@ -186,7 +186,7 @@ class Settings(unittest.TestCase):
         self.assertEqual(models.apply(cfg, {"draft": "none"})["args"], cfg["args"])   # (nothing to switch: as it is)
 
 
-# models.js' fields for both engines (fieldsOf, exported in a temporary copy, as serve/test_glm_dsa_models.py's)
+# models.js' fields for both builds (fieldsOf, exported in a temporary copy, as serve/test_glm_dsa_models.py's)
 PAGE_JS = r"""
 import fs from "node:fs";
 import path from "node:path";
@@ -211,7 +211,7 @@ const ser = (v) => v == null || typeof v === "boolean" ? null : Array.isArray(v)
   : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, ser(x)]));
 const s = {context: 262144, gpus: [0, 1, 2, 3], env: {}, images: false, draft: "dspark", reserve_mib: null,
            prefill_chunk: null, cpu_threads: null, dspark_cum: null};
-const base = {file: "maya-inkling2-hip.json", running: false, backend: "hip", family: "ik2", model: "inkling-2-small",
+const base = {file: "maya-ik2-hip.json", running: false, backend: "hip", family: "ik2", model: "inkling-2-small",
               quant: "UD-Q2_K_XL", settings: s, context_range: {min: 4096, max: 1048576, tested: 262144}};
 const own = {kv_bytes: 32768, kv_gpu_bytes: 1560, dspark_kv_bytes: 6400, dspark_gb: 3.47};   // (models.py's entry)
 const cases = {

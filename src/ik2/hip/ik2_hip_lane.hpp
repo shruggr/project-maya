@@ -1,4 +1,4 @@
-// src/inkling2/inkling2_lane.hpp - maya-inkling2's CPU lane: the routed experts that are not in VRAM, computed on the
+// src/ik2/hip/ik2_hip_lane.hpp - maya-ik2's CPU lane: the routed experts that are not in VRAM, computed on the
 // CPU from their copies in RAM or, with --mmap-experts, in place in the model's files (docs/INKLING2_AMD.md) while the
 // GPU computes the others.  The arithmetic is maya-ds4's CPU rows for a GGUF's experts (src/ds4/ds4_iq_cpu.cpp:
 // ggml-cpu's dots, an activation as Q8_K) with the SITU activation between the fused gate | up rows and down.  The
@@ -12,7 +12,7 @@
 
 #include "hy4_lane.hpp"
 
-namespace inkling2 {
+namespace ik2hip {
 
 /// A layer's experts outside VRAM, by RAM slot r: below n_copy copied into RAM, at base + r blob - its fused gate | up
 /// matrix (2 n_ff rows of n_embd) at 0, its down matrix (n_embd rows of n_ff) at tr_down; from n_copy on in place in
@@ -47,4 +47,4 @@ struct CpuRowEntry {
 void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<CpuRowEntry>& entries, const float* x, int T,
                       float* out);
 
-}  // namespace inkling2
+}  // namespace ik2hip

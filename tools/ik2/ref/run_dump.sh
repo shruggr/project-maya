@@ -1,5 +1,5 @@
 #!/bin/bash
-# Reference tensor dump for maya-inkling2 (docs/INKLING2_AMD.md): llama.cpp's Inkling 2 (a checkout with
+# Reference tensor dump for maya-ik2 (docs/INKLING2_AMD.md): llama.cpp's Inkling 2 (a checkout with
 # examples/inkling-dump = this directory's inkling-dump.cpp, built as build-hip), run in a ROCm container.
 #   run_dump.sh <name> <prompt file> [steps] [regex]   ->  $REF/<name>/
 # Environment (all required): LLAMA the llama.cpp checkout, MODELS the folder holding Inkling-2-Small-GGUF/,

@@ -1,20 +1,20 @@
-// tests/inkling2_dspark_test.cpp - maya-inkling2's drafter alone (src/inkling2/inkling2_dspark) against a reference
-// run of llama.cpp PR #32218 (tools/inkling2/ref/inkling-dspark-eval.cpp; docs/INKLING2_DSPARK.md, "Measured"):
+// tests/ik2_hip_dspark_test.cpp - maya-ik2's drafter alone (src/ik2/hip/ik2_hip_dspark) against a reference
+// run of llama.cpp PR #32218 (tools/ik2/ref/inkling-dspark-eval.cpp; docs/INKLING2_DSPARK.md, "Measured"):
 //   <ref>/tokens.txt             the prompt's token count, then the prompt's and the target's greedy tokens
 //   <ref>/tap-slot<id>.bin       F32 [positions][n_embd]: the target's taps (ids 5, 11, ..., 41, 48)
 //   <ref>/drafts-<variant>.txt   a line a generated position n: `n kept`, then 7 x `token:probability`
 // The prompt's taps are fed, then for every reference line the taps of position n - 1 and a block drafted after the
 // token at n: the 7 drafts and their top probabilities against the reference's.
 //
-//   inkling2-dspark-test --index <maya-inkling2-dspark-q8_0> --target-pack <maya-inkling2> --ref <dir>
-//                        [--variant q8_0] [--gpu 3] [--joint-index <maya-inkling2-dspark-bf16>] [--max-ctx 16384]
+//   ik2-hip-dspark-test --index <maya-ik2-dspark-q8_0> --target-pack <maya-ik2> --ref <dir>
+//                        [--variant q8_0] [--gpu 3] [--joint-index <maya-ik2-dspark-bf16>] [--max-ctx 16384]
 //   --paths    then the other ways in, each against the straight host feed's drafts at the run's end: a rollback and
 //              the rows fed again, the taps fed from the device (feed_dev), a second drafter on the caller's copy of
 //              the target's output matrix (output_dev)
 //   --synth N  then a context of N positions (the run's taps repeated; --max-ctx above N): a block's time there, and
 //              a rollback of 100 positions fed again against the drafts before it
-#include "inkling2_dspark.hpp"
-#include "inkling2_pack.hpp"
+#include "ik2_hip_dspark.hpp"
+#include "ik2_hip_pack.hpp"
 
 #include <cuda_runtime.h>
 
@@ -33,7 +33,7 @@ static double now_ms() {
 }
 
 int main(int argc, char** argv) {
-    inkling2::DsparkOptions o;
+    ik2hip::DsparkOptions o;
     std::string ref, variant = "q8_0";
     o.gpu = 0;
     o.profile = true;
@@ -65,16 +65,16 @@ int main(int argc, char** argv) {
         }
     }
     if (o.index.empty() || o.target_pack.empty() || ref.empty()) {
-        std::fprintf(stderr, "usage: inkling2-dspark-test --index DIR --target-pack DIR --ref DIR [--variant q8_0] [--gpu N]\n");
+        std::fprintf(stderr, "usage: ik2-hip-dspark-test --index DIR --target-pack DIR --ref DIR [--variant q8_0] [--gpu N]\n");
         return 2;
     }
     std::string err;
-    inkling2::Dspark d;
+    ik2hip::Dspark d;
     if (!d.load(o, err)) {
         std::fprintf(stderr, "load: %s\n", err.c_str());
         return 1;
     }
-    const int E = d.n_embd(), NT = inkling2::Dspark::kTaps;
+    const int E = d.n_embd(), NT = ik2hip::Dspark::kTaps;
     // the reference
     std::vector<int> tok;
     int n_prompt = 0;
@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
     long long perr_n = 0;
     std::vector<int> dt;
     std::vector<float> dp;
-    const inkling2::DsparkStats& st = d.stats();
+    const ik2hip::DsparkStats& st = d.stats();
     const double feed0 = st.feed_ms;
     for (size_t li = 0; li < lines.size(); ++li) {
         const Line& l = lines[li];
@@ -260,21 +260,21 @@ int main(int argc, char** argv) {
         }
         // a second drafter on the caller's output matrix
         {
-            inkling2::Pack tp;
+            ik2hip::Pack tp;
             if (!tp.load(o.target_pack, err)) return 1;
-            const inkling2::Tensor* to = tp.get("output.weight");
+            const ik2hip::Tensor* to = tp.get("output.weight");
             void* dw = nullptr;
             if (!to || cudaMalloc(&dw, to->bytes) != cudaSuccess ||
                 cudaMemcpy(dw, tp.data(*to), to->bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
                 std::fprintf(stderr, "output_dev: no output.weight on the device\n");
                 return 1;
             }
-            inkling2::DsparkOptions o2 = o;
+            ik2hip::DsparkOptions o2 = o;
             o2.verbose = false;
             o2.output_dev = (const uint8_t*) dw;
             o2.output_type = to->type == "Q6_K" ? 14 : 8;
             o2.output_ld = (size_t) to->bytes / (size_t) to->n(1);
-            inkling2::Dspark d2;
+            ik2hip::Dspark d2;
             if (!d2.load(o2, err) || !d2.feed(taps.data(), e, 0, err) || !d2.draft(anchor, 7, b0, bp, err)) {
                 std::fprintf(stderr, "output_dev: %s\n", err.c_str());
                 return 1;
@@ -296,7 +296,7 @@ int main(int argc, char** argv) {
             p += n;
         }
         std::printf("synthetic context of %lld positions fed in %.0f ms\n", synth, now_ms() - tf);
-        const inkling2::DsparkStats s0 = d.stats();
+        const ik2hip::DsparkStats s0 = d.stats();
         std::vector<int> a0, b0;
         std::vector<float> ap, bp;
         const int anchor = tok[(size_t) (synth % n_all)];
@@ -305,7 +305,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "synth draft: %s\n", err.c_str());
                 return 1;
             }
-        const inkling2::DsparkStats& s1 = d.stats();
+        const ik2hip::DsparkStats& s1 = d.stats();
         const double nb2 = (double) (s1.drafts - s0.drafts);
         if (nb2 < 1 || a0.size() != 7) {
             std::fprintf(stderr, "synth: no drafts at %lld (a --max-ctx above it?)\n", synth);

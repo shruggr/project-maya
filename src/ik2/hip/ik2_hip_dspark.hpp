@@ -1,5 +1,5 @@
-// src/inkling2/inkling2_dspark.hpp - maya-inkling2's drafter: Inkling 2 Small's DSpark block (Thinking Machines'
-// mtp.safetensors as tools/inkling2/convert_dspark.py's Q8_0 GGUF and its index) on one GPU
+// src/ik2/hip/ik2_hip_dspark.hpp - maya-ik2's drafter: Inkling 2 Small's DSpark block (Thinking Machines'
+// mtp.safetensors as tools/ik2/convert_dspark.py's Q8_0 GGUF and its index) on one GPU
 // (docs/INKLING2_DSPARK.md: the equations, the measured acceptance).
 //
 // The drafter is fed the target's taps of every position the context keeps (feed: 8 vectors of n_embd a position -
@@ -21,11 +21,11 @@
 #include <string>
 #include <vector>
 
-namespace inkling2 {
+namespace ik2hip {
 
 struct DsparkOptions {
-    std::string index;         // the drafter's index folder (maya-inkling2-dspark-q8_0: dspark.txt, tensors.txt)
-    std::string target_pack;   // the target's pack (maya-inkling2: token_embd, token_embd_norm, output)
+    std::string index;         // the drafter's index folder (maya-ik2-dspark-q8_0: dspark.txt, tensors.txt)
+    std::string target_pack;   // the target's pack (maya-ik2: token_embd, token_embd_norm, output)
     std::string joint_index;   // (optional) another index of the same drafter to take joint_proj.weight from (the
                                // BF16 one: Q8_0 rounds its small weights coarsely); empty: the index's own
     int gpu = 0;               // the device (the engine's: the GPU that holds the target's head)
@@ -108,4 +108,4 @@ private:
     std::unique_ptr<Impl> m;
 };
 
-}  // namespace inkling2
+}  // namespace ik2hip

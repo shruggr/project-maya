@@ -1,5 +1,5 @@
-"""serve/test_ik2_amd.py - Inkling-2-Small's second engine, maya-inkling2 (AMD), under the one family "ik2", and what
-the server does for the model beyond serve/test_inkling2_frontend.py: a config of either engine is the family "ik2"
+"""serve/test_ik2_amd.py - Inkling-2-Small's engine maya-ik2 on AMD (its HIP build, src/ik2/hip) under the family "ik2", and
+what the server does for the model beyond serve/test_inkling2_frontend.py: a config of either build is the family "ik2"
 ("inkling2" its older name), the engine line each one gets, the Models page's settings, a tokenizer folder with the
 GGUF's template swapped for thinkingmachines' own, a tool result headed by its tool's name, another role's message a
 stop, the loop guard's view of a call and the prompts it continues with, and a tool result's picture as a note.
@@ -19,9 +19,9 @@ from serve.frontend import inkling_messages, openai_to_messages
 from serve.test_inkling2_frontend import (ASK, CALL, END, EOS, MODEL, PUBLIC, TEXT, TOOL, TOOLS, USER, public,
                                           service)
 
-AMD = {"exe": "/home/me/project-maya/build-hip/maya-inkling2",
-       "args": ["--pack", "/models/Inkling-2-Small-GGUF/UD-Q2_K_XL/maya-inkling2", "--max-context", "32768"],
-       "tokenizer": "/models/Inkling-2-Small-GGUF/UD-Q2_K_XL/maya-inkling2/tokenizer",
+AMD = {"exe": "/home/me/project-maya/build-hip/maya-ik2",
+       "args": ["--pack", "/models/Inkling-2-Small-GGUF/UD-Q2_K_XL/maya-ik2", "--max-context", "32768"],
+       "tokenizer": "/models/Inkling-2-Small-GGUF/UD-Q2_K_XL/maya-ik2/tokenizer",
        "model_name": "inkling-2-small", "gpu": [0, 1, 2, 3], "backend": "hip"}
 CUDA = {"exe": "/opt/maya/build/maya-ik2", "gpu": [0, 1], "model_name": "inkling-2-small",
         "args": ["--model", "/models/Inkling-2-Small-UD-Q3_K_XL-00001-of-00005.gguf", "--max-context", "32768",
@@ -48,7 +48,7 @@ class Family(unittest.TestCase):
         self.assertEqual(Q.shown("ik2", "ud-q2_k_xl"), "Inkling 2 Small · UD-Q2_K_XL")
 
     def test_engine_line(self):
-        # (several GPUs: maya-inkling2 takes the server's layer split; maya-ik2 stops at the flag - its own --gpus)
+        # (several GPUs: maya-ik2 takes the server's layer split; maya-ik2 stops at the flag - its own --gpus)
         self.assertEqual(server.engine_args(AMD), AMD["args"] + ["--layer-split", "auto"])
         self.assertEqual(server.engine_args(CUDA), CUDA["args"])
         self.assertEqual(server.child_env(AMD)["HIP_VISIBLE_DEVICES"], "0,1,2,3")
@@ -73,7 +73,7 @@ class Family(unittest.TestCase):
         self.assertEqual(maya.setup_title(AMD), "Inkling-2-Small")
         self.assertNotIn("ik2", maya.FAMILIES)                           # (its setup is AMD only: not a row everywhere)
         maya.select_build_backend("hip")
-        self.assertEqual(maya.exe_for_target("maya-inkling2").name, "maya-inkling2")
+        self.assertEqual(maya.exe_for_target("maya-ik2").name, "maya-ik2")
         self.assertEqual(maya.bench_exe(AMD), Path(AMD["exe"]))
 
 
@@ -135,8 +135,8 @@ class Serving(unittest.TestCase):
     def test_a_tool_results_picture_is_a_note(self):
         svc, eng, tok = service(MODEL + TEXT + "ok" + END)
         self.assertEqual(svc.text_only(), "Inkling-2-Small on maya-ik2")
-        eng.info = {"engine": "inkling2", "engine_kind": "inkling2"}      # (the AMD engine's INFO)
-        self.assertEqual(svc.text_only(), "Inkling-2-Small on maya-inkling2")
+        eng.info = {"engine": "ik2", "engine_kind": "ik2-hip"}          # (the AMD build's INFO)
+        self.assertEqual(svc.text_only(), "Inkling-2-Small on maya-ik2")
         msgs, tools, kw = openai_to_messages({"messages": ROUND, "tools": TOOLS})
         ids, _, _ = svc.prepare(msgs, tools, kw, 100)                    # (no error: the agent's turn goes on)
         self.assertIn(server.HY4_PICTURE_NOTE, tok.decode(ids))

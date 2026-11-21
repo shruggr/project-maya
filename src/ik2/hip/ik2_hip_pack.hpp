@@ -1,4 +1,4 @@
-// src/inkling2/inkling2_pack.hpp - maya-inkling2's pack (tools/inkling2/pack_gguf.py): the geometry (inkling2.txt) and
+// src/ik2/hip/ik2_hip_pack.hpp - maya-ik2's pack (tools/ik2/pack_gguf.py): the geometry (inkling2.txt) and
 // every tensor of the GGUF set read in place (tensors.txt, each shard mapped once).
 //
 //   inkling2.txt  `key value` lines; lists comma-separated
@@ -16,7 +16,7 @@
 
 #include "mm3_os.hpp"
 
-namespace inkling2 {
+namespace ik2hip {
 
 struct Tensor {
     std::string name, type;
@@ -53,7 +53,7 @@ struct Pack {
         dir = pack_dir;
         std::ifstream gf(dir + "/inkling2.txt");
         if (!gf) {
-            err = dir + "/inkling2.txt: cannot open (tools/inkling2/pack_gguf.py --model <model> writes it)";
+            err = dir + "/inkling2.txt: cannot open (tools/ik2/pack_gguf.py --model <model> writes it)";
             return false;
         }
         for (std::string line; std::getline(gf, line);) {
@@ -118,7 +118,7 @@ struct Pack {
         // (keys the model's files always give - pack_gguf.py refuses a GGUF without them: no fallback here either)
         for (const char* k : {"expert_weights_scale", "final_logit_softcapping", "log_scaling_n_floor", "bos", "eos"})
             if (!kv.count(k)) {
-                err = dir + "/inkling2.txt: no " + k + " (tools/inkling2/pack_gguf.py writes it)";
+                err = dir + "/inkling2.txt: no " + k + " (tools/ik2/pack_gguf.py writes it)";
                 return false;
             }
         g.n_layer = (int) num("n_layer");
@@ -156,7 +156,7 @@ struct Pack {
             g.d_rel > 256 || g.conv != 4 || g.n_used < 1 || g.n_used > 16 || g.n_expert > 1024 || g.res_block < 1 ||
             g.n_swa < 1 || g.rel_extent < 1 || g.log_floor < 1 || g.situ_beta <= 0 ||
             (g.n_layer + g.res_block - 1) / g.res_block + 1 > 16) {
-            err = dir + "/inkling2.txt: a geometry maya-inkling2 does not run";
+            err = dir + "/inkling2.txt: a geometry maya-ik2 does not run";
             return false;
         }
         return true;
@@ -183,4 +183,4 @@ struct Pack {
     const uint8_t* data(const Tensor& x) const { return map[(size_t) x.file] + x.off; }
 };
 
-}  // namespace inkling2
+}  // namespace ik2hip

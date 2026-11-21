@@ -17,9 +17,9 @@ import re
 from pathlib import Path
 
 FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
-# ("ik2": Thinking Machines' Inkling-2-Small, one family with two engines - maya-ik2 (CUDA: unsloth's GGUFs in place,
-#  docs/INKLING2.md; no setup yet, its config is written by hand) and maya-inkling2 (AMD: a pack of unsloth's
-#  UD-Q2_K_XL, docs/INKLING2_AMD.md; maya.py's set_up_ik2))
+# ("ik2": Thinking Machines' Inkling-2-Small on its engine, maya-ik2 - on NVIDIA unsloth's GGUFs in place
+#  (docs/INKLING2.md; no setup yet, its config is written by hand), on AMD its HIP build (src/ik2/hip) on a pack of
+#  unsloth's UD-Q2_K_XL (docs/INKLING2_AMD.md; maya.py's set_up_ik2))
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
 MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
          "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash",   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
@@ -209,7 +209,7 @@ OTHERS = {("deepseek", "gguf-q8"): "UD-Q8_K_XL", ("deepseek", "gguf-q4"): "UD-Q4
           ("minimax", "exl3"): "EXL3 3.5 bpw", ("qwen", "q5_k_m"): "Q5_K_M",
           ("qwen", "ud-iq2_xs"): "unsloth UD-IQ2_XS",   # (the base model in unsloth's GGUF: maya.QWEN_UD)
           ("hy4", "q4_k_m"): "Q4_K_M",                  # (AngelSlim's Q4_K_M of Hy4-flash: maya.HY4)
-          # (unsloth's GGUFs of Inkling-2-Small: maya-ik2 reads Q4 / Q3 in place, maya-inkling2 a pack of Q2)
+          # (unsloth's GGUFs of Inkling-2-Small: maya-ik2 reads Q4 / Q3 in place on NVIDIA, a pack of Q2 on AMD)
           ("ik2", "ud-q4_k_xl"): "UD-Q4_K_XL", ("ik2", "ud-q3_k_xl"): "UD-Q3_K_XL", ("ik2", "ud-q2_k_xl"): "UD-Q2_K_XL"}
 # files of the base model rather than CYBER-FROST: the model's name on screen without "(CYBER-FROST)"
 SHOWN_KEY = {("qwen", "ud-iq2_xs"): "Qwen-3.8-Flash-Next"}
@@ -220,7 +220,7 @@ QWEN_UD_IDS = ("qwen-ud-iq2_xs", "qwen3.8-flash-next-ud-iq2_xs", "qwen3.8-ud-iq2
 # Hy4-flash: AngelSlim's Q4_K_M GGUF (two shards) - the setup ids it is asked for by (the first: the Models page's).
 # "hy4-flash" and "hy4" alone are the model: its files are then asked (Maya's quants and this one), or --hy4-quant
 HY4_IDS = ("hy4-flash-q4_k_m", "hy4-q4_k_m")
-# Inkling-2-Small on AMD (maya-inkling2): unsloth's UD-Q2_K_XL, its one set of files there - the setup ids it is asked
+# Inkling-2-Small on AMD (maya-ik2's HIP build): unsloth's UD-Q2_K_XL, its one set of files there - the setup ids it is asked
 # for by (the first: the Models page's); the model's own name and "inkling2" alone are the same files
 IK2_IDS = ("inkling-2-small-ud-q2_k_xl", "inkling2-ud-q2_k_xl", "ik2-ud-q2_k_xl", "inkling-2-small", "inkling2")
 # --mm3-quant also takes the tier as DeepSeek's --ds4-quant does (maya-xs), beside its first names (gguf-xs)
@@ -292,7 +292,7 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
 
 
 IK2_FAMILY_NAMES = ("ik2", "inkling2")
-IK2_EXES = ("maya-ik2", "maya-inkling2")
+IK2_EXES = ("maya-ik2", "maya-inkling2")   # (maya-inkling2: the AMD build's name before it was maya-ik2's)
 IK2_QUANT = re.compile(r"UD-(?:I?Q\d\w*)", re.I)   # (a quant's name in unsloth's file or folder names: UD-Q4_K_XL)
 
 
@@ -306,9 +306,9 @@ def family_of(cfg: dict) -> str:
     exe = Path(str(cfg.get("exe", ""))).name
     if inst.get("family") == "hy4" or exe.startswith("maya-hy4"):
         return "hy4"
-    # (Inkling-2-Small: both its engines - maya-ik2 on CUDA (a config by hand), maya-inkling2 on AMD (set_up_ik2), whose
-    #  --pack would otherwise read as DeepSeek's below; "inkling2" is that engine's family name in configs written
-    #  before the two were one family)
+    # (Inkling-2-Small: maya-ik2 on NVIDIA (a config by hand) and on AMD (set_up_ik2), whose --pack would otherwise
+    #  read as DeepSeek's below; "inkling2" and maya-inkling2 are the AMD build's family and program names in configs
+    #  written before it was maya-ik2's)
     if inst.get("family") in IK2_FAMILY_NAMES or exe.startswith(IK2_EXES):
         return "ik2"
     if inst.get("family") == "minimax" or exe.startswith("maya-mm3"):

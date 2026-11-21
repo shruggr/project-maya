@@ -1,19 +1,21 @@
-# Inkling 2 Small on AMD: `maya-inkling2`
+# Inkling 2 Small on AMD: `maya-ik2`'s AMD build
 
-The AMD (HIP) engine for Thinking Machines' Inkling 2 Small, beside `maya-ik2`, the CUDA engine of
-[INKLING2.md](INKLING2.md) (the model, the file format, the reference, the server side: read that first). It is
-built the way `maya-hy4` is (src/hy4, commit 93f0486): an engine directory of its own, `src/inkling2`, that compiles
-maya-ds4's ggml block-type kernels (`src/ds4/ds4_iq.cu`, `ds4_iq_cpu.cpp`, `ds4_gguf_cpu.cpp`, `MAYA_DS4_IQ_ONLY`),
-from a pack of unsloth's UD-Q2_K_XL, with the model's DSpark drafter ([INKLING2_DSPARK.md](INKLING2_DSPARK.md)).
-CMake builds it only with `STRATA_ENABLE_HIP`: it has never been built or run with CUDA.
+`maya-ik2`, the engine of [INKLING2.md](INKLING2.md) (the model, the file format, the reference, the server side: read
+that first), on AMD (HIP). Its CUDA build's kernels are NVIDIA's own (inline PTX: `mma.sync`, `wgmma`, `cp.async`;
+NVFP4), so on AMD the engine's model runs from `src/ik2/hip`, on maya-ds4's ggml block-type kernels
+(`src/ds4/ds4_iq.cu`, `ds4_iq_cpu.cpp`, `ds4_gguf_cpu.cpp`, `MAYA_DS4_IQ_ONLY`; built the way `maya-hy4` is), from a
+pack of unsloth's UD-Q2_K_XL, with the model's DSpark drafter ([INKLING2_DSPARK.md](INKLING2_DSPARK.md)). CMake
+builds `src/ik2/hip` as `maya-ik2` with `STRATA_ENABLE_HIP`; the CUDA build (`src/ik2/*.cu`) is unchanged.
 
-To the server both engines are one family, `ik2`: the chat template (thinkingmachines' own,
-`tools/ik2/chat_template.jinja`), the answer's parser (`InklingRewriter`) and the tokenizer are INKLING2.md's.
-"Serving" below has what is this engine's own: its run config, its command line and the line protocol.
+One engine to the server, the web app and the setup: family `ik2`, the chat template (thinkingmachines' own,
+`tools/ik2/chat_template.jinja`), the answer's parser (`InklingRewriter`) and the tokenizer of INKLING2.md, and the
+CUDA build's flags where both builds have the setting (`--model`, `--gpus N`, `--chunk`, `--max-context`; maya-ds4's
+names for the AMD build's other settings). Its INFO line says `engine=ik2 engine_kind=ik2-hip`. "Serving" below has
+what is the AMD build's own: its run config, its command line and the line protocol.
 
 ## Status (2026-11-20)
 
-On v1.1.70's tree (branch `inkling2-amd`: maya-ik2's PR with this engine beside it), measured again: parity OK x4,
+On v1.1.70's tree (maya-ik2's PR with this build as `maya-inkling2`, an engine of its own then), measured again: parity OK x4,
 the rewind test's five cases OK, short decode through `--serve` 37.3 tok/s without drafts and 59.1 with them (256
 tokens), `--ab` prose 33.8 -> 62.1, code 36.1 -> 59.2, thinking 37.0 -> 39.3 tok/s; through serve/server.py with the
 official chat template, my_e2e's three turns 42.1 / 38.9 / 50.7 tok/s. The table below is the run before the merge
@@ -55,7 +57,7 @@ Done:
 - The CPU lane over a window (`cpu_experts_rows`): a RAM expert several rows picked is read once for them.
 - The drafter's taps: every row of every step and of every prompt chunk, F32 [rows][8][4608] on the last GPU, fed to
   `Dspark::feed_dev` once the rows are kept.
-- Drafting in the decode loop and in `--serve` (`draft_round` in inkling2_main.cpp): draft -> window -> keep -> feed;
+- Drafting in the decode loop and in `--serve` (`draft_round` in ik2_hip_main.cpp): draft -> window -> keep -> feed;
   the window by expected tokens a millisecond; greedy and sampled acceptance; `--dspark on|off|none` (maya-ds4's; `idle`, tests only),
   `--dspark-index`, `--dspark-cum`; INFO `dspark=1`, DONE `drafts_acc` / `drafts_off`. docs/INKLING2_DSPARK.md
   ("In the engine") has the numbers.
@@ -68,7 +70,7 @@ t(T) at 2.7k context, ms a pass of T rows (`--window-test`, the drafter's taps o
 | now | 29.9 | 38.9 | 45.5 | 51.3 | 59.2 | 65.5 | 71.2 | 77.4 | 83.7 |
 | now, `--dspark none` (no taps) | 29.1 | 38.8 | 45.5 | 50.8 | 59.1 | 65.9 | 71.6 | 77.5 | 83.0 |
 
-A row more costs 6.7 ms (8.7 before). What is left of it (`INKLING2_PHASES=1`, a line a window size): the routed
+A row more costs 6.7 ms (8.7 before). What is left of it (`IK2_HIP_PHASES=1`, a line a window size): the routed
 experts 4.7 ms (4.3 more unique experts a layer, at the cards' memory bandwidth: the floor), the input projections'
 extra columns 0.5, the router / publish / grouping 0.45, the attention 0.33 (2.2 before), the output projection 0.23,
 the lane 0.2.
@@ -80,7 +82,7 @@ than an undrafted one (a poll a pass, not a token), so:
   256 tokens each);
 - with the cache on, the two part where the row's two best logits are close: prose at token 21 (gap 0.057), code at
   98 (0.059) or 111 (0.13), thinking at 7 (0.027) or 112 (0.99) - two drafted loads each, the gaps from the undrafted
-  run (`INKLING2_MARGIN_LOG=1`; the median gap is 3.4 / 4.8 / 1.7, and an expert on the other side moves a logit by
+  run (`IK2_HIP_MARGIN_LOG=1`; the median gap is 3.4 / 4.8 / 1.7, and an expert on the other side moves a logit by
   up to 1.4);
 - two undrafted loads part the same way once the cache's moves fall differently: the prose prompt (the first after
   the load) gave the same 256 tokens in four loads, the code prompt after it the same 165, the thinking prompt 7.
@@ -107,16 +109,16 @@ physical core; N: at most N), `--expert-profile` (`<pack>/expert-profile.bin`, r
 --cpu-threads --log-floor --prefill-chunk --try-chunks --repeat --rewind --short-prompt --no-expert-cache --mmap-experts --eos --serve --tokens
 --tokens-file --n-predict --layers --dspark --dspark-index --dspark-cum --verbose`; tests `--parity [--parity-force-picks
 --parity-force-only --parity-decode --parity-detail --parity-max] --rewind-test --short-bench --window-test
-[--window-bits] --prompts --ab --temperature --seed --dspark-rest0`. Environment: `INKLING2_PHASES` (device phase
-table, a line a window size), `INKLING2_ROUND_LOG` (a line a drafting round), `INKLING2_TIMELINE`, `INKLING2_PROF`,
-`INKLING2_OLD_STEP`, `INKLING2_SWAP_BATCH`, `INKLING2_SWAP_BURST_MS`, `INKLING2_VERIFY_LOAD`, `INKLING2_EXPERT_CHECK`,
-`INKLING2_NO_WARMUP`, `INKLING2_VRAM_LOG` (a line a GPU at each stage of the load and after each prompt, decode and
+[--window-bits] --prompts --ab --temperature --seed --dspark-rest0`. Environment: `IK2_HIP_PHASES` (device phase
+table, a line a window size), `IK2_HIP_ROUND_LOG` (a line a drafting round), `IK2_HIP_TIMELINE`, `IK2_HIP_PROF`,
+`IK2_HIP_OLD_STEP`, `IK2_HIP_SWAP_BATCH`, `IK2_HIP_SWAP_BURST_MS`, `IK2_HIP_VERIFY_LOAD`, `IK2_HIP_EXPERT_CHECK`,
+`IK2_HIP_NO_WARMUP`, `IK2_HIP_VRAM_LOG` (a line a GPU at each stage of the load and after each prompt, decode and
 request: free VRAM, the engine's own, the rest); the measured values' overrides ("The measured values"):
-`INKLING2_CACHE_DECAY` / `_MARGIN` / `_BONUS` / `_PROMPT_ROWS`, `INKLING2_SWAP_WIN_ROWS`, `INKLING2_LANE_SPIN_US`,
-`INKLING2_SNAP_EVERY`, `INKLING2_BURST_ROUNDS` / `_MOVES` / `_MIN`, `INKLING2_DRAFT_T0` / `_A0` / `_B0` / `_REST` /
-`_REST_MAX` / `_WARM` / `_REST_GAIN` / `_RESET_GAIN` / `_EMA` / `_B_MIN`, and at the load `INKLING2_STAGE`,
-`INKLING2_TS_MAX`, `INKLING2_S_FLOOR_MI`, `INKLING2_WARM_TOKENS` (tests: `INKLING2_STAGE_USE`, `INKLING2_TS_USE`,
-`INKLING2_S_USE_MI`, `INKLING2_TAP_EVENT`; `--sweep VAR=a,b,..`, `--sweep-rounds N`); `INKLING2_ATTN_OLD` / `INKLING2_ATTN_TK` now reach only the step with a tap or a pick hook.
+`IK2_HIP_CACHE_DECAY` / `_MARGIN` / `_BONUS` / `_PROMPT_ROWS`, `IK2_HIP_SWAP_WIN_ROWS`, `IK2_HIP_LANE_SPIN_US`,
+`IK2_HIP_SNAP_EVERY`, `IK2_HIP_BURST_ROUNDS` / `_MOVES` / `_MIN`, `IK2_HIP_DRAFT_T0` / `_A0` / `_B0` / `_REST` /
+`_REST_MAX` / `_WARM` / `_REST_GAIN` / `_RESET_GAIN` / `_EMA` / `_B_MIN`, and at the load `IK2_HIP_STAGE`,
+`IK2_HIP_TS_MAX`, `IK2_HIP_S_FLOOR_MI`, `IK2_HIP_WARM_TOKENS` (tests: `IK2_HIP_STAGE_USE`, `IK2_HIP_TS_USE`,
+`IK2_HIP_S_USE_MI`, `IK2_HIP_TAP_EVENT`; `--sweep VAR=a,b,..`, `--sweep-rounds N`); `IK2_HIP_ATTN_OLD` / `IK2_HIP_ATTN_TK` now reach only the step with a tap or a pick hook.
 
 ## Goal and targets
 
@@ -238,10 +240,10 @@ Reference checkout: `<llama.cpp>` (master b94959a64, Inkling 2 = PR #32217 + #32
 
 ## The engine (design)
 
-- `src/inkling2/`, modeled on src/hy4: `inkling2_main.cpp` (args, `--serve` protocol from hy4_main.cpp),
-  `inkling2_model.cu/.hpp` (load, place, forward), `inkling2_kernels.cu/.cuh` (Inkling-only kernels: mix, convs,
-  clip/norm, rel-bias attention with sinks, router), `inkling2_lane.cpp` (CPU experts), a pack reader.
-- Weights from the GGUF in place through a pack index (tools/inkling2/pack_gguf.py, Hy4-style: GGUF names, stacked
+- `src/ik2/hip/`, modeled on src/hy4: `ik2_hip_main.cpp` (args, `--serve` protocol from hy4_main.cpp),
+  `ik2_hip_model.cu/.hpp` (load, place, forward), `ik2_hip_kernels.cu/.cuh` (Inkling-only kernels: mix, convs,
+  clip/norm, rel-bias attention with sinks, router), `ik2_hip_lane.cpp` (CPU experts), a pack reader.
+- Weights from the GGUF in place through a pack index (tools/ik2/pack_gguf.py, Hy4-style: GGUF names, stacked
   experts).
 - **Layer split** over the GPUs (hidden-state hand-off between cards). Tensor parallel is out: the experts' 256-value
   blocks cannot split n_ff 2304 (maya-ds4 falls back the same way on this PC).
@@ -264,8 +266,8 @@ epilogue / `native_gu_rows_split`) take it. Existing activations: bit-for-bit un
 
 ## The reference (llama.cpp tensor dumps)
 
-Tool: `tools/inkling2/ref/inkling-dump.cpp` (built as `llama-inkling-dump` in the reference checkout,
-`examples/inkling-dump`), run in the ROCm container (`tools/inkling2/ref/run_dump.sh`). It evaluates the prompt as
+Tool: `tools/ik2/ref/inkling-dump.cpp` (built as `llama-inkling-dump` in the reference checkout,
+`examples/inkling-dump`), run in the ROCm container (`tools/ik2/ref/run_dump.sh`). It evaluates the prompt as
 one batch (step 0), then 3-4 greedy single-token decodes (steps 1..N), and saves every graph tensor whose name
 matches a regex.
 
@@ -274,20 +276,20 @@ matches a regex.
   `154328 13 149917 151451` (" Berlin. The capital"). Tensors: `l_out-L`, `ffn_inp-L`, `ffn_out-L`, `attn_out-L`
   (SWA layers), `ffn_moe_topk-L` (i32 picks), `ffn_moe_probs-L`, `ffn_moe_weights*-L`, `result_norm`,
   `result_output` (last row only), and layers 0 and 5: `Qcur`, `Kcur`, `Vcur`, `Rcur`, `kq_b`, `kqv_out`.
-- `<ref>/long`: 2698-token prompt (`tools/inkling2/ref/prompt-long.txt`), 3 steps: `l_out-L`,
+- `<ref>/long`: 2698-token prompt (`tools/ik2/ref/prompt-long.txt`), 3 steps: `l_out-L`,
   `ffn_moe_topk-L`, `attn_out-{0,5,47}`, `result_norm`, `result_output` - exercises the SWA ring and the distance cut.
 - Format: `index.jsonl` (one line a tensor: step, name, file, type f32/i32, op, ne[4]); `s<step>/<name>.bin`
   contiguous, ne0 fastest; `tokens.txt` (prompt ids, then the greedy ids). Rows are tokens (ne1).
 - `<ref>/long-f32`: the same prompt with `-fa off -ctk f32 -ctv f32` (the reference's own noise
   floor), `attn_out-L`, `ffn_inp-L`, `ffn_out-L`, `l_out-L`, `ffn_moe_topk-L` for every layer.
 - **Parity, as measured.** The model is sensitive at a few positions: llama.cpp against itself (`long` vs `long-f32`,
-  `tools/inkling2/ref/compare_dumps.py`) drops to a worst `l_out` cosine of 0.23 (layer 35) with 89-95% of picks the
+  `tools/ik2/ref/compare_dumps.py`) drops to a worst `l_out` cosine of 0.23 (layer 35) with 89-95% of picks the
   same in the deep layers. The jumps come at the global layers (11, 17, 29, 35, 41), while the mean stays >= 0.97.
   So a per-row minimum of 0.999 cannot be met by any implementation on long prompts. The test is instead:
   - On the short reference with the reference's picks forced (`--parity-force-picks`): every row >= 0.999.
   - On the long reference: the same greedy tokens, a per-layer **mean** cosine >= 0.999 with picks forced, and a
     natural-pass worst cosine and pick agreement no worse than `long` vs `long-f32`.
-  - maya-inkling2 M1 met all of these. Short, forced: worst 0.99967. Long: natural worst 0.245 with 93.8% of picks
+  - maya-ik2 M1 met all of these. Short, forced: worst 0.99967. Long: natural worst 0.245 with 93.8% of picks
     the same; forced worst 0.70 with the mean >= 0.9993.
 
 ## Serving
@@ -298,27 +300,27 @@ model list; the Models page lists it under the other quants on an AMD install): 
 model, ~202 GB, `IK2_MEMORY_GB`; below that the experts RAM does not hold are read in place from the model's files,
 slower - the setup warns and goes on, as DeepSeek's does; `--mmap-experts` given to the setup is written and kept), the context (DeepSeek's: offered from 32K up to the
 model's 1M, recommended from 64K up to 256K by what VRAM + RAM hold beyond the model), the engine
-(`build-hip/maya-inkling2`), unsloth's UD-Q2_K_XL set (`tools/inkling2/download.json`, in
+(`build-hip/maya-ik2`), unsloth's UD-Q2_K_XL set (`tools/ik2/download.json`, in
 `<models>/Inkling-2-Small-GGUF/UD-Q2_K_XL`), Thinking Machines' `mtp.safetensors` and `config.json` in
-`<models>/Inkling-2-Small-MTP` converted by `tools/inkling2/convert_dspark.py --type q8_0`, the pack, its expert
-profile (`expert-profile.bin`, copied from `data/expert-profile-inkling2.bin` where the pack has none) and
-`maya-inkling2-hip.json` with `--dspark-index` and `--dspark none` until the speed calibration (DeepSeek's,
+`<models>/Inkling-2-Small-MTP` converted by `tools/ik2/convert_dspark.py --type q8_0`, the pack, its expert
+profile (`expert-profile.bin`, copied from `data/expert-profile-ik2.bin` where the pack has none) and
+`maya-ik2-hip.json` with `--dspark-index` and `--dspark none` until the speed calibration (DeepSeek's,
 `tools/calibrate_ds4.py`: the config started without the drafter and with it, chat, code and tool calls) finds that
 drafting pays on this PC (`--drafting measure|on|off`, `--speed-calibration`). Files already there are used as they are (a pack made by hand
 included: `--repack` builds it again). `maya_quants.py`'s ids: `inkling-2-small`, `inkling-2-small-ud-q2_k_xl`. On
-NVIDIA the model's engine is `maya-ik2`, which has no setup: the setup says so and stops.
+NVIDIA `maya-ik2` has no setup yet: the setup says so and stops.
 
 By hand, the same steps:
 
-    python tools/inkling2/pack_gguf.py --model <the GGUF set's folder>   # <model>/maya-inkling2: the pack, its tokenizer/
+    python tools/ik2/pack_gguf.py --model <the GGUF set's folder>   # <model>/maya-ik2: the pack, its tokenizer/
 
 ```json
 {
- "exe": "<maya>/build-hip/maya-inkling2",
- "args": ["--pack", "<models>/Inkling-2-Small-GGUF/UD-Q2_K_XL/maya-inkling2", "--max-context", "32768",
-          "--dspark-index", "<models>/Inkling-2-Small-MTP/maya-inkling2-dspark-q8_0"],
+ "exe": "<maya>/build-hip/maya-ik2",
+ "args": ["--pack", "<models>/Inkling-2-Small-GGUF/UD-Q2_K_XL/maya-ik2", "--max-context", "32768",
+          "--dspark-index", "<models>/Inkling-2-Small-MTP/maya-ik2-dspark-q8_0"],
  "cwd": "<maya>",
- "tokenizer": "<models>/Inkling-2-Small-GGUF/UD-Q2_K_XL/maya-inkling2/tokenizer",
+ "tokenizer": "<models>/Inkling-2-Small-GGUF/UD-Q2_K_XL/maya-ik2/tokenizer",
  "model_name": "inkling-2-small",
  "gpu": [0, 1, 2, 3],
  "backend": "hip",
@@ -327,18 +329,19 @@ By hand, the same steps:
 }
 ```
 
-- **Family.** `tools/maya_quants.py`'s `family_of` gives `ik2` by the engine's name (`maya-inkling2*`, before the
-  `--pack` check that would call it DeepSeek) or by `"installer": {"family": "ik2"}`; `"inkling2"`, the family's name
-  in configs written before the two engines were one family, is still read. Sampling and the thinking level are the
+- **Family.** `tools/maya_quants.py`'s `family_of` gives `ik2` by the engine's name (`maya-ik2*`, before the
+  `--pack` check that would call it DeepSeek) or by `"installer": {"family": "ik2"}`; `"inkling2"` and
+  `maya-inkling2`, this build's family and program names when it was an engine of its own, are still read. A config
+  is the AMD build's (`serve/models.py`'s `ik2_amd`) by its `"backend": "hip"` or its `--pack`. Sampling and the thinking level are the
   family's defaults (temperature 1.0, top_p 1.0, `auto`: the template's own effort, 0.9).
 - **The template.** A pack made before `pack_gguf.py` wrote the official template holds the GGUF's (the llama.cpp
   conversion's) in `tokenizer/chat_template.jinja`; the server then renders with `tools/ik2/chat_template.jinja`
   and says so at its start (`chat_template_path`; `MAYA_PACK_TEMPLATE=1` keeps the pack's).
 - **The command.** `Popen([exe, "--serve", *args])` with the config's args, plus `--layer-split auto` when `gpu`
-  lists more than one GPU (`engine_args`; not for `maya-ik2`, which stops at that flag), in `cwd`, with
+  lists more than one GPU (`engine_args`; not on NVIDIA, where maya-ik2 stops at that flag), in `cwd`, with
   `HIP_VISIBLE_DEVICES` = the config's GPUs and `lib_dirs` first on the library path. The Models page changes
   `--max-context`, the GPUs and Drafting (`--dspark on|none` with `--dspark-index`, offered where the drafter's index is
-  on this PC; maya-ik2 has no drafter), and for maya-inkling2 DeepSeek's rows for the settings both engines have:
+  on this PC; the CUDA build drafts in its CLI only), and DeepSeek's rows for the settings the AMD build shares with maya-ds4:
   `--reserve-mib`, `--mmap-experts` (Experts VRAM does not hold), `--prefill-chunk`, `--cpu-threads` and `--dspark-cum` (as DeepSeek's Draft confidence,
   `--dspark-conf`); every other flag stays as the config has it.
 - **The drafter's index.** The engine drafts only with the index `--dspark-index` names (the setup writes it); without
@@ -371,12 +374,12 @@ R=<rocm-sdk>
 cmake -S . -B build-hip -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
   -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PREFILL_MMQ=ON -DSTRATA_BUILD_TESTS=ON -DCMAKE_HIP_ARCHITECTURES=gfx1201 \
   -DCMAKE_HIP_COMPILER=$R/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=$R -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
-cmake --build build-hip --target maya-inkling2 -j
-LD_LIBRARY_PATH=$R/lib build-hip/maya-inkling2 --pack <pack> ...
+cmake --build build-hip --target maya-ik2 -j
+LD_LIBRARY_PATH=$R/lib build-hip/maya-ik2 --pack <pack> ...
 ```
 
-`./maya.sh --setup` builds it as it builds the other engines. CMake hooks: `cmake/inkling2_engine.cmake`, `cmake/inkling2_kernels.cmake` and
-`cmake/inkling2_dspark.cmake`, included from CMakeLists.txt after Hy4's block inside `if(STRATA_ENABLE_HIP)`
+`./maya.sh --setup` builds it as it builds the other engines. CMake hooks: `cmake/ik2_hip_engine.cmake`, `cmake/ik2_hip_kernels.cmake` and
+`cmake/ik2_hip_dspark.cmake`, included from CMakeLists.txt after Hy4's block inside `if(STRATA_ENABLE_HIP)`
 (`_strata_gpu_*` variables in scope; tests inside `if(STRATA_BUILD_TESTS)`).
 
 ## Open questions
@@ -384,7 +387,7 @@ LD_LIBRARY_PATH=$R/lib build-hip/maya-inkling2 --pack <pack> ...
 - `log_scaling_n_floor` (settled: **8192**). The GGUF was converted from the first config.json, which said 128000.
   Thinking Machines' 2026-11-17 commit 1df2d97d45 changed only that value, to 8192, which is also NeMo AutoModel's
   inkling2 default. pack_gguf.py reads the stale 128000 as 8192 (`STALE_FLOOR`); `--log-floor` overrides it.
-  llama.cpp with this GGUF still uses 128000, so past position 8192 maya-inkling2 differs from it on purpose.
+  llama.cpp with this GGUF still uses 128000, so past position 8192 maya-ik2 differs from it on purpose.
 - The drafter (done: [INKLING2_DSPARK.md](INKLING2_DSPARK.md)). It is not in the GGUF set; Thinking Machines ships it
   as `mtp.safetensors` (3.4 GB, BF16) with its config.json, and the setup downloads it beside the model.
   - Shape (`mtp_config`): 5 dense layers (hidden 4608, 48/8 heads, head_dim 128, FFN 18432), layers 0/1/3/4 SWA 1024,
@@ -413,7 +416,7 @@ warm-up with the experts in place - a chunk and a quarter of tokens spread over 
 to swap (zram here) the host memory the first warm-up touched, and the first prompt then paged it back in - one of a
 GPU's layers stalled 5.6 - 5.8 s, a 2.7k-token prompt took 7.4 - 8.9 s instead of 2.8, in 11 of 16 loads. Now the
 load pays it (the second warm-up 1 - 7 s) and the first prompt reads as its repeat does. There is no estimate left in the plan: the guessed slacks (+256 B a tensor, +4096 B a layer, +32 MiB prompt
-path, +64 MiB decode scratch) and the drafter's 3.09 GB figure are gone. `INKLING2_VRAM_LOG=1` prints a line a GPU at
+path, +64 MiB decode scratch) and the drafter's 3.09 GB figure are gone. `IK2_HIP_VRAM_LOG=1` prints a line a GPU at
 each stage of the load and after each prompt, decode and served request: its free VRAM, the engine's own allocations
 and the rest.
 
@@ -463,7 +466,7 @@ KB of VRAM a context: the K / V rows, the attention scratch, the drafter's rows 
 experts); the setup recommends up to 256K (S16).
 
 **512K end to end** (`--max-context 524288`, the drafter on, the engine's defaults - the run named
-`--prefill-chunk 512`, `INKLING2_STAGE=24` and `INKLING2_S_FLOOR_MI=44`, which the defaults now are; with the larger
+`--prefill-chunk 512`, `IK2_HIP_STAGE=24` and `IK2_HIP_S_FLOOR_MI=44`, which the defaults now are; with the larger
 2048 / 64 / 176 Mi of E9's measurement it did not load: the RAM experts 114 GB and the 8 GiB margin against 121 GB). 8,602 experts in VRAM, 99.8 GiB in RAM;
 loaded in 396 s. The 2.7k-token prompt: 796 tok/s, 200 drafted tokens at 61.3 tok/s. Then a 307,710-token prompt -
 the guide repeated 19 times with two maintainer's notes between the copies (OSPREY-4, port 51877; "Silver Lynx"), a
@@ -506,7 +509,7 @@ are let go of (`MADV_DONTNEED`), the in-place ones' kept. The Models page's "Exp
 From the files / In RAM) and the setup's `--mmap-experts` are DeepSeek's (W3, S31); below the model's memory the setup
 now says the experts RAM does not hold are read from the SSD (S23).
 
-Measured (the drafter on, the shipped profile read-only, `INKLING2_VRAM_LOG=1`):
+Measured (the drafter on, the shipped profile read-only, `IK2_HIP_VRAM_LOG=1`):
 
 | Run | Experts in VRAM / RAM / files | Load | 2.7k-token prompt | Its 200 tokens, drafted | CPU lane |
 |---|---|---|---|---|---|
@@ -526,7 +529,7 @@ of them copied and registered. That is what remains: long prompts at 1M are slow
 ## The measured values (2026-11-21)
 
 The measurement phase's list ("Values and their sources", the rows that were MEASURE), measured on this PC. Each value
-has an `INKLING2_<NAME>` override (maya-ds4's `DS4_CACHE_*` way: read at the load); `--sweep VAR=a,b,..`
+has an `IK2_HIP_<NAME>` override (maya-ds4's `DS4_CACHE_*` way: read at the load); `--sweep VAR=a,b,..`
 The checks against the baseline (the default, all copied at these contexts, so the old path): PARITY OK x4, the rewind
 test's five cases OK, `--ab` prose 33.9 -> 59.7, code 37.1 -> 58.1, thinking 37.4 -> 38.4 tok/s, `--serve` 37.7 tok/s
 without drafts and 59.3 with them (the 2.7k prompt continued: 65.3) - the baseline's 33.9 / 59.5, 37.1 / 58.3, 37.3 /
@@ -620,14 +623,14 @@ with where it comes from (2026-11-20). Sources:
 | E24 | `INFO ... model=Inkling-2-Small engine=inkling2 mtp=0` | Model name and protocol keys at start | MODEL | GGUF `general.name Inkling-2-Small`. The protocol is maya-hy4's (INKLING2_AMD.md). |
 | E25 | `a` = 30 ms at start | Starting estimate of a one-row pass | MEASURED | INKLING2_AMD.md (t(1) = 29.9 ms at 2.7k context) |
 | E26 | `b` = 7 ms at start | Starting estimate of one more window row | MEASURED | INKLING2_AMD.md (6.7 ms a row); DSPARK.md (7 - 8 fitted) |
-| E27 | `t_draft` = 10 ms at start (INKLING2_DRAFT_T0) | Starting estimate of a draft's time | MEASURED (insensitive) | `--sweep` ("The measured values" below): 5 / 10 / 20 ms decode alike within noise |
-| E28 | `rest_len` 8 (INKLING2_DRAFT_REST) | Rounds without drafts after a round that did not pay | MEASURED (insensitive) | 4 / 8 / 16 alike within noise (below) |
-| E29 | Rest cap 32, doubling (INKLING2_DRAFT_REST_MAX) | Longest rest | MEASURED (insensitive) | 16 / 32 / 64 alike within noise (below) |
-| E30 | 8 drafted rounds before judging (INKLING2_DRAFT_WARM) | Warm-up of the gain average | MEASURED (insensitive) | 4 / 8 / 16 alike within noise (below) |
-| E31 | Rest when `gain < 0.1·a` (INKLING2_DRAFT_REST_GAIN) | When drafting rests | MEASURED (insensitive) | 0.05 / 0.1 / 0.2 alike within noise (below) |
-| E32 | `gain > 0.3·a` resets the rest length (INKLING2_DRAFT_RESET_GAIN) | Hysteresis | MEASURED (insensitive) | 0.2 / 0.3 / 0.5 alike within noise (below) |
-| E33 | EMA 0.9 / 0.1 (INKLING2_DRAFT_EMA) | Smoothing of a, b, gain and t_draft | MEASURED (insensitive) | 0.8 / 0.9 / 0.95 alike within noise (below) |
-| E34 | `b` floor 0.5 ms (INKLING2_DRAFT_B_MIN) | Lower bound on the fitted row cost | MEASURED (insensitive) | 0.25 / 0.5 / 1 alike within noise (below) |
+| E27 | `t_draft` = 10 ms at start (IK2_HIP_DRAFT_T0) | Starting estimate of a draft's time | MEASURED (insensitive) | `--sweep` ("The measured values" below): 5 / 10 / 20 ms decode alike within noise |
+| E28 | `rest_len` 8 (IK2_HIP_DRAFT_REST) | Rounds without drafts after a round that did not pay | MEASURED (insensitive) | 4 / 8 / 16 alike within noise (below) |
+| E29 | Rest cap 32, doubling (IK2_HIP_DRAFT_REST_MAX) | Longest rest | MEASURED (insensitive) | 16 / 32 / 64 alike within noise (below) |
+| E30 | 8 drafted rounds before judging (IK2_HIP_DRAFT_WARM) | Warm-up of the gain average | MEASURED (insensitive) | 4 / 8 / 16 alike within noise (below) |
+| E31 | Rest when `gain < 0.1·a` (IK2_HIP_DRAFT_REST_GAIN) | When drafting rests | MEASURED (insensitive) | 0.05 / 0.1 / 0.2 alike within noise (below) |
+| E32 | `gain > 0.3·a` resets the rest length (IK2_HIP_DRAFT_RESET_GAIN) | Hysteresis | MEASURED (insensitive) | 0.2 / 0.3 / 0.5 alike within noise (below) |
+| E33 | EMA 0.9 / 0.1 (IK2_HIP_DRAFT_EMA) | Smoothing of a, b, gain and t_draft | MEASURED (insensitive) | 0.8 / 0.9 / 0.95 alike within noise (below) |
+| E34 | `b` floor 0.5 ms (IK2_HIP_DRAFT_B_MIN) | Lower bound on the fitted row cost | MEASURED (insensitive) | 0.25 / 0.5 / 1 alike within noise (below) |
 | E35 | `rest0` 0 | Rounds without a draft after k = 0 | MEASURED | main.cpp: "1 costs prose a sixth of its drafted rounds and gains thinking text nothing" |
 | E36 | At most 7 drafts | Drafts per round | MODEL | config `mtp_config.block_size 8`: the anchor plus 7 drafts |
 | E37 | Window sized by expected tokens per ms, on by default | How many drafts to verify | MEASURED | The rule's gain is in DSPARK.md. **Differs**: ds4's cost-aware window is off by default "until measured on GPUs" (ds4_main.cpp); ds4 uses only the fixed cum cut. |
@@ -635,34 +638,34 @@ with where it comes from (2026-11-20). Sources:
 | E39 | Removed (+256 B per tensor) | - | MEASURED | The plan no longer estimates: it reads the free VRAM after the other allocations and the runtime's warm-up ("VRAM" above: each allocation's real size, 64 KiB at least and whole 2 MiB pages above 1 MiB, is in what it reads) |
 | E40 | SWA ring = `n_swa + rewind + Tc` = 1024 + 4096 + 512 = 5632 rows | Rows of each sliding-window layer's cache | DERIVED | n_swa 1024 (GGUF `attention.sliding_window`) + E8 + E9 |
 | E41 | Removed (+32 MiB) | - | MEASURED | The plan no longer estimates: it reads the free VRAM after the other allocations and the runtime's warm-up ("VRAM" above: each allocation's real size, 64 KiB at least and whole 2 MiB pages above 1 MiB, is in what it reads) |
-| E42 | `S_n()` = max(44 Mi, n_head x max_keys) floats (INKLING2_S_FLOOR_MI) | Prompt-path attention score scratch | MEASURED (the floor); DERIVED (n_head x max_keys) | A pass of ts tokens over nk keys takes n_head x ts x nk scores and attention_rows halves ts until it fits: one token over every key must fit (44 Mi alone stops a prompt at about 961K keys). The floor sets how many tokens a long prompt's passes take: an 80K-token prompt, 2048-token chunks, tok/s at 11 / 22 / 44 / 88 / 176 / 352 Mi: 853 / 1082 / 1247 / 1354 / 1409 / 1400 (two runs each, within 0.2%); a 20K prompt within 1% at all of them. 176 Mi's 0.8 GiB a GPU more cost what E9 says, so 44 |
-| E43 | `kTsMax` **128** (INKLING2_TS_MAX) | Tokens per pass of the prompt attention | MEASURED | 2048-token chunks, tok/s at 32 / 64 / 128 / 256 / 512 tokens a pass: a 20K prompt 1806 / 1861 / **1875** / 1844 / 1841, 80K 1483 / 1524 / 1532 / 1513 / 1511 ("The measured values" below); its rel-bias table kTsMax x 48 x 1024 floats, 25 MB. Was 512 (CHOSEN) |
-| E44 | `kStage` 24 (INKLING2_STAGE) | Experts streamed per staging pass (two buffers) | MEASURED | 2048-token chunks, tok/s at 24 / 48 / 64 / 96: a 20K prompt 1579 / 1713 / 1812 / 1831, 80K 1358 / 1436 / 1499 / 1509 ("The measured values" above); 64's 0.8 GiB a GPU more cost what E9 says, so 24 |
+| E42 | `S_n()` = max(44 Mi, n_head x max_keys) floats (IK2_HIP_S_FLOOR_MI) | Prompt-path attention score scratch | MEASURED (the floor); DERIVED (n_head x max_keys) | A pass of ts tokens over nk keys takes n_head x ts x nk scores and attention_rows halves ts until it fits: one token over every key must fit (44 Mi alone stops a prompt at about 961K keys). The floor sets how many tokens a long prompt's passes take: an 80K-token prompt, 2048-token chunks, tok/s at 11 / 22 / 44 / 88 / 176 / 352 Mi: 853 / 1082 / 1247 / 1354 / 1409 / 1400 (two runs each, within 0.2%); a 20K prompt within 1% at all of them. 176 Mi's 0.8 GiB a GPU more cost what E9 says, so 44 |
+| E43 | `kTsMax` **128** (IK2_HIP_TS_MAX) | Tokens per pass of the prompt attention | MEASURED | 2048-token chunks, tok/s at 32 / 64 / 128 / 256 / 512 tokens a pass: a 20K prompt 1806 / 1861 / **1875** / 1844 / 1841, 80K 1483 / 1524 / 1532 / 1513 / 1511 ("The measured values" below); its rel-bias table kTsMax x 48 x 1024 floats, 25 MB. Was 512 (CHOSEN) |
+| E44 | `kStage` 24 (IK2_HIP_STAGE) | Experts streamed per staging pass (two buffers) | MEASURED | 2048-token chunks, tok/s at 24 / 48 / 64 / 96: a 20K prompt 1579 / 1713 / 1812 / 1831, 80K 1358 / 1436 / 1499 / 1509 ("The measured values" above); 64's 0.8 GiB a GPU more cost what E9 says, so 24 |
 | E45 | Removed (+4096 B per layer) | - | MEASURED | The plan no longer estimates: it reads the free VRAM after the other allocations and the runtime's warm-up ("VRAM" above: each allocation's real size, 64 KiB at least and whole 2 MiB pages above 1 MiB, is in what it reads) |
 | E46 | Window scratch: 9 rows over up to 4096 keys | Attention scratch size for a window | CHOSEN (trade) | 9 = kWin rows; 4096 keys holds every SWA window (1024) and a global layer's first 4096 positions in one launch pair (58 MB a GPU); past it a window's rows run one at a time |
 | E47 | Removed (+64 MiB) | - | MEASURED | The plan no longer estimates: it reads the free VRAM after the other allocations and the runtime's warm-up ("VRAM" above: each allocation's real size, 64 KiB at least and whole 2 MiB pages above 1 MiB, is in what it reads) |
 | E48 | Removed from the engine; the setup's per-position cost `ctx_bytes` (D10) | Drafter VRAM at other contexts | MEASURED | 3314 MiB at 32K and 4794 at 256K: 1400 MiB for 229,376 positions, 6400 bytes each, D10 exactly |
 | E49 | head + `8·n_embd` B | VRAM of output_norm + output_res_query (2 F32 vectors) | DERIVED | 2 x 4608 x 4 B |
 | E50 | One spare expert slot per layer | Room for the cache's moves | CHOSEN (bound) | One move at a time a layer: the hot expert lands in the spare slot, the cold one's slot is the next spare |
-| E51 | The RAM experts' copies leave `ram_margin()` 8 GiB (INKLING2_RAM_MARGIN_GB) of the RAM to be had | The copies that fit; the others read in place (E95) | MAYA | ds4_model.cu's ram_margin (8 GiB, DS4_RAM_MARGIN_GB); the setup's IK2_MEMORY_GB counts the same 8 GiB (IK2_RAM_MARGIN_GIB). Before --mmap-experts the load stopped when they did not all fit |
+| E51 | The RAM experts' copies leave `ram_margin()` 8 GiB (IK2_HIP_RAM_MARGIN_GB) of the RAM to be had | The copies that fit; the others read in place (E95) | MAYA | ds4_model.cu's ram_margin (8 GiB, DS4_RAM_MARGIN_GB); the setup's IK2_MEMORY_GB counts the same 8 GiB (IK2_RAM_MARGIN_GIB). Before --mmap-experts the load stopped when they did not all fit |
 | E52 | Staging pinned buffer of at least 256 MiB | Load-time copy buffer (host memory, not VRAM) | MEASURED (insensitive) | Pinned copies to an R9700: 64 MiB pieces 56.3 GB/s, 256 MiB 56.7, 1 GiB 56.9; the load reads the files at about 1 GB/s, so the piece's size is under 1% of it |
 | E53 | 16 blobs: the movers' bounce buffer, and the most moves per poll | Expert-cache copy buffer | CHOSEN (bound) | swap_poll's most moves a round (16): the movers' bounce holds that many blobs |
-| E54 | Warm-up chunk min(Tc, 256) tokens (INKLING2_WARM_TOKENS) | The runtime's share taken before the experts are placed; the first run's seconds | MEASURED | 16, 64 and 256 tokens all take the runtime's whole share (the free VRAM never moved after the load, prompts up to 80K); with 16 the first 5K prompt read 7% slower than its repeat (946 / 1020 tok/s), with 256 2% (996 / 1013). The 256 tokens cost 0.2 s of the load |
+| E54 | Warm-up chunk min(Tc, 256) tokens (IK2_HIP_WARM_TOKENS) | The runtime's share taken before the experts are placed; the first run's seconds | MEASURED | 16, 64 and 256 tokens all take the runtime's whole share (the free VRAM never moved after the load, prompts up to 80K); with 16 the first 5K prompt read 7% slower than its repeat (946 / 1020 tok/s), with 256 2% (996 / 1013). The 256 tokens cost 0.2 s of the load |
 | E55 | token_embd as Q5_K / Q6_K / F32 | Embedding row types accepted | MODEL | The pack's tensors.txt: `token_embd.weight Q5_K` |
-| E56 | The experts' heat x **0.9 every 256 tokens** (a token's share each token: 0.9^(1/256); INKLING2_CACHE_DECAY) | How fast an expert's heat decays | MAYA | maya-ds4's DS4_CACHE_DECAY 0.9 (ds4_model.cu ~1797), within noise of the earlier x0.995 a token: the six-turn chat, two loads each, 51.3 / 51.0 tok/s against 48.7 / 51.2, the CPU lane 4.0 / 4.3 % against 4.1 / 3.9 % |
-| E57 | Move when `heat(hot) > 1.25·heat(cold) + 1.0` (INKLING2_CACHE_MARGIN / _BONUS) | The swap rule | MAYA | maya-ds4's DS4_CACHE_MARGIN 1.25 and _BONUS 1.0, measured with E56 (against 1.5 and 0.5) |
+| E56 | The experts' heat x **0.9 every 256 tokens** (a token's share each token: 0.9^(1/256); IK2_HIP_CACHE_DECAY) | How fast an expert's heat decays | MAYA | maya-ds4's DS4_CACHE_DECAY 0.9 (ds4_model.cu ~1797), within noise of the earlier x0.995 a token: the six-turn chat, two loads each, 51.3 / 51.0 tok/s against 48.7 / 51.2, the CPU lane 4.0 / 4.3 % against 4.1 / 3.9 % |
+| E57 | Move when `heat(hot) > 1.25·heat(cold) + 1.0` (IK2_HIP_CACHE_MARGIN / _BONUS) | The swap rule | MAYA | maya-ds4's DS4_CACHE_MARGIN 1.25 and _BONUS 1.0, measured with E56 (against 1.5 and 0.5) |
 | E58 | `swap_batch` 4 | Moves per GPU between two steps | MEASURED | model.cu: "4 and 8 decode alike, the CPU lane at 2 - 3 % of the picks" |
 | E59 | `burst_s` 0 (off) | Swap burst after a prompt | MEASURED | model.cu: "the first prompt after a load was seen to take 5 s longer with it" |
-| E60 | 48 rounds x 64 moves (INKLING2_BURST_ROUNDS / _MOVES) | Burst size | MEASURED (inactive) | The burst is off (E59, measured): these never run; kept |
-| E61 | Burst only after prompts of at least 64 tokens (INKLING2_BURST_MIN) | Burst trigger | MEASURED (inactive) | As E60 |
-| E62 | Window poll: min(16, batch x min(T, 4)) moves (INKLING2_SWAP_WIN_ROWS) | Moves after a window | MEASURED (insensitive) | 2 / 4 / 8 alike within noise ("The measured values" below); at most the bounce's 16 |
-| E63 | Prompt routings weighted min(1, 64/T) (INKLING2_CACHE_PROMPT_ROWS) | A prompt chunk's share of the heat | MEASURED (insensitive) | 16 / 64 / 256 alike within noise (below) |
-| E64 | `INKLING2_SWAP_BATCH` clamped to 1..64 | Env bounds | CHOSEN (bound) | Env bounds: at least one move; above 16 swap_poll's bounce cap takes it |
-| E65 | `kSnaps` 96, `kSnapEvery` 64 (INKLING2_SNAP_EVERY) | Convolution-history checkpoints: a ring of 96, one every 64 decoded tokens | MEASURED (insensitive) | Every 16 / 64 / 256 decoded tokens alike within noise (below); 96 x 64 = 6144 decoded positions, more than the 4096 rewind (E8): the bound holds (at 16 it would not) |
+| E60 | 48 rounds x 64 moves (IK2_HIP_BURST_ROUNDS / _MOVES) | Burst size | MEASURED (inactive) | The burst is off (E59, measured): these never run; kept |
+| E61 | Burst only after prompts of at least 64 tokens (IK2_HIP_BURST_MIN) | Burst trigger | MEASURED (inactive) | As E60 |
+| E62 | Window poll: min(16, batch x min(T, 4)) moves (IK2_HIP_SWAP_WIN_ROWS) | Moves after a window | MEASURED (insensitive) | 2 / 4 / 8 alike within noise ("The measured values" below); at most the bounce's 16 |
+| E63 | Prompt routings weighted min(1, 64/T) (IK2_HIP_CACHE_PROMPT_ROWS) | A prompt chunk's share of the heat | MEASURED (insensitive) | 16 / 64 / 256 alike within noise (below) |
+| E64 | `IK2_HIP_SWAP_BATCH` clamped to 1..64 | Env bounds | CHOSEN (bound) | Env bounds: at least one move; above 16 swap_poll's bounce cap takes it |
+| E65 | `kSnaps` 96, `kSnapEvery` 64 (IK2_HIP_SNAP_EVERY) | Convolution-history checkpoints: a ring of 96, one every 64 decoded tokens | MEASURED (insensitive) | Every 16 / 64 / 256 decoded tokens alike within noise (below); 96 x 64 = 6144 decoded positions, more than the 4096 rewind (E8): the bound holds (at 16 it would not) |
 | E66 | `kWin` 9 | Most rows in a window | CHOSEN (bound) | A round takes at most 8 rows (the anchor and 7 drafts, mtp_config.block_size 8); the 9th only --window-test's 9-row window uses |
 | E67 | Drafter taps 2..8, the last = n_layer | Check that the drafter fits the target | MODEL | config `mtp_config.target_layer_ids` (8 entries, the last 48) |
 | E68 | `kLine` 16 unsigned (64 B) | Spacing of the mapped flags | CHOSEN (bound) | 64 bytes, a cache line: each flag on its own line |
-| E69 | The lane's dispatcher spins 20 ms (INKLING2_LANE_SPIN_US), then sleeps 200 µs | CPU lane idle policy | MAYA | maya-ds4's DS4_LANE_SPIN_US 20000 us; measured within noise of the best: 200 / 1800 (the old 20000 yields) / 20000 us 57.0 / 55.0 / 55.2 tok/s (below) |
+| E69 | The lane's dispatcher spins 20 ms (IK2_HIP_LANE_SPIN_US), then sleeps 200 µs | CPU lane idle policy | MAYA | maya-ds4's DS4_LANE_SPIN_US 20000 us; measured within noise of the best: 200 / 1800 (the old 20000 yields) / 20000 us 57.0 / 55.0 / 55.2 tok/s (below) |
 | E70 | Depth-mix RMS eps `1e-6f` (hard-coded) | Depth-mix norm epsilon | MODEL\* | llama.cpp inkling2.cpp `ggml_rms_norm(ctx0, states, 1e-6f)`; also config `rms_norm_eps 1e-06` |
 | E71 | Router weight-sum eps `1e-20f` | Router normalization | MODEL\* | llama.cpp inkling2.cpp `expert_weights_norm_eps = 1e-20f` |
 | E72 | `tau = 1 + alpha·log(max(1, (p+1)/floor))` | Log attention scaling | MODEL | alpha 0.1 (GGUF / config), floor 8192 (E10) |
@@ -671,8 +674,8 @@ with where it comes from (2026-11-20). Sources:
 | E75 | `kATK` 16 | Keys per window-attention tile | MEASURED | 16-key tiles were the fastest of 64 / 32 / 16 at a 1024-key window (11.2 / 8.9 / 6.4 ms a token over the 48 layers: split_tk's comment); the window's tiles take the same size |
 | E76 | `kAU` 4 for up to four rows, 8 from five | Keys per thread in window scores | MEASURED | kernels.cu (ms by T for 1 / 2 / 4 / 8 keys) |
 | E77 | `kCombTiles` 8192 | Tiles per combine chunk (past 131072 keys) | CHOSEN (bound) | 8192 floats = 32 KB, a block's shared memory for the tiles' factors; past it (131072 keys at 16 a tile) the factors go a chunk at a time |
-| E78 | `split_tk` 16 / 16 (`INKLING2_ATTN_TK`) | Split-attention tile keys | MEASURED | split_tk's comment: 64 keys 11.2, 32 keys 8.9, 16 keys 6.4 ms a token at a 1024-key window |
-| E79 | Split scratch for at least 2048 keys, 16-key tiles | Attention scratch sizing | CHOSEN (bound) | At least 256 tiles: INKLING2_ATTN_TK's smallest tile (8) over 2048 keys |
+| E78 | `split_tk` 16 / 16 (`IK2_HIP_ATTN_TK`) | Split-attention tile keys | MEASURED | split_tk's comment: 64 keys 11.2, 32 keys 8.9, 16 keys 6.4 ms a token at a 1024-key window |
+| E79 | Split scratch for at least 2048 keys, 16-key tiles | Attention scratch sizing | CHOSEN (bound) | At least 256 tiles: IK2_HIP_ATTN_TK's smallest tile (8) over 2048 keys |
 | E80 | Clip eps `1e-6` | L2 clip denominator | MODEL\* | llama.cpp inkling2.cpp `ggml_scale_bias(norm, 1.0f, 1e-6f)` |
 | E81 | Conv scale 1/sqrt(9), 1/sqrt(5) | Short-convolution output scale | MODEL\* | llama.cpp inkling2.cpp `1/sqrtf((dynamic ? 2 : 1)*n_conv + 1)`, n_conv = 4 (config `sconv_kernel_size`) |
 | E82 | SITU beta 4.0, lb 25.0 | Expert activation | MODEL | GGUF `situ_beta 4.0` / `situ_linear_beta 25.0`; config `mlp_gate_softcap 4.0` / `mlp_up_softcap 25.0` |
@@ -684,7 +687,7 @@ with where it comes from (2026-11-20). Sources:
 | E88 | `inkling2.txt`, `tensors.txt` | Pack file names | MAYA | Hy4's pack layout (maya.py: "hy4.txt, tensors.txt, tokenizer/") |
 | E89 | `--max-context --reserve-mib --vram-experts --cpu-threads --expert-profile --profile-out --prefill-chunk --eos` | Flag names | MAYA | ds4_main.cpp's flags; now also --no-expert-cache, --profile-readonly, --dspark on\|off\|none |
 | E90 | `--ctx --log-floor --rewind --short-prompt --dspark-index --dspark-cum`; `--dspark idle` | Our own flag names | CHOSEN (names) | Settings maya-ds4 has no flag for (its cum floor: MAYA_DS4_DSPARK_CUM and the request's dspark_cum, the same key here); idle (tests) has no maya-ds4 counterpart |
-| E91 | `INKLING2_*` env names | Test and diagnostic switches | CHOSEN (names) | The family's prefix, as DS4_* / HY4_* |
+| E91 | `IK2_HIP_*` env names | Test and diagnostic switches | CHOSEN (names) | The family's prefix, as DS4_* / HY4_* |
 | E92 | Window-test pass: cosine ≥ 0.9995 | Test threshold | CHOSEN (bound) | Below the 9 of 9 rows found equal to the bit (above): room for a moved expert only |
 | E93 | Rewind-test pass: cosine ≥ 0.9999 | Test threshold | CHOSEN (bound) | The exact cases resume at a chunk's start: the same chunks as the cold read, so only rounding is left |
 | E94 | Parity: mean cosine ≥ 0.999; every row ≥ 0.999 on ≤ 64 positions | Test threshold | MEASURED | INKLING2_AMD.md (llama.cpp's own noise floor: a worst cosine of 0.23 on long prompts) |
@@ -717,7 +720,7 @@ with where it comes from (2026-11-20). Sources:
 | D20 | Markov state as int16 (x32767) | State quantization in the head | CHOSEN (method) | int16 x 32767 state in the head; acceptance matched llama.cpp's through the engine tests, no number for this scale alone |
 | D21 | M rows int8, scale max/127 | Folded head matrix | CHOSEN (method) | Symmetric Q8 rows of the folded matrix |
 | D22 | M built in 16-column chunks | GEMV batching | MAYA | ds4_iq.cu |
-| D23 | `maya-inkling2-dspark-<kind>/`, `dspark.txt`, `format maya-inkling2-dspark 1`, `model_dir ..` | Index layout | CHOSEN (names) | tensors.txt in pack_gguf.py's format |
+| D23 | `maya-ik2-dspark-<kind>/`, `dspark.txt`, `format maya-ik2-dspark 1`, `model_dir ..` | Index layout | CHOSEN (names) | tensors.txt in pack_gguf.py's format |
 | D24 | The engine loads the Q8_0 copy | Drafter weight type | MEASURED | DSPARK.md |
 | D25 | Taps = outputs of layers 4, 10, ..., 40 + `result_norm` | What the drafter is fed | MEASURED | DSPARK.md (the other tap variants are worse) and config `target_layer_ids` |
 | D26 | RoPE NEOX (half-split) | Rotary pairing | MEASURED | DSPARK.md (adjacent pairs collapse to 0.32 / 0.69 / 0.30) |
@@ -726,34 +729,34 @@ with where it comes from (2026-11-20). Sources:
 
 | # | Value | What it does | Source | Where it comes from |
 |---|---|---|---|---|
-| S1 | `INK_EXE` `maya-inkling2` | Engine binary | MAYA | `maya-<engine>`: DS4_EXE maya.py, HY4_EXE 804 |
+| S1 | `INK_EXE` `maya-ik2` | Engine binary | MAYA | `maya-<engine>`: DS4_EXE maya.py, HY4_EXE 804 |
 | S2 | `IK2` "Inkling-2-Small" | Model id | MODEL | GGUF `general.name` / `basename` |
 | S3 | `IK2_SHOWN` "Inkling 2 Small" | Name on screen | MODEL | GGUF `general.base_model.0.name` |
-| S4 | `tools/inkling2/download.json` | Manifest | MAYA | DS4_MANIFEST maya.py, HY4_MANIFEST 808 |
-| S5 | `IK2_PACK` "maya-inkling2" | Pack folder in the model's | MAYA | HY4_PACK "maya-hy4" maya.py |
+| S4 | `tools/ik2/download.json` | Manifest | MAYA | DS4_MANIFEST maya.py, HY4_MANIFEST 808 |
+| S5 | `IK2_PACK` "maya-ik2" | Pack folder in the model's | MAYA | HY4_PACK "maya-hy4" maya.py |
 | S6 | `IK2_QUANT` "ud-q2_k_xl" | Quant key | MODEL | unsloth's folder `UD-Q2_K_XL` (download.json; the local folder) |
 | S7 | `IK2_GGUF_DIR` "Inkling-2-Small-GGUF" | GGUF folder under models | MODEL | The repo name, `unsloth/Inkling-2-Small-GGUF` (download.json) |
 | S8 | `IK2_MTP_DIR` "Inkling-2-Small-MTP" | Drafter folder | CHOSEN (names) | This PC's folder name for Thinking Machines' repo |
-| S9 | `IK2_DSPARK` "maya-inkling2-dspark-q8_0" | Drafter index folder | CHOSEN (names) | convert_dspark.py's Q8_0 index |
+| S9 | `IK2_DSPARK` "maya-ik2-dspark-q8_0" | Drafter index folder | CHOSEN (names) | convert_dspark.py's Q8_0 index |
 | S10 | Removed | - | - | It was not used |
-| S11 | `IK2_CONFIG` "maya-inkling2-hip.json" | Config file name | MAYA | "maya-ds4-hip.json" maya.py |
+| S11 | `IK2_CONFIG` "maya-ik2-hip.json" | Config file name | MAYA | "maya-ds4-hip.json" maya.py |
 | S12 | `IK2_MODEL_NAME` "inkling-2-small" | API model name | MAYA | Lower-case ids: DS4_MODEL_NAME maya.py, HY4_MODEL_NAME 848 |
 | S13 | `IK2_CONTEXTS` top 1048576 | Largest context offered | MODEL | inkling2.txt `context_length`; config `model_max_length` |
 | S14 | `IK2_CONTEXTS` 32K .. 1M | Contexts offered | MAYA | DS4_CONTEXTS |
 | S15 | `IK2_DEFAULT_CONTEXT` 65536 | Fallback and lower bound of the recommendation | MAYA | DS4_DEFAULT_CONTEXT maya.py. It is not what the engine defaults to (E1, 32768), and nothing was measured at 64K (INKLING2_AMD.md). Measurable here. |
-| S16 | `IK2_RECOMMENDED_CONTEXT` 262144 | Highest recommendation | MAYA | DS4_RECOMMENDED_CONTEXT (DeepSeek's reason: its indexer's quadratic cost). maya-inkling2 has been run end to end with a server at 256K and prompts up to 109,464 tokens (W2) |
+| S16 | `IK2_RECOMMENDED_CONTEXT` 262144 | Highest recommendation | MAYA | DS4_RECOMMENDED_CONTEXT (DeepSeek's reason: its indexer's quadratic cost). maya-ik2 has been run end to end with a server at 256K and prompts up to 109,464 tokens (W2) |
 | S17 | IK2_KV_BYTES 32768 + IK2_ATTN_BYTES 1560 on each GPU (+ IK2_DSPARK_KV_BYTES 6400 while it drafts) | Cache VRAM per context token | DERIVED | From the engine's allocations (serve/models.py says which): the global layers' K / V rows; each GPU's attention_split scratch, 48 x 130 floats a 16-key tile (past its 58 MB floor, 37,152 positions); the SWA rings are 7168 rows (E40) whatever the context. The setup and the page read the same constants |
 | S18 | `IK2_DSPARK_KV_BYTES` 6400 | The drafter's per token | DERIVED | = D10 |
 | S19 | `IK2_MEMORY_GB` 203 (download.json the same) | VRAM + RAM that must hold the model | DERIVED | ceil(files 190.9 GiB + the engine's RAM margin 8 GiB + the drafter's 3.47 GB = 3.2 GiB) |
 | S20 | `IK2_DSPARK_GB` 3.47 | Drafter's VRAM added to the need | MEASURED | The last GPU's free VRAM after the load's warm-up with the drafter and without it: 25124 against 28438 MiB at 32K ("VRAM" above) |
-| S21 | `data/expert-profile-inkling2.bin` | Shipped expert profile | MEASURED | The path follows DS4_PROFILE (maya.py). The contents equal the pack's default.prof byte for byte: 15,139,200 routings = 39,425 tokens x 48 x 8. **The corpus is not recorded** (commit 8d4e2c7 says only "the profile the AMD runs used"). |
-| S22 | Set up on AMD under Linux only | Platform gate | CHOSEN (scope) | maya-ik2, the NVIDIA engine, has no setup |
+| S21 | `data/expert-profile-ik2.bin` | Shipped expert profile | MEASURED | The path follows DS4_PROFILE (maya.py). The contents equal the pack's default.prof byte for byte: 15,139,200 routings = 39,425 tokens x 48 x 8. **The corpus is not recorded** (commit 8d4e2c7 says only "the profile the AMD runs used"). |
+| S22 | Set up on AMD under Linux only | Platform gate | CHOSEN (scope) | maya-ik2's CUDA build has no setup yet |
 | S23 | VRAM + RAM < need: a warning, the setup goes on | Memory gate | MAYA | DeepSeek's check (check_pc); the warning says the experts RAM does not hold are then read from the SSD (--mmap-experts auto), slower |
 | S24 | Recommendation pool `vram + ram - need` | Context recommendation | MAYA | ds4_recommended_context |
 | S25 | 64K when RAM is unreadable or nothing fits | Fallback | MAYA | maya.py |
 | S26 | Warn when a chosen context's cache does not fit | Warning | CHOSEN (warning) | A chosen context whose cache leaves the experts too little: said, on the same pool as S24 |
 | S27 | `--reserve-mib` = `--vram-reserve-mib`, else hip_reserve_mib: 3072 (1024 on a Linux APU) | VRAM kept free | MAYA | DeepSeek's setup maya.py; hip_reserve_mib maya.py |
-| S28 | `--dspark none` until the speed calibration; `--drafting measure \| on \| off` | Setup's drafting default | MAYA | DeepSeek's setup and tools/calibrate_ds4.py (now taking maya-inkling2's --dspark-index) |
+| S28 | `--dspark none` until the speed calibration; `--drafting measure \| on \| off` | Setup's drafting default | MAYA | DeepSeek's setup and tools/calibrate_ds4.py (now taking maya-ik2's --dspark-index) |
 | S29 | A setup again keeps the config's --dspark; the calibration or --drafting then sets it | Re-setup rule | MAYA | write_config_ds4's keep_args |
 | S30 | Port 8080 | Default port | MAYA | maya.py |
 | S31 | Kept flags `--reserve-mib --vram-experts --layer-split --cpu-threads --expert-profile --prefill-chunk --dspark-cum --rewind --short-prompt --mmap-experts` | Hand-set flags a re-setup keeps | CHOSEN (list) | Every engine setting the setup does not ask, now with --dspark and --mmap-experts (DeepSeek's list keeps both; the setup's --mmap-experts is written, as DeepSeek's) |
@@ -774,23 +777,23 @@ with where it comes from (2026-11-20). Sources:
 |---|---|---|---|---|
 | W1 | 32K .. 1M | Contexts on the Models page | MAYA | = S14 (models.py's DS4_CONTEXTS) |
 | W2 | `CONTEXT_TESTED["inkling2"]` 524288 | Where the page starts saying "untested" | MEASURED | Run end to end at --max-context 524288 with a 307,710-token prompt ("Long contexts" above); 1M does not load on this PC (its RAM) |
-| W3 | `IK2_KEYS` + reserve_mib, mmap, prefill_chunk, cpu_threads, dspark_cum (maya-inkling2 only) | Settings the page edits | MAYA | DS4_KEYS; dspark_cum is dspark_conf's counterpart, in DeepSeek's Draft confidence row; mmap: DeepSeek's "Experts VRAM does not hold" row (auto: the flag dropped) |
-| W4 | VRAM kept free (--reserve-mib) for maya-inkling2 | - | MAYA | DeepSeek's row |
+| W3 | `IK2_KEYS` + reserve_mib, mmap, prefill_chunk, cpu_threads, dspark_cum (maya-ik2 only) | Settings the page edits | MAYA | DS4_KEYS; dspark_cum is dspark_conf's counterpart, in DeepSeek's Draft confidence row; mmap: DeepSeek's "Experts VRAM does not hold" row (auto: the flag dropped) |
+| W4 | VRAM kept free (--reserve-mib) for maya-ik2 | - | MAYA | DeepSeek's row |
 | W5 | `--dspark` read as "on" when absent; off and none read as Off | Current Drafting state | MAYA | The engine's default, as maya-ds4's; the page writes none (DeepSeek's) |
 | W6 | Context fallback 32768 | Context when `--max-context` is absent | MAYA | = E1 (ds4_model.hpp) |
 | W7 | Trained context from inkling2.txt `context_length` | Slider top | MODEL | inkling2.txt `context_length 1048576` |
-| W8 | Drafter searched at `<models>/Inkling-2-Small-MTP/maya-inkling2-dspark-q8_0` and `pack.parents[2]/...` | Finds the index | DERIVED | From S7 / S8 / S9 |
+| W8 | Drafter searched at `<models>/Inkling-2-Small-MTP/maya-ik2-dspark-q8_0` and `pack.parents[2]/...` | Finds the index | DERIVED | From S7 / S8 / S9 |
 | W9 | The page's cost: the server's kv_bytes + kv_gpu_bytes x GPUs + dspark_kv_bytes while it drafts | Cache GB shown for a context | DERIVED | = S17, from serve/models.py |
 | W10 | "About {IK2_DSPARK_GB} GB" (3.47) | Drafting hint | MEASURED | = S20 |
 | W11 | Levels none, auto, low, medium, high, xhigh, max | Thinking levels offered | MODEL | The template's levels as the other PR's server takes them (frontend.py's INKLING_EFFORT): its effort_kwargs reads minimal as thinking off (0), so the page does not offer it beside Off |
 | W12 | Default "auto" (the template's 0.9) | Default thinking level | MODEL | chat_template.jinja:5 |
 | W13 | 0 / 0.2 / 0.7 / 0.9 / 0.99 in the titles | Labels | MODEL | chat_template.jinja:1 |
-| W14 | "Inkling 2 Small (maya-inkling2)", NAME_WORDS `inkling` | Labels | MODEL | GGUF base_model name |
+| W14 | "Inkling 2 Small (maya-ik2)", NAME_WORDS `inkling` | Labels | MODEL | GGUF base_model name |
 | W15 | `INKLING_TEXT_ONLY` "Inkling-2-Small" | Name in picture errors | MODEL | GGUF `general.name` |
 | W16 | Stops on `<|message_user|>`, `<|message_system|>`, `<|message_tool|>` | Turn-end guard | MODEL | chat_template.jinja:2 role tokens; vocab ids 200000 / 200002 / 200003. The template ends a model turn with `<\|content_model_end_sampling\|>` (124). Treating the role tokens as stops is our addition. |
 | W17 | Call end `<|end_message|>` | Tool-call parsing | MODEL | chat_template.jinja:119 |
 | W18 | GGUF-template detection: has `<|content_invoke_tool_json|>` and `<|message_model|>`, no `effort_map`; `MAYA_PACK_TEMPLATE=1` | Uses the official template | MODEL | Markers: chat_template.jinja:1, 112. The env name is CHOSEN. |
-| W19 | maya-inkling2 gets `--layer-split auto` (maya-ik2 does not) | Engine command | MAYA | The server's rule for any multi-GPU engine (server.py) |
+| W19 | maya-ik2 gets `--layer-split auto` (maya-ik2 does not) | Engine command | MAYA | The server's rule for any multi-GPU engine (server.py) |
 | W20 | Call open `<|content_invoke_tool_(json\|text)|>`, close `<|end_message|>` | Loop guard | MODEL | chat_template.jinja:112, 119; vocab 200057 (`_text`) |
 | W21 | A tool result is named by its position (the k-th result answers the k-th call) | Tool result header | CHOSEN (other PR) | frontend.py's inkling_messages (PR #1079's): OpenAI's and Anthropic's order |
 | W22 | `IK2_OTHER` ("inkling-2-small-ud-q2_k_xl", "unsloth") | Download row | MODEL | download.json (unsloth) |
@@ -801,7 +804,7 @@ with where it comes from (2026-11-20). Sources:
 | # | Value | What it does | Source | Where it comes from |
 |---|---|---|---|---|
 | T1 | `STALE_FLOOR {128000: 8192}` | Fixes the GGUF's floor | MODEL | config.json `log_scaling_n_floor 8192` against GGUF `log_scaling_n_floor` / `attention.log_scale_floor` 128000. The Thinking Machines commit hash (pack_gguf.py; INKLING2_AMD.md) cannot be checked locally; config.json can. |
-| T2 | Output `<model>/maya-inkling2` | Pack folder | MAYA | = S5 |
+| T2 | Output `<model>/maya-ik2` | Pack folder | MAYA | = S5 |
 | T3 | No fallback: the GGUF must give both keys | Used when the GGUF lacks the key | MODEL | pack_gguf.py's other required keys |
 | T4 | `attention.log_scale_floor` read first, `log_scaling_n_floor` second | Key order | MODEL | Both are 128000 in this GGUF |
 | T5 | Geometry guards | Refuses other shapes | CHOSEN (bound) | = E85 |

@@ -1,4 +1,4 @@
-// Reference dump for the maya-inkling2 port: runs a prompt (one batch) and then N greedy
+// Reference dump for the maya-ik2 port: runs a prompt (one batch) and then N greedy
 // decode steps, saving every graph tensor whose name matches INK_DUMP_FILTER (a regex,
 // default: per-layer outputs, router picks, final norm and logits) as raw F32/I32 files.
 //

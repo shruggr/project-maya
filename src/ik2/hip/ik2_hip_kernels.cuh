@@ -1,13 +1,13 @@
-// src/inkling2/inkling2_kernels.cuh - maya-inkling2's own kernels (inkling2_kernels.cu): what Inkling 2 adds to the GGUF
-// matrices that src/ds4/ds4_iq runs (docs/INKLING2_AMD.md, llama.cpp's src/models/inkling2.cpp).  One token a call (the
-// decode path): every activation an F32 vector on the device.
+// src/ik2/hip/ik2_hip_kernels.cuh - maya-ik2's AMD build's own kernels (ik2_hip_kernels.cu): what Inkling 2 adds to
+// the GGUF matrices that src/ds4/ds4_iq runs (docs/INKLING2_AMD.md, llama.cpp's src/models/inkling2.cpp).  One token a
+// call (the decode path): every activation an F32 vector on the device.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace inkling2::k {
+namespace ik2hip::k {
 
 // the depth mix's states at most (the saved residual streams and the current one): the model needs ceil(48 / 6) + 1 = 9
 // (n_layers_per_attn_res_block 6)
@@ -174,4 +174,4 @@ void combine_rows(const float* ent, const float* w, int T, int nu, int E, float*
 /// Launch failures since the last call (each printed); 0 none
 int errors();
 
-}  // namespace inkling2::k
+}  // namespace ik2hip::k

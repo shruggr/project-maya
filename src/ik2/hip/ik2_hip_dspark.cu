@@ -1,4 +1,4 @@
-// src/inkling2/inkling2_dspark.cu - maya-inkling2's drafter (inkling2_dspark.hpp; docs/INKLING2_DSPARK.md has the
+// src/ik2/hip/ik2_hip_dspark.cu - maya-ik2's drafter (ik2_hip_dspark.hpp; docs/INKLING2_DSPARK.md has the
 // equations, read from llama.cpp PR #32218's graph_inkling2 / build_inkling2_head).
 //
 // One GPU.  The block's matrices stay in the GGUF's Q8_0 blocks and run through ds4_iq's GEMVs (the activations as
@@ -6,10 +6,10 @@
 // the attention and the markov head are this file's kernels.  The head's correction goes through
 // M = output @ dspark_hidden_out ([vocab][256], made at the load) instead of the target's whole output matrix a
 // step, and its 7 steps run on the device one after the other: the host reads the tokens once, at the end.
-#include "inkling2_dspark.hpp"
+#include "ik2_hip_dspark.hpp"
 
-#include "inkling2_kernels.cuh"
-#include "inkling2_pack.hpp"
+#include "ik2_hip_kernels.cuh"
+#include "ik2_hip_pack.hpp"
 #include "hy4_kernels.cuh"
 #include "../ds4/ds4_iq.cuh"
 
@@ -31,7 +31,7 @@
 extern "C" void dequantize_row_q5_K(const void* x, float* y, int64_t k);   // (ggml-quants: the anchor's embedding row)
 extern "C" void dequantize_row_q6_K(const void* x, float* y, int64_t k);
 
-namespace inkling2 {
+namespace ik2hip {
 
 namespace hk = hy4::k;
 namespace iq = strata::ds4::gguf::iq;
@@ -45,7 +45,7 @@ std::atomic<int> g_err{0};
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "maya-inkling2 dspark kernel %s: %s\n", what, cudaGetErrorString(e));
+        std::fprintf(stderr, "maya-ik2 dspark kernel %s: %s\n", what, cudaGetErrorString(e));
         g_err.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -463,7 +463,7 @@ float half_to_float(uint16_t h) {
     return r;
 }
 
-// the drafter's index (tools/inkling2/convert_dspark.py): dspark.txt, tensors.txt - the format of the model's pack
+// the drafter's index (tools/ik2/convert_dspark.py): dspark.txt, tensors.txt - the format of the model's pack
 struct Index {
     std::string dir;
     std::map<std::string, std::string> kv;
@@ -475,7 +475,7 @@ struct Index {
         dir = d;
         std::ifstream gf(dir + "/dspark.txt");
         if (!gf) {
-            err = dir + "/dspark.txt: cannot open (tools/inkling2/convert_dspark.py writes it)";
+            err = dir + "/dspark.txt: cannot open (tools/ik2/convert_dspark.py writes it)";
             return false;
         }
         for (std::string line; std::getline(gf, line);) {
@@ -483,8 +483,8 @@ struct Index {
             const size_t sp = line.find(' ');
             if (sp != std::string::npos) kv[line.substr(0, sp)] = line.substr(sp + 1);
         }
-        if (str("format").rfind("maya-inkling2-dspark", 0) != 0) {
-            err = dir + "/dspark.txt: not a maya-inkling2-dspark index";
+        if (str("format").rfind("maya-ik2-dspark", 0) != 0) {
+            err = dir + "/dspark.txt: not a maya-ik2-dspark index";
             return false;
         }
         std::ifstream f(dir + "/tensors.txt");
@@ -719,7 +719,7 @@ struct Dspark::Impl {
         if (!t) return false;
         if (t->type != "Q8_0" || kk % 32 != 0 || t->bytes != iq::row_bytes(iq::kQ8_0, kk) * (size_t) nn) {
             err = n + ": " + t->type + " - the drafter's block matrices are Q8_0 (the Q8_0 index: "
-                  "tools/inkling2/convert_dspark.py --type q8_0)";
+                  "tools/ik2/convert_dspark.py --type q8_0)";
             return false;
         }
         uint8_t* d = nullptr;
@@ -768,7 +768,7 @@ struct Dspark::Impl {
     bool attention_gemm(DLayer& l, int64_t lo, int nctx, float scale, std::string& err) {
         const int per = H / Hkv, Q = B * per, KD = Hkv * D, nk = nctx + B;
         const float one = 1.0f, zero = 0.0f;
-        inkling2::k::perm_heads(qv, qp, B, Hkv, per, D, true, s);
+        ik2hip::k::perm_heads(qv, qp, B, Hkv, per, D, true, s);
         hk::to_f16(qp, (size_t) D, Hkv * Q, D, xh16, (size_t) D, s);
         hk::to_f16(kv, (size_t) KD, B, KD, kb16, (size_t) KD, s);
         hk::to_f16(vv, (size_t) KD, B, KD, vb16, (size_t) KD, s);
@@ -794,7 +794,7 @@ struct Dspark::Impl {
             err = "dspark: an attention GEMM failed";
             return false;
         }
-        inkling2::k::perm_heads(op, ao, B, Hkv, per, D, false, s);
+        ik2hip::k::perm_heads(op, ao, B, Hkv, per, D, false, s);
         return true;
     }
     bool sync(std::string& err) {
@@ -836,7 +836,7 @@ struct Dspark::Impl {
             Vp != tg.n_vocab || Vu != tg.n_vocab_unpadded || E % 32 || FF % 32 || (H * D) % 32 || (Hkv * D) % 32 ||
             D > 128 || D % 2 || H % Hkv || (B * (H / Hkv) + 256 / D - 1) / (256 / D) > kPartAcc || R < 4 || R > 256 || R % 4 || n_swa < 1 || Vu > Vp || cap <= 0 ||
             targets.back() != tg.n_layer || (int) ix.num("target_n_layer") != tg.n_layer) {
-            err = o.index + ": a drafter maya-inkling2 does not run with this target";
+            err = o.index + ": a drafter maya-ik2 does not run with this target";
             return false;
         }
         CK(cudaSetDevice(dev));
@@ -1093,13 +1093,13 @@ struct Dspark::Impl {
             DLayer& l = L[(size_t) il];
             hk::q8_rows(fz + (size_t) il * n * E, (size_t) E, n, E, xq, xd, s);
             if (!mv({job(l.kc, xq, xd, n, kc, (size_t) KD), job(l.vc, xq, xd, n, vc, (size_t) KD)}, err)) return false;
-            inkling2::k::rms(kc, (size_t) D, n * Hkv, D, l.kcn, eps, kc, (size_t) D, s);
+            ik2hip::k::rms(kc, (size_t) D, n * Hkv, D, l.kcn, eps, kc, (size_t) D, s);
             rope_neox_kernel<<<blocks_of((size_t) n * Hkv * D / 2), 256, 0, s>>>(kc, n, Hkv, D, (long long) pos0, log_base);
             check("rope");
-            inkling2::k::store_rows(kc, n, KD, l.K, l.ring, pos0, s);
-            inkling2::k::store_rows(vc, n, KD, l.V, l.ring, pos0, s);
+            ik2hip::k::store_rows(kc, n, KD, l.K, l.ring, pos0, s);
+            ik2hip::k::store_rows(vc, n, KD, l.V, l.ring, pos0, s);
         }
-        inkling2::k::store_rows(fz + (size_t) NL * n * E, n, E, fring, FR, pos0, s);
+        ik2hip::k::store_rows(fz + (size_t) NL * n * E, n, E, fring, FR, pos0, s);
         return true;
     }
     bool feed(const float* taps_in, size_t ld, bool on_dev, int n, int64_t pos0, std::string& err) {
@@ -1159,7 +1159,7 @@ struct Dspark::Impl {
             else std::memcpy(h_x.data(), row, (size_t) E * 4);
             CK(cudaMemcpyAsync(emb, h_x.data(), (size_t) E * 4, cudaMemcpyHostToDevice, s));
             CK(cudaMemcpyAsync(x, x0, (size_t) B * E * 4, cudaMemcpyDeviceToDevice, s));
-            inkling2::k::rms(emb, (size_t) E, 1, E, tok_norm, eps, x, (size_t) E, s);
+            ik2hip::k::rms(emb, (size_t) E, 1, E, tok_norm, eps, x, (size_t) E, s);
             CK(cudaMemcpyAsync(tok, &anchor, sizeof(int), cudaMemcpyHostToDevice, s));
             CK(cudaMemsetAsync(state, 0, (size_t) R * 4, s));
             CK(cudaMemcpyAsync(cumd, &one, 4, cudaMemcpyHostToDevice, s));
@@ -1171,13 +1171,13 @@ struct Dspark::Impl {
         const float scale = 1.0f / std::sqrt((float) D);
         for (int il = 0; il < NL; ++il) {
             DLayer& l = L[(size_t) il];
-            inkling2::k::rms(x, (size_t) E, B, E, l.attn_norm, eps, a, (size_t) E, s);
+            ik2hip::k::rms(x, (size_t) E, B, E, l.attn_norm, eps, a, (size_t) E, s);
             hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
             if (!mv8({job(l.q, xq, xd, B, qv, (size_t) HD), job(l.kk, xq, xd, B, kv, (size_t) KD),
                      job(l.v, xq, xd, B, vv, (size_t) KD)}, err))
                 return false;
-            inkling2::k::rms(qv, (size_t) D, B * H, D, l.qn, eps, qv, (size_t) D, s);
-            inkling2::k::rms(kv, (size_t) D, B * Hkv, D, l.kn, eps, kv, (size_t) D, s);
+            ik2hip::k::rms(qv, (size_t) D, B * H, D, l.qn, eps, qv, (size_t) D, s);
+            ik2hip::k::rms(kv, (size_t) D, B * Hkv, D, l.kn, eps, kv, (size_t) D, s);
             rope_neox_kernel<<<blocks_of((size_t) B * H * D / 2), 256, 0, s>>>(qv, B, H, D, (long long) n, log_base);
             rope_neox_kernel<<<blocks_of((size_t) B * Hkv * D / 2), 256, 0, s>>>(kv, B, Hkv, D, (long long) n, log_base);
             if (!phase(st.qkv_ms)) return false;
@@ -1202,19 +1202,19 @@ struct Dspark::Impl {
             if (!phase(st.attn_ms)) return false;
             hk::q8_rows(ao, (size_t) HD, B, HD, xq, xd, s);
             if (!mv8({job(l.o, xq, xd, B, ob, (size_t) E)}, err)) return false;
-            inkling2::k::add(x, ob, (size_t) B * E, s);
+            ik2hip::k::add(x, ob, (size_t) B * E, s);
             if (!phase(st.o_ms)) return false;
-            inkling2::k::rms(x, (size_t) E, B, E, l.ffn_norm, eps, a, (size_t) E, s);
+            ik2hip::k::rms(x, (size_t) E, B, E, l.ffn_norm, eps, a, (size_t) E, s);
             hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
             if (!mv8({job(l.gate, xq, xd, B, gu, (size_t) FF), job(l.up, xq, xd, B, gu + (size_t) B * FF, (size_t) FF)}, err))
                 return false;
             hk::swiglu(gu, gu + (size_t) B * FF, (size_t) FF, B, FF, hh, (size_t) FF, s);
             hk::q8_rows(hh, (size_t) FF, B, FF, xq, xd, s);
             if (!mv8({job(l.down, xq, xd, B, ob, (size_t) E)}, err)) return false;
-            inkling2::k::add(x, ob, (size_t) B * E, s);
+            ik2hip::k::add(x, ob, (size_t) B * E, s);
             if (!phase(st.ffn_ms)) return false;
         }
-        inkling2::k::rms(x, (size_t) E, B, E, out_norm, eps, hN, (size_t) E, s);
+        ik2hip::k::rms(x, (size_t) E, B, E, out_norm, eps, hN, (size_t) E, s);
         if (!phase(st.layers_ms)) return false;
         if (o.profile) st.layers_ms = st.qkv_ms + st.attn_ms + st.o_ms + st.ffn_ms;
         // ---- the base logits of the draft rows (the target's output matrix, read once)
@@ -1280,4 +1280,4 @@ int Dspark::n_embd() const { return m->E; }
 int Dspark::vocab() const { return m->Vu; }
 const DsparkStats& Dspark::stats() const { return m->st; }
 
-}  // namespace inkling2
+}  // namespace ik2hip

@@ -36,8 +36,8 @@ GLM_EXL3 = ("EXL3-3.05bpw", "EXL3-4.05bpw")
 # (Qwen3.8-Flash-Next itself: unsloth's UD-IQ2_XS only - its other UD quants run on the same code but are not listed;
 #  the setup id: maya_quants.QWEN_UD_IDS[0])
 QWEN_OTHER = (("qwen-ud-iq2_xs", "qwen", "ud-iq2_xs", "unsloth"),)
-# (Inkling 2 Small on AMD: unsloth's UD-Q2_K_XL, the files maya-inkling2 runs - offered on AMD only; on NVIDIA its engine
-#  is maya-ik2, which has no setup yet.  The setup id: maya_quants.IK2_IDS[0])
+# (Inkling 2 Small on AMD: unsloth's UD-Q2_K_XL, the files maya-ik2's AMD build runs - offered on AMD only; on NVIDIA
+#  maya-ik2 has no setup yet.  The setup id: maya_quants.IK2_IDS[0])
 IK2_OTHER = (("inkling-2-small-ud-q2_k_xl", "ik2", "ud-q2_k_xl", "unsloth"),)
 OTHER = tuple([(f"deepseek-{k}", "deepseek", k, by) for k, by in DS4_OTHER] + [("minimax-exl3", "minimax", "exl3", "Mia-AiLab")] +
               [(f"glm-{k.lower()}", "glm", k, "turboderp") for k in GLM_EXL3] + list(QWEN_OTHER) + list(IK2_OTHER))
@@ -52,7 +52,7 @@ def _offered(fam: str, key: str, backend: str, ccs: list) -> bool:
     AMD; GLM's EXL3 quants anywhere but Metal."""
     if backend == "metal":
         return False
-    if fam == "ik2":                                   # (maya-inkling2: the setup's check_pc takes AMD only)
+    if fam == "ik2":                                   # (maya-ik2: the setup's check_pc takes AMD only so far)
         return backend == "hip"
     if fam in ("deepseek", "minimax") and backend != "hip" and ccs:   # (their EXL3 quants and DeepSeek's GGUFs:
         return max(ccs) >= EXL3_MIN_CC                                  # maya-ds4's / maya-mm3's kernels, V100 on)

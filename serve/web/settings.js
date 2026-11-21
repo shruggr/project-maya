@@ -47,8 +47,8 @@ const Row = ({label, sub, children, htmlFor, cls = ""}) => html`<div class=${`se
 // the engines by their INFO engine_kind
 const ENGINES = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)", mm3: "MiniMax-M3.1 (maya-mm3)",
                  hy4: "Hy4-Flash (maya-hy4)",
-                 // (Inkling 2 Small's two engines: maya-ik2 on NVIDIA, maya-inkling2 on AMD)
-                 ik2: "Inkling 2 Small (maya-ik2)", inkling2: "Inkling 2 Small (maya-inkling2)"};
+                 // (Inkling 2 Small's engine, maya-ik2: on NVIDIA, and its AMD build - src/ik2/hip)
+                 ik2: "Inkling 2 Small (maya-ik2)", "ik2-hip": "Inkling 2 Small (maya-ik2, AMD)"};
 
 // ------------------------------------------------------------------ General
 function General() {

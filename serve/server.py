@@ -70,10 +70,10 @@ HY4_PICTURE_NOTE = "[a picture was here; pictures are off on this server, so it 
 
 
 def inkling_text_only(engine) -> str:
-    """Inkling 2's name in the errors about pictures, with the engine that runs it (its INFO engine=: maya-ik2 on
-    NVIDIA, maya-inkling2 on AMD)."""
+    """Inkling 2's name in the errors about pictures, with the engine that runs it (its INFO engine=: maya-ik2, on
+    NVIDIA and on AMD)."""
     kind = str((getattr(engine, "info", None) or {}).get("engine") or "")
-    return f"{INKLING_TEXT_ONLY} on maya-{kind}" if kind in ("ik2", "inkling2") else INKLING_TEXT_ONLY
+    return f"{INKLING_TEXT_ONLY} on maya-{kind}" if kind == "ik2" else INKLING_TEXT_ONLY
 
 
 def hy4_tool_pictures_noted(messages: list) -> list:
@@ -2191,9 +2191,9 @@ def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
-    # (maya-ik2 - Inkling 2 on CUDA - has no --layer-split and stops at a flag it does not know: its two GPUs are its
-    #  own --gpus 2 with IK2_EP / IK2_TP, as the config has them.  Inkling 2's AMD engine, maya-inkling2, takes it)
-    own_split = Path(str(cfg.get("exe", ""))).name.startswith("maya-ik2")
+    # (maya-ik2 on NVIDIA has no --layer-split and stops at a flag it does not know: its two GPUs are its own --gpus 2
+    #  with IK2_EP / IK2_TP, as the config has them.  Its AMD build (src/ik2/hip) takes it)
+    own_split = models.family(cfg) == "ik2" and not models.ik2_amd(cfg)
     if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and not own_split:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     # --parallel N: each extra conversation's rings and KV come out of the experts' room, and the prompt path
@@ -3833,7 +3833,7 @@ class Service:
                                  "the card has room for a picture beside the model), so it cannot read images or "
                                  "videos: send the request without them (describe the picture in text instead)")
             if self.vision is None and getattr(self.template, "inkling", False):
-                # Inkling 2: its engines (maya-ik2, maya-inkling2) have no vision tower yet (the GGUF leaves it out;
+                # Inkling 2: maya-ik2 has no vision tower yet, on NVIDIA or AMD (the GGUF leaves it out;
                 # unsloth's mmproj is not read)
                 raise ValueError(f"{inkling_text_only(self.engine)} reads text only for now, so it cannot read images or "
                                  "videos: send the request without them (describe the picture in text instead)")
@@ -7178,7 +7178,7 @@ def chat_template_path(tpath) -> Path:
     DeepSeek's are tools/mm3's and tools/ds4's - DeepSeek's rendered by its pinned encoder, serve/ds41_encoding.py -
     CYBER-FROST's its own, verbatim), a GLM-5 pack's swapped for serve/glm5_chat_template.jinja (MAYA_PACK_TEMPLATE=1
     keeps the pack's), and serve/chat_template.jinja when the tokenizer has none.  An Inkling 2 tokenizer that holds
-    the GGUF's template (the llama.cpp conversion's, which differs - a maya-inkling2 pack made before its tool wrote
+    the GGUF's template (the llama.cpp conversion's, which differs - an AMD pack (maya-ik2's HIP build) made before its tool wrote
     the official one, or a strata_tokenizer.py run without --chat-template): thinkingmachines' own,
     tools/ik2/chat_template.jinja, the one ChatTemplate.inkling reads (MAYA_PACK_TEMPLATE=1 keeps the pack's)."""
     tpl = Path(tpath) / "chat_template.jinja"

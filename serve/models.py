@@ -15,10 +15,10 @@ A config's settings, as the page shows them (None: the engine's own default, or 
              prefill_chunk, cpu_threads, kv ("auto" | "q8": the latent cache's rows, --kv - 8-bit rows are the setup's
              opt-in faster drafting on a small card, "f16" kept where a config has it); images (the pack's mmproj
              file: --vision off when off); one answer at a time
-  Inkling 2 Small (family "ik2": maya-ik2 on NVIDIA, maya-inkling2 on AMD - text only, one answer at a time): context,
-             gpus, env; draft ("dspark" | "none": maya-inkling2's DSpark drafter, where its index is on this PC -
-             maya-ik2 has none); maya-inkling2's DeepSeek settings: reserve_mib, mmap, prefill_chunk, cpu_threads
-             and dspark_cum (its counterpart of DeepSeek's dspark_conf); maya-ik2's other flags stay as the config
+  Inkling 2 Small (family "ik2", its engine maya-ik2 - text only, one answer at a time): context, gpus, env; on
+             AMD (maya-ik2's HIP build, src/ik2/hip) also draft ("dspark" | "none": its DSpark drafter, where its
+             index is on this PC) and its DeepSeek settings: reserve_mib, mmap, prefill_chunk, cpu_threads and
+             dspark_cum (its counterpart of DeepSeek's dspark_conf); on NVIDIA the engine's flags stay as the config
              has them
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
@@ -53,10 +53,10 @@ CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does n
 # GLM engine's 256K, and maya-mm3's 256K (MiniMax-M3.1 is offered up to its 1M; past 256K it has not been run end to
 # end yet)
 # (maya-hy4: Tencent's own Q4_K_M run end to end up to 256K; Maya's sizes up to 32K so far - the model is trained for 1M)
-# (maya-inkling2: run end to end at --max-context 524288 with a 307,710-token prompt, and at 262144 through --serve with
+# (maya-ik2 on AMD, engine_kind ik2-hip: run end to end at --max-context 524288 with a 307,710-token prompt, and at 262144 through --serve with
 #  prompts up to 262,000 tokens - docs/INKLING2_AMD.md, "Long contexts"; 1M has not been run: on the PC it was measured
 #  on, 125 GB of RAM, its experts outside VRAM do not fit)
-CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 32768, "hy4-q4": 262144, "inkling2": 524288}
+CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 32768, "hy4-q4": 262144, "ik2-hip": 524288}
 CONTEXT_TESTED_DEFAULT = 262144
 QWEN_KV =("fp16", "int8", "k8v4", "q4_0")                        # the Qwen path's --kv
 MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --kv-cache (one format for K and V)
@@ -76,23 +76,23 @@ MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_c
             "cpu_threads", "reserve_gb", "prefill_chunk", "cache_gb", "dspark_conf")
 QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb")
 HY4_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "reserve_gb", "prefill_chunk", "cpu_threads", "kv")
-# (Inkling 2: maya-inkling2's DeepSeek settings beside them - DS4_KEYS' reserve_mib, mmap, prefill_chunk, cpu_threads,
-#  and dspark_cum, its counterpart of dspark_conf; maya-ik2's other flags stay as the config has them)
+# (Inkling 2: maya-ik2's AMD build's DeepSeek settings beside them - DS4_KEYS' reserve_mib, mmap, prefill_chunk,
+#  cpu_threads, and dspark_cum, its counterpart of dspark_conf; on NVIDIA the engine's flags stay as the config has them)
 IK2_KEYS = ("context", "images", "gpus", "env", "draft", "reserve_mib", "mmap", "prefill_chunk", "cpu_threads",
             "dspark_cum")
-IK2_AMD_ONLY = ("reserve_mib", "mmap", "prefill_chunk", "cpu_threads", "dspark_cum")   # (maya-ik2 has none of them)
-# Inkling 2 Small's DSpark drafter on AMD (maya-inkling2 --dspark-index): tools/inkling2/convert_dspark.py's Q8_0 index,
+IK2_AMD_ONLY = ("reserve_mib", "mmap", "prefill_chunk", "cpu_threads", "dspark_cum")   # (maya-ik2 on NVIDIA: none of them)
+# Inkling 2 Small's DSpark drafter on AMD (maya-ik2 --dspark-index): tools/ik2/convert_dspark.py's Q8_0 index,
 # in the folder the setup downloads Thinking Machines' mtp.safetensors into, beside the model's GGUF folder (maya.py's
 # IK2_MTP_DIR / IK2_DSPARK)
 IK2_MTP_DIR = "Inkling-2-Small-MTP"
-IK2_DSPARK = "maya-inkling2-dspark-q8_0"
-# maya-inkling2's VRAM a context position, from its allocations (src/inkling2/inkling2_model.cu) - the setup's
+IK2_DSPARK = "maya-ik2-dspark-q8_0"
+# maya-ik2's VRAM a context position on AMD, from its allocations (src/ik2/hip/ik2_hip_model.cu) - the setup's
 # (maya.py's ik2_kv_gb) and the Models page's Context size line (models.js' ik2Fields) both count these:
 #   IK2_KV_BYTES       all the GPUs together: the 8 global layers' K and V rows, 8 kv heads x 128 in F16 (dense_bytes'
 #                      cache_rows = max_ctx for a global layer) - the 40 sliding-window layers' rings are 5632 rows
 #                      whatever the context (n_swa 1024 + --rewind 4096 + the 512-token prompt chunk);
 #   IK2_ATTN_BYTES     each GPU: the decode step's attention scratch, S_need's attention_split_floats - n_head (48) x
-#                      (head_dim + 2) floats a 16-key tile (inkling2_kernels.cu), 48 x 130 x 4 / 16 bytes a position
+#                      (head_dim + 2) floats a 16-key tile (ik2_hip_kernels.cu), 48 x 130 x 4 / 16 bytes a position
 #                      once it outgrows its floor, the window's 9 rows over 4,096 keys (58 MB, past 37,152 positions);
 #                      the prompt path's scores add 48 x 6 bytes a position only past 961K (S_n's floor), left out;
 #   IK2_DSPARK_KV_BYTES  the drafter's, on the last GPU while it drafts: Dspark::ctx_bytes (its one global layer's K
@@ -340,14 +340,17 @@ def mm3_pack_has(cfg: dict, key: str) -> bool:
 
 
 def ik2_amd(cfg: dict) -> bool:
-    """An Inkling 2 Small config of the AMD engine, maya-inkling2 (the CUDA one, maya-ik2, has no drafter)."""
-    return Path(str(cfg.get("exe", ""))).name.startswith("maya-inkling2")
+    """An Inkling 2 Small config of maya-ik2's AMD build (src/ik2/hip: the drafter, DeepSeek's settings): the config's
+    backend, or the pack its build reads (--pack; on NVIDIA the engine reads the GGUF itself, --model)."""
+    if not Path(str(cfg.get("exe", ""))).name.startswith("maya-ik2"):
+        return False
+    return cfg.get("backend") == "hip" or flag(cfg.get("args") or [], "--pack") is not None
 
 
 def ik2_drafter(cfg: dict) -> Path | None:
-    """maya-inkling2's DSpark drafter (an index with its dspark.txt): the one the config drafts with (--dspark-index),
+    """maya-ik2's DSpark drafter (an index with its dspark.txt): the one the config drafts with (--dspark-index),
     else the one a setup converted beside the model - in its models folder (installer.models_dir), or where the
-    setup's layout puts it beside the pack (<models>/Inkling-2-Small-GGUF/<quant>/maya-inkling2).  None for maya-ik2,
+    setup's layout puts it beside the pack (<models>/Inkling-2-Small-GGUF/<quant>/maya-ik2).  None on NVIDIA,
     or when it is not on this PC."""
     if not ik2_amd(cfg):
         return None
@@ -434,7 +437,7 @@ def _choices(cfg: dict) -> dict:
     if family(cfg) == "hy4":                           # (images: the pack's mmproj file)
         return {"draft": (["mtp"] if hy4_has_mtp(cfg) else []) + (["dfly2"] if hy4_has_dfly2(cfg) else []) + ["none"],
                 "images": hy4_has_vision(cfg)}
-    if family(cfg) == "ik2":                           # (Inkling 2: text only; maya-inkling2 drafts with DSpark)
+    if family(cfg) == "ik2":                           # (Inkling 2: text only; on AMD maya-ik2 drafts with DSpark)
         return {"draft": ["dspark", "none"] if ik2_drafter(cfg) is not None else ["none"], "images": False,
                 "text_only": True, "drafting": ik2_amd(cfg)}   # ("drafting": the engine has the switch)
     if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
@@ -469,7 +472,7 @@ def settings_of(cfg: dict) -> dict:
                    cache_gb=_float(flag(args, "--cache-gb")), dspark_conf=_float(flag(args, "--dspark-conf")))
         return out
     if family(cfg) == "ik2":                           # (Inkling 2: text only)
-        # (maya-inkling2 drafts unless --dspark off / none, as maya-ds4, from the index --dspark-index names - none
+        # (maya-ik2 on AMD drafts unless --dspark off / none, as maya-ds4, from the index --dspark-index names - none
         #  named: no drafts)
         dspark, index = flag(args, "--dspark", "on"), flag(args, "--dspark-index")
         out.update(images=False, draft="dspark" if ik2_amd(cfg) and dspark not in ("off", "none") and index and
@@ -684,9 +687,9 @@ def apply(cfg: dict, settings: dict) -> dict:
         else:
             out.pop("env", None)
     elif fam == "ik2":
-        # (Inkling 2's engines: --max-context above, the GPUs, the env - and maya-inkling2's DSpark drafter: --dspark on
-        #  or none with its index, as DeepSeek's, which the setup wrote or ik2_drafter found; its DeepSeek settings as
-        #  DeepSeek's are written - empty: the engine's own.  maya-ik2 has neither: nothing written)
+        # (maya-ik2: --max-context above, the GPUs, the env - and on AMD its DSpark drafter: --dspark on or none with
+        #  its index, as DeepSeek's, which the setup wrote or ik2_drafter found; its DeepSeek settings as DeepSeek's
+        #  are written - empty: the engine's own.  On NVIDIA it has neither: nothing written)
         if s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: no DSpark drafter for this model on this PC (the setup downloads and converts "
                              "it)" if s.get("draft") == "dspark" else "Drafting: DSpark or none")
@@ -697,7 +700,7 @@ def apply(cfg: dict, settings: dict) -> dict:
         if not ik2_amd(cfg):
             given = [k for k in IK2_AMD_ONLY if s.get(k) not in (None, "")]
             if given:
-                raise ValueError(f"not a setting of maya-ik2: {', '.join(given)}")
+                raise ValueError(f"not a setting of maya-ik2 on NVIDIA: {', '.join(given)}")
         else:
             args = set_flag(args, "--reserve-mib", reserve) if reserve is not None else drop_flag(args, "--reserve-mib")
             if s.get("mmap") not in ("auto", "on", "off"):   # (DeepSeek's row: auto is the engine's own, not written)
@@ -981,7 +984,7 @@ def describe(path: Path, running: str | None) -> dict:
     cur = shown_settings(cfg)
     rng = context_range(trained_context_of(cfg), cur.get("context"),
                         {"deepseek": "ds4", "minimax": "mm3", "hy4": "hy4-q4" if hy4_plain(cfg) else "hy4",
-                         "ik2": "inkling2" if ik2_amd(cfg) else ""}.get(family(cfg), ""))
+                         "ik2": "ik2-hip" if ik2_amd(cfg) else ""}.get(family(cfg), ""))
     hy4_fits = hy4_contexts(cfg) if family(cfg) == "hy4" else []
     if family(cfg) == "hy4" and not hy4_plain(cfg):
         rng["max"] = min(rng["max"], max(hy4_fits + [CONTEXT_MIN, int(cur.get("context") or 0)]))
@@ -991,7 +994,7 @@ def describe(path: Path, running: str | None) -> dict:
     # line (the page's GLM_KV_BYTES is GLM-5.3-Flash's) - keys only its configs have
     own = {"shown": G53.LABEL, "kv_bytes": glm53_kv_bytes(cfg)} if G53.config_is_glm_dsa(cfg) else {}
     if family(cfg) == "ik2" and ik2_amd(cfg):
-        # (maya-inkling2: its VRAM a context position - all the GPUs' caches, each GPU's attention scratch, the
+        # (maya-ik2 on AMD: its VRAM a context position - all the GPUs' caches, each GPU's attention scratch, the
         #  drafter's while it drafts - and the drafter's own VRAM, for the Context size line and the Drafting hint)
         own = {"kv_bytes": IK2_KV_BYTES, "kv_gpu_bytes": IK2_ATTN_BYTES, "dspark_kv_bytes": IK2_DSPARK_KV_BYTES,
                "dspark_gb": IK2_DSPARK_GB}

@@ -1,6 +1,6 @@
-"""tools/test_setup_ik2.py - the setup's Inkling 2 Small (maya.py's set_up_ik2), on AMD only (maya-inkling2; on NVIDIA
+"""tools/test_setup_ik2.py - the setup's Inkling 2 Small (maya.py's set_up_ik2), on AMD only (maya-ik2; on NVIDIA
 the model's engine is maya-ik2, which has no setup: said, and nothing else happens): its files pinned
-(tools/inkling2/download.json - unsloth's UD-Q2_K_XL and the model's DSpark drafter), the names it is asked for by,
+(tools/ik2/download.json - unsloth's UD-Q2_K_XL and the model's DSpark drafter), the names it is asked for by,
 the memory it needs (VRAM + RAM, derived as DS4_MEMORY_GB: below it said, as DeepSeek's setup says it), the context
 recommended as DeepSeek's (64K up to 256K by this PC's memory; offered from 32K up to the model's 1M), files already
 there used as they are (the set, the drafter's index, a pack built by hand: no download, no conversion, nothing packed
@@ -27,9 +27,9 @@ import maya  # noqa: E402
 import maya_quants as Q  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-TABLE = json.loads((ROOT / "tools" / "inkling2" / "download.json").read_text(encoding="utf-8"))   # (as committed)
+TABLE = json.loads((ROOT / "tools" / "ik2" / "download.json").read_text(encoding="utf-8"))   # (as committed)
 AMD = [{"index": i, "name": "Radeon AI PRO R9700", "arch": "gfx1201", "vram_gb": 32.0} for i in range(4)]
-DSPARK_GGUF = "Inkling-2-Small-DSpark-Q8_0.gguf"                    # (tools/inkling2/convert_dspark.py's Q8_0 copy)
+DSPARK_GGUF = "Inkling-2-Small-DSpark-Q8_0.gguf"                    # (tools/ik2/convert_dspark.py's Q8_0 copy)
 
 
 def args(**kw):
@@ -91,7 +91,7 @@ class Layout:
     def make_index(self):
         ix = self.mtp / maya.IK2_DSPARK
         ix.mkdir(exist_ok=True)
-        (ix / "dspark.txt").write_text("format maya-inkling2-dspark 1\nmodel_dir ..\n", encoding="utf-8")
+        (ix / "dspark.txt").write_text("format maya-ik2-dspark 1\nmodel_dir ..\n", encoding="utf-8")
         (ix / "tensors.txt").write_text(f"file 0 {DSPARK_GGUF}\nt x F32 0 0 4 1\n", encoding="utf-8")
         (self.mtp / DSPARK_GGUF).write_bytes(b"GGUF")
         return ix
@@ -121,7 +121,7 @@ class Manifest(unittest.TestCase):
         files = sum(maya.ik2_entry()["files"].values()) / 2**30
         self.assertAlmostEqual(files, 190.9, delta=0.05)
         self.assertEqual(maya.IK2_MEMORY_GB, math.ceil(files + maya.IK2_RAM_MARGIN_GIB + 3.47e9 / 2**30))
-        src = (ROOT / "src" / "inkling2" / "inkling2_model.cu").read_text(encoding="utf-8")
+        src = (ROOT / "src" / "ik2" / "hip" / "ik2_hip_model.cu").read_text(encoding="utf-8")
         self.assertIn("double gib = 8.0;", src)                       # (the engine's ram_margin(): the same 8 GiB)
         self.assertEqual(maya.IK2_RAM_MARGIN_GIB, 8)
 
@@ -156,7 +156,7 @@ class PackKeys(unittest.TestCase):
 
     def test_required(self):
         import importlib.util
-        spec = importlib.util.spec_from_file_location("ik2_pack_gguf", ROOT / "tools" / "inkling2" / "pack_gguf.py")
+        spec = importlib.util.spec_from_file_location("ik2_pack_gguf", ROOT / "tools" / "ik2" / "pack_gguf.py")
         pg = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(pg)
         geo = pg.geometry(dict(self.KV), None)
@@ -167,7 +167,7 @@ class PackKeys(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(SystemExit) as e:
                 pg.geometry(kv, None)
             self.assertIn(key, str(e.exception))
-        hpp = (ROOT / "src" / "inkling2" / "inkling2_pack.hpp").read_text(encoding="utf-8")
+        hpp = (ROOT / "src" / "ik2" / "hip" / "ik2_hip_pack.hpp").read_text(encoding="utf-8")
         self.assertIn('{"expert_weights_scale", "final_logit_softcapping", "log_scaling_n_floor", "bos", "eos"}', hpp)
         for fallback in ('num("expert_weights_scale", 1.0)', 'num("final_logit_softcapping", 0.0)',
                          'num("log_scaling_n_floor", 1)', 'num("bos", -1)', 'num("eos", -1)'):
@@ -216,7 +216,7 @@ class NotOnNvidia(unittest.TestCase):
             self.assertIn("AMD GPUs", out.getvalue())
             self.assertIn("docs/INKLING2.md", out.getvalue())
             if backend == "cuda":
-                self.assertIn("on NVIDIA its engine is maya-ik2, which has no setup yet", out.getvalue())
+                self.assertIn("on NVIDIA maya-ik2 has no setup yet", out.getvalue())
 
     def test_amd_goes_on(self):
         with patch.object(maya, "check_hip_pc", return_value={"backend": "hip"}) as hip, quiet():
@@ -237,9 +237,9 @@ class Context(unittest.TestCase):
         too: the global layers' K / V rows (dense_bytes' cache_rows), each GPU's attention scratch (S_need's
         attention_split_floats: n_head x (head_dim + 2) floats a 16-key tile) and the drafter's (Dspark::ctx_bytes)."""
         from serve import models
-        src = ROOT / "src" / "inkling2"
-        model = (src / "inkling2_model.cu").read_text(encoding="utf-8")
-        kern = (src / "inkling2_kernels.cu").read_text(encoding="utf-8")
+        src = ROOT / "src" / "ik2" / "hip"
+        model = (src / "ik2_hip_model.cu").read_text(encoding="utf-8")
+        kern = (src / "ik2_hip_kernels.cu").read_text(encoding="utf-8")
         self.assertIn("? (size_t) (g.n_swa + o.rewind + Tc) : (size_t) o.max_ctx;", model)   # (a global layer: max_ctx)
         self.assertIn("cache_rows(il) * kvd * 2 * 2", model)            # (K and V, F16)
         self.assertIn("k::attention_split_floats(g.n_head, g.head_dim, (int64_t) max_keys)", model)
@@ -247,7 +247,7 @@ class Context(unittest.TestCase):
         self.assertEqual(models.IK2_ATTN_BYTES, 1560)
         self.assertEqual(models.IK2_DSPARK_KV_BYTES, 6400)
         self.assertIn("return 2 * 8 * 128 * 2 + (size_t) kBlock * 48 * (4 + 2);",
-                      (src / "inkling2_dspark.hpp").read_text(encoding="utf-8"))
+                      (src / "ik2_hip_dspark.hpp").read_text(encoding="utf-8"))
         self.assertEqual((maya.IK2_KV_BYTES, maya.IK2_ATTN_BYTES, maya.IK2_DSPARK_KV_BYTES),
                          (models.IK2_KV_BYTES, models.IK2_ATTN_BYTES, models.IK2_DSPARK_KV_BYTES))
 
@@ -255,7 +255,7 @@ class Context(unittest.TestCase):
         """The setup's and the page's figure: one, the measured 3.47 GB - the engine needs none (it places its experts
         after the drafter is in, in what is left)."""
         from serve import models
-        hpp = (ROOT / "src" / "inkling2" / "inkling2_model.hpp").read_text(encoding="utf-8")
+        hpp = (ROOT / "src" / "ik2" / "hip" / "ik2_hip_model.hpp").read_text(encoding="utf-8")
         self.assertNotIn("dspark_reserve_gb", hpp)
         self.assertEqual(maya.IK2_DSPARK_GB, models.IK2_DSPARK_GB)
         self.assertEqual(models.IK2_DSPARK_GB, 3.47)
@@ -357,7 +357,7 @@ class Files(unittest.TestCase):
             self.assertEqual(maya.ik2_drafter_step(args(), lay.mtp, lay.shards[0], Path("/llama")),
                              lay.mtp / maya.IK2_DSPARK)
         cmd = ran[0]
-        self.assertTrue(cmd[1].endswith("tools/inkling2/convert_dspark.py"))
+        self.assertTrue(cmd[1].endswith("tools/ik2/convert_dspark.py"))
         self.assertEqual(cmd[cmd.index("--mtp") + 1], str(lay.mtp))
         self.assertEqual(cmd[cmd.index("--type") + 1], "q8_0")         # (the copy the engine loads)
         self.assertEqual(cmd[cmd.index("--tokenizer-gguf") + 1], str(lay.shards[0]))
@@ -395,7 +395,7 @@ class Files(unittest.TestCase):
             ran = []
             with patch.object(maya, "run", lambda cmd, *x, **k: ran.append([str(c) for c in cmd])), quiet():
                 maya.ik2_pack_step(a, lay.d, lay.shards)
-            self.assertTrue(ran and ran[0][1].endswith("tools/inkling2/pack_gguf.py"))
+            self.assertTrue(ran and ran[0][1].endswith("tools/ik2/pack_gguf.py"))
             self.assertEqual(ran[0][ran[0].index("--out") + 1], str(pack))
             self.assertEqual(ran[0][ran[0].index("--files") + 1:], [s.name for s in lay.shards])
             rec = json.loads((pack / maya.PACK_SOURCES).read_text(encoding="utf-8"))
@@ -424,7 +424,7 @@ class Files(unittest.TestCase):
         (pack / "default.prof").unlink()
         (pack / "inkling2.txt").write_text("n_layer 4\nn_expert 384\n", encoding="utf-8")   # (another geometry)
         self.assertIsNone(maya.ik2_seed_profile(pack))
-        src = (ROOT / "src" / "inkling2" / "inkling2_model.cu").read_text(encoding="utf-8")
+        src = (ROOT / "src" / "ik2" / "hip" / "ik2_hip_model.cu").read_text(encoding="utf-8")
         self.assertIn('o.pack + "/expert-profile.bin"', src)          # (the engine's default: the same file)
         self.assertIn('o.pack + "/default.prof"', src)
 
@@ -449,7 +449,7 @@ class Config(unittest.TestCase):
             path = maya.write_config_ik2(a or args(), PC, {"lib_dirs": ["/opt/rocm/lib"]}, self.lay.d / maya.IK2_PACK,
                                          262144, self.lay.models, self.lay.d,
                                          self.lay.mtp / maya.IK2_DSPARK if index else None)
-        self.assertEqual(path, self.root / "maya-inkling2-hip.json")
+        self.assertEqual(path, self.root / "maya-ik2-hip.json")
         return json.loads(path.read_text(encoding="utf-8"))
 
     def test_fresh(self):
@@ -473,7 +473,7 @@ class Config(unittest.TestCase):
         from serve import models
         self.assertEqual(models.choices(cfg)["draft"], ["dspark", "none"])
         self.assertEqual(models.settings_of(cfg)["draft"], "none")
-        self.assertTrue((self.root / "run-maya-inkling2-hip.sh").is_file())
+        self.assertTrue((self.root / "run-maya-ik2-hip.sh").is_file())
         # (DeepSeek's speed calibration takes it: the drafter is there, nothing measured yet)
         self.assertTrue(maya.CDS.has_drafter(cfg))
         self.assertTrue(maya.needs_speed_calibration(cfg))
@@ -489,11 +489,11 @@ class Config(unittest.TestCase):
         self.assertFalse(maya.needs_speed_calibration(none))
 
     def test_again_keeps_what_it_does_not_ask(self):
-        old = {"exe": "/x/maya-inkling2", "args": ["--pack", "/old", "--max-context", "32768", "--reserve-mib", "900",
+        old = {"exe": "/x/maya-ik2", "args": ["--pack", "/old", "--max-context", "32768", "--reserve-mib", "900",
                                                    "--cpu-threads", "16", "--expert-profile", "/p.prof",
                                                    "--dspark-cum", "0.4", "--mmap-experts", "on"],
                "host": "0.0.0.0", "api_key": "k", "env": {"A": "1"}, "port": 9000, "reasoning_effort": "high"}
-        (self.root / "maya-inkling2-hip.json").write_text(json.dumps(old), encoding="utf-8")
+        (self.root / "maya-ik2-hip.json").write_text(json.dumps(old), encoding="utf-8")
         cfg = self.write(args(env=["B=2"]))
         for f, v in (("--reserve-mib", "900"), ("--cpu-threads", "16"), ("--expert-profile", "/p.prof"),
                      ("--dspark-cum", "0.4"), ("--mmap-experts", "on"), ("--max-context", "262144"),
@@ -514,7 +514,7 @@ class Config(unittest.TestCase):
         hip_reserve_mib."""
         self.assertEqual(maya.flag_value(self.write(args(vram_reserve_mib=900))["args"], "--reserve-mib"), "900")
         self.assertEqual(maya.flag_value(self.write()["args"], "--reserve-mib"), "900")   # (a setup again keeps it)
-        (self.root / "maya-inkling2-hip.json").unlink()
+        (self.root / "maya-ik2-hip.json").unlink()
         apu = [dict(AMD[0], unified_memory=True)]
         with patch.object(maya, "hip_unified_memory", lambda g: bool(g.get("unified_memory"))), \
                 patch.dict(PC, gpus=apu):
@@ -562,7 +562,7 @@ class SetUp(unittest.TestCase):
         path, out = self.run_setup(lay, args(model=maya.IK2, models_dir=str(lay.models)))
         self.assertIsNotNone(path, out)
         self.assertEqual(lay.files(), before)
-        self.assertEqual(self.built, ["maya-inkling2"])
+        self.assertEqual(self.built, ["maya-ik2"])
         cfg = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(maya.flag_value(cfg["args"], "--dspark-index"), str(lay.mtp / maya.IK2_DSPARK))
         self.assertEqual(maya.flag_value(cfg["args"], "--max-context"), "262144")    # (recommended as DeepSeek: 256K, the most)
@@ -578,7 +578,7 @@ class SetUp(unittest.TestCase):
         self.assertIsNotNone(path, out)
         self.assertIn(f"below the ~{maya.IK2_MEMORY_GB} GB", out)
         self.assertIn("read in place from the model's files", out)
-        self.assertEqual(self.built, ["maya-inkling2"])
+        self.assertEqual(self.built, ["maya-ik2"])
 
     def test_drafting_as_deepseeks(self):
         """--drafting on / off: written, the calibration skipped (installer.speed_calibration records the choice);
@@ -613,12 +613,12 @@ class Engine(unittest.TestCase):
                 patch.object(maya, "compile_engine_hip") as comp:
             (Path(t) / "MAYA-BUILD.json").write_text(json.dumps({"src": "old", "archs": ["gfx1201"], "rocm": "/r",
                                                                 "llama": str(ROOT / "third_party" / "llama.cpp"),
-                                                                "targets": ["maya-inkling2"]}), encoding="utf-8")
+                                                                "targets": ["maya-ik2"]}), encoding="utf-8")
             if not (ROOT / "third_party" / "llama.cpp" / "ggml" / "CMakeLists.txt").exists():
                 self.skipTest("no llama.cpp checkout")
             maya.refresh_engine(cfg)
-        self.assertEqual(comp.call_args.kwargs["target"], "maya-inkling2")
-        self.assertIn("maya-inkling2", maya.ENGINE_PROCESSES)
+        self.assertEqual(comp.call_args.kwargs["target"], "maya-ik2")
+        self.assertIn("maya-ik2", maya.ENGINE_PROCESSES)
 
 
 class ModelsPage(unittest.TestCase):

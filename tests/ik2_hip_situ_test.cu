@@ -1,10 +1,10 @@
-// tests/inkling2_situ_test.cu - Inkling 2's expert activation (SITU: ds4_iq.cuh's kActSitu, llama.cpp's LLM_FFN_SITU)
+// tests/ik2_hip_situ_test.cu - Inkling 2's expert activation (SITU: ds4_iq.cuh's kActSitu, llama.cpp's LLM_FFN_SITU)
 // on maya-ds4's ggml block-type kernels and the CPU lane, no model:
 //   a = beta tanh(g / beta) sigmoid(g) * (lb > 0 ? lb tanh(u / lb) : u)      (Inkling 2: beta 4, lb 25)
 // Random experts at Inkling 2 Small's shapes (n_embd 4608, n_ff 2304; the GGUF's fused gate_up tensor of an expert -
 // rows 0..2303 the gate, 2304..4607 the up - in ds4_iq's blob layout: tr[1] = tr[0] + 2304 row_bytes, then the down),
 // quantized by ggml to its layers' types (layers 0-39: gate_up IQ2_XS, down IQ3_XXS; 40-47: IQ3_XXS, IQ4_XS), 24
-// experts, 8 picks a token (a skewed routing: some experts of many rows, some of few).  Each form maya-inkling2 takes -
+// experts, 8 picks a token (a skewed routing: some experts of many rows, some of few).  Each form maya-ik2 takes -
 // the token form (a plan: a decode step), the window form (grouped entries: a verify window, a few prompt rows), the
 // prompt form (the sets: the light experts of <= 16 rows and the GEMM tiles) for 1 / 8 / 16 / 64 rows (the sets also
 // 160) and the CPU lane (iq_cpu_gate_up / iq_cpu_down with IqCpu::act) - against a double-precision reference over
@@ -15,12 +15,12 @@
 // and the window form's entries bit for bit the token form's (as with SwiGLU), every form again with other parameters
 // (beta 2.5, lb 0: not the structs' defaults), iq::situ_f16 against the reference, and what the dispatch refuses.
 // The environment picks the paths a run takes: MAYA_DS4_NO_TC=1 the F32 tiles, MAYA_DS4_NO_LIGHT=1 no light experts,
-// DS4_IQ_TC_RM=4 the tensor-core tiles of 256 rows, DS4_IQ_OWN=0 the CPU lane's ggml rows (cmake/inkling2_kernels.cmake
+// DS4_IQ_TC_RM=4 the tensor-core tiles of 256 rows, DS4_IQ_OWN=0 the CPU lane's ggml rows (cmake/ik2_hip_kernels.cmake
 // runs each).
 //
 // --dump FILE / --check FILE: the existing activations (DeepSeek's clamped SwiGLU, MiniMax's swigluoai with gate and up
-// of one type and of two) through every form and type, written / compared bit for bit - built as inkling2_situ_dump
-// (INKLING2_SITU_LEGACY_ONLY: this file against ds4_iq's API before kActSitu), run before and after a change to ds4_iq.
+// of one type and of two) through every form and type, written / compared bit for bit - built as ik2_hip_situ_dump
+// (IK2_HIP_SITU_LEGACY_ONLY: this file against ds4_iq's API before kActSitu), run before and after a change to ds4_iq.
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -149,7 +149,7 @@ void make_pool(Pool& p, int type, int k, int n, float sigma, uint64_t seed) {
     });
 }
 
-// A layer's experts in ds4_iq's blob layout as maya-inkling2 places Inkling's: an expert's GGUF gate_up tensor (rows
+// A layer's experts in ds4_iq's blob layout as maya-ik2 places Inkling's: an expert's GGUF gate_up tensor (rows
 // 0..F-1 the gate, F..2F-1 the up: tr[1] = tr[0] + F row_bytes) then its down; expert e's rows are the pools' rows in
 // an order of its own (a rotation by e), so every expert differs
 struct Layer {
@@ -252,7 +252,7 @@ iq::Args base_args(const Layer& L, const Act& c) {
     a.tu = L.tu == L.tg ? 0 : L.tu;
     a.act = c.act;
     a.pexp = c.pexp;
-#if !defined(INKLING2_SITU_LEGACY_ONLY)
+#if !defined(IK2_HIP_SITU_LEGACY_ONLY)
     a.situ_beta = c.beta;
     a.situ_lb = c.lb;
 #endif
@@ -411,7 +411,7 @@ bool set_form(const Layer& L, const Act& c, const std::vector<float>& x, const R
     sa.act = c.act;
     sa.tu = L.tu == L.tg ? 0 : L.tu;
     sa.graw = sa.tu != 0 ? dgraw.p : nullptr;
-#if !defined(INKLING2_SITU_LEGACY_ONLY)
+#if !defined(IK2_HIP_SITU_LEGACY_ONLY)
     sa.situ_beta = c.beta;
     sa.situ_lb = c.lb;
 #endif
@@ -626,7 +626,7 @@ int dump_main(bool check, const char* path) {
             std::fprintf(stderr, "cannot write %s\n", path);
             return 2;
         }
-        std::printf("inkling2_situ: %zu outputs (%zu bytes) of the existing activations written to %s%s\n",
+        std::printf("ik2_hip_situ: %zu outputs (%zu bytes) of the existing activations written to %s%s\n",
                     d.items.size(), bytes, path, fails ? " - with FAILURES" : "");
         return fails ? 1 : 0;
     }
@@ -652,12 +652,12 @@ int dump_main(bool check, const char* path) {
             std::printf("  DIFFERS: %s (%zu of %zu bytes)\n", name.c_str(), nd, b.size());
         }
     }
-    std::printf("inkling2_situ: %zu outputs (%zu bytes) of the existing activations against %s: %d differ, %d missing\n",
+    std::printf("ik2_hip_situ: %zu outputs (%zu bytes) of the existing activations against %s: %d differ, %d missing\n",
                 d.items.size(), bytes, path, differ, missing);
     return differ || missing || fails ? 1 : 0;
 }
 
-#if !defined(INKLING2_SITU_LEGACY_ONLY)
+#if !defined(IK2_HIP_SITU_LEGACY_ONLY)
 // ---------------------------------------------------------------- SITU against the double reference
 // The pools' rows dotted with every token's input, in double: exact (x as given), with x as the token / window / light
 // forms round it (int8 per 32) and as the CPU lane does (its Q8_K); and each token's routed output, exact
@@ -1036,7 +1036,7 @@ int main(int argc, char** argv) {
     const std::string mode = argc >= 2 ? argv[1] : "";
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
-        std::printf("inkling2_situ_test: no GPU, skipped\n");
+        std::printf("ik2_hip_situ_test: no GPU, skipped\n");
         return 77;
     }
     if (mode == "--dump" || mode == "--check") {
@@ -1046,7 +1046,7 @@ int main(int argc, char** argv) {
         }
         return dump_main(mode == "--check", argv[2]);
     }
-#if defined(INKLING2_SITU_LEGACY_ONLY)
+#if defined(IK2_HIP_SITU_LEGACY_ONLY)
     std::fprintf(stderr, "usage: %s --dump|--check FILE (this build: the existing activations only)\n", argv[0]);
     return 2;
 #else
@@ -1056,9 +1056,9 @@ int main(int argc, char** argv) {
     cudaDeviceProp prop{};
     CU(cudaGetDeviceProperties(&prop, 0));
 #if defined(STRATA_USE_HIP)
-    std::printf("inkling2_situ_test on %s (%s)", prop.name, prop.gcnArchName);
+    std::printf("ik2_hip_situ_test on %s (%s)", prop.name, prop.gcnArchName);
 #else
-    std::printf("inkling2_situ_test on %s (sm_%d%d)", prop.name, prop.major, prop.minor);
+    std::printf("ik2_hip_situ_test on %s (sm_%d%d)", prop.name, prop.major, prop.minor);
 #endif
     const char* envs[] = {"MAYA_DS4_NO_TC", "MAYA_DS4_NO_LIGHT", "DS4_IQ_TC_RM", "DS4_IQ_OWN"};
     for (const char* e : envs)
@@ -1071,7 +1071,7 @@ int main(int argc, char** argv) {
     situ_refusals(s);
     std::printf("worst (max |err| / max |ref|): ");
     for (const auto& [k, w] : worst) std::printf(" %s h %.2e y %.2e;", k.c_str(), w.h, w.y);
-    std::printf("\ninkling2_situ_test: %s\n", fails ? "FAILED" : "ok");
+    std::printf("\nik2_hip_situ_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;
 #endif
 }

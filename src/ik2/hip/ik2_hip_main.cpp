@@ -1,17 +1,22 @@
-// src/inkling2/inkling2_main.cpp - maya-inkling2: Thinking Machines' Inkling 2 Small on the GPUs (inkling2_model.hpp).
+// src/ik2/hip/ik2_hip_main.cpp - maya-ik2's AMD build: Thinking Machines' Inkling 2 Small on the GPUs
+// (ik2_hip_model.hpp).  The CUDA build is src/ik2/ik2_main.cu (docs/INKLING2.md); this one runs on maya-ds4's ggml
+// block-type kernels (docs/INKLING2_AMD.md).
 //
-//   maya-inkling2 --pack <dir> --tokens 371,151451,... [--n-predict N]   greedy decode from token ids, with timings
-//   maya-inkling2 --pack <dir> --parity <reference dir>                  the reference's tokens one at a time, every
-//                                                                        tensor of its dump compared (llama.cpp's
-//                                                                        graph names: docs/INKLING2_AMD.md)
-//   maya-inkling2 --pack <dir> --serve                                    serve/server.py's line protocol
+//   maya-ik2 --pack <dir> --tokens 371,151451,... [--n-predict N]   greedy decode from token ids, with timings
+//   maya-ik2 --pack <dir> --parity <reference dir>                   the reference's tokens one at a time, every
+//                                                                    tensor of its dump compared (llama.cpp's
+//                                                                    graph names: docs/INKLING2_AMD.md)
+//   maya-ik2 --pack <dir> --serve                                    serve/server.py's line protocol
+//   (--model <the set's first .gguf> in place of --pack: the pack beside it, as the CUDA build is given the model)
 // Decoding drafts with the model's DSpark drafter unless --dspark off (draft_round below; docs/INKLING2_DSPARK.md).
-#include "inkling2_model.hpp"
+#include "ik2_hip_model.hpp"
 
 #include "mm3_os.hpp"
 #include "mm3_sample.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <filesystem>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -69,7 +74,7 @@ struct Ref {
         dir = d;
         std::ifstream f(dir + "/index.jsonl"), tk(dir + "/tokens.txt");
         if (!f || !tk) {
-            err = dir + ": no index.jsonl / tokens.txt (a reference dump: tools/inkling2/ref)";
+            err = dir + ": no index.jsonl / tokens.txt (a reference dump: tools/ik2/ref)";
             return false;
         }
         for (std::string line; std::getline(f, line);) {
@@ -233,7 +238,7 @@ int sample(const float* row, int V, const mm3::sample::Req& r, const std::vector
 // little where drafts are break-even and much where the text turns to code or prose - measured through the server:
 // rests of up to 128 rounds carried from a thinking block slept through most of the code after it.)
 // (a, b and t_draft's starting values, rest_len / its cap 32, the 8 rounds before judging, the 0.1 a / 0.3 a bars, the
-//  0.9 / 0.1 averages and b's 0.5 ms floor: each with an INKLING2_DRAFT_* override, read when a Drafting is made -
+//  0.9 / 0.1 averages and b's 0.5 ms floor: each with an IK2_HIP_DRAFT_* override, read when a Drafting is made -
 //  docs/INKLING2_AMD.md, "Values and their sources")
 double env_d(const char* k, double d) {
     const char* v = std::getenv(k);
@@ -241,13 +246,13 @@ double env_d(const char* k, double d) {
 }
 struct Drafting {
     bool on = false;
-    double a = env_d("INKLING2_DRAFT_A0", 30.0), b = env_d("INKLING2_DRAFT_B0", 7.0),
-           t_draft = env_d("INKLING2_DRAFT_T0", 10.0);   // ms: a token's pass, a window row more, a draft
+    double a = env_d("IK2_HIP_DRAFT_A0", 30.0), b = env_d("IK2_HIP_DRAFT_B0", 7.0),
+           t_draft = env_d("IK2_HIP_DRAFT_T0", 10.0);   // ms: a token's pass, a window row more, a draft
     double gain = 0.0;                          // ms a drafted round gains over plain steps (EMA)
-    int rest_len0 = (int) env_d("INKLING2_DRAFT_REST", 8), rest_max = (int) env_d("INKLING2_DRAFT_REST_MAX", 32),
-        warm = (int) env_d("INKLING2_DRAFT_WARM", 8);
-    double rest_gain = env_d("INKLING2_DRAFT_REST_GAIN", 0.1), reset_gain = env_d("INKLING2_DRAFT_RESET_GAIN", 0.3),
-           ema = env_d("INKLING2_DRAFT_EMA", 0.9), b_min = env_d("INKLING2_DRAFT_B_MIN", 0.5);
+    int rest_len0 = (int) env_d("IK2_HIP_DRAFT_REST", 8), rest_max = (int) env_d("IK2_HIP_DRAFT_REST_MAX", 32),
+        warm = (int) env_d("IK2_HIP_DRAFT_WARM", 8);
+    double rest_gain = env_d("IK2_HIP_DRAFT_REST_GAIN", 0.1), reset_gain = env_d("IK2_HIP_DRAFT_RESET_GAIN", 0.3),
+           ema = env_d("IK2_HIP_DRAFT_EMA", 0.9), b_min = env_d("IK2_HIP_DRAFT_B_MIN", 0.5);
     int n_d = 0, rest = 0, rest_len = rest_len0;
     int rest0 = 0;   // rounds without a draft after one whose drafts were not worth a window (--dspark-rest0; measured:
                      // 1 costs prose a sixth of its drafted rounds and gains thinking text nothing)
@@ -255,10 +260,10 @@ struct Drafting {
     long long rounds = 0, drafted = 0, offered = 0, accepted = 0, passes = 0, tokens = 0, khist[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     long long rested = 0;
     double draft_ms = 0, verify_ms = 0;
-    bool log = std::getenv("INKLING2_ROUND_LOG") != nullptr;
-    // INKLING2_MARGIN_LOG=1 (tests): a line a greedy token - the gap between the row's two largest logits (a near-tie
+    bool log = std::getenv("IK2_HIP_ROUND_LOG") != nullptr;
+    // IK2_HIP_MARGIN_LOG=1 (tests): a line a greedy token - the gap between the row's two largest logits (a near-tie
     // is where two runs whose experts sit differently may part)
-    bool margins = std::getenv("INKLING2_MARGIN_LOG") != nullptr;
+    bool margins = std::getenv("IK2_HIP_MARGIN_LOG") != nullptr;
 
     double cost(int T) const { return a + b * (T - 1); }
     int choose(const std::vector<float>& p, int n) const {
@@ -365,7 +370,7 @@ bool verdict(const float* row, int V, const mm3::sample::Req& r, const std::vect
 // penalties' history).  room: the tokens the request may still give out (>= 1).  out: the tokens after tok - the drafts
 // that stood, then the model's next - the last of them the next round's tok; `read`: the rows the context took (tok and
 // the kept drafts).  spec: this request drafts.
-bool draft_round(inkling2::Model& m, Drafting& dr, int tok, const mm3::sample::Req& r, const std::vector<int>& hist,
+bool draft_round(ik2hip::Model& m, Drafting& dr, int tok, const mm3::sample::Req& r, const std::vector<int>& hist,
                  std::mt19937_64& rng, long long room, bool spec, std::vector<int>& out, std::vector<float>& lg,
                  std::string& err) {
     out.clear();
@@ -462,11 +467,11 @@ bool draft_round(inkling2::Model& m, Drafting& dr, int tok, const mm3::sample::R
 // path's chunk costs more than that many steps)
 // spec: a request drafts unless it says (GEN spec=0|1), as maya-ds4's --dspark on / off; drafting: it may draft at
 // all (--dspark idle: the drafter fed, never asked)
-int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool spec_default, bool drafting, float cum_default,
+int serve(ik2hip::Model& m, const std::vector<int>& stops, int short_n, bool spec_default, bool drafting, float cum_default,
           int rest0) {
     for (const std::string& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
-    const inkling2::Stats& st = m.stats();
-    std::printf("INFO engine=inkling2 engine_kind=inkling2 model=Inkling-2-Small ctx=%lld vram_gb=%.2f dspark=%d mtp=0 "
+    const ik2hip::Stats& st = m.stats();
+    std::printf("INFO engine=ik2 engine_kind=ik2-hip model=Inkling-2-Small ctx=%lld vram_gb=%.2f dspark=%d mtp=0 "
                 "experts=%d experts_vram=%d\n", (long long) m.max_ctx(), st.vram_gb + m.dspark_vram_gb(),
                 m.dspark() && drafting && spec_default ? 1 : 0, st.experts_all, st.experts_vram);
     std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
@@ -477,7 +482,7 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool s
     std::vector<float> lgw;
     std::printf("READY %lld stop\n", (long long) m.max_ctx());
     std::fflush(stdout);
-    std::fprintf(stderr, "maya inkling2 serve: GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT\n");
+    std::fprintf(stderr, "maya ik2 serve: GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT\n");
     Lines lines;
     lines.start();
     std::vector<int> held;   // the tokens the context holds
@@ -519,7 +524,7 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool s
         // none: the last request's is cleared
         if (!m.set_logit_bias(bias, err)) {
             std::printf("ERR the logit bias: %s\n", err.c_str());
-            std::fprintf(stderr, "inkling2: the logit bias: %s\n", err.c_str());
+            std::fprintf(stderr, "ik2: the logit bias: %s\n", err.c_str());
             std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", n);
             std::fflush(stdout);
             continue;
@@ -559,7 +564,7 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool s
         held.assign(r.ids.begin(), r.ids.begin() + (long) m.end());
         if (!ok) {
             std::printf("ERR %s\n", err.c_str());
-            std::fprintf(stderr, "inkling2: %s\n", err.c_str());
+            std::fprintf(stderr, "ik2: %s\n", err.c_str());
             m.reset();
             held.clear();
         }
@@ -622,7 +627,7 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool s
             const int64_t at = m.end();
             if (!draft_round(m, dr, tok, r, held, rng, r.max_new - produced, spec, out, lgw, err)) {
                 std::printf("ERR %s\n", err.c_str());
-                std::fprintf(stderr, "inkling2: %s\n", err.c_str());
+                std::fprintf(stderr, "ik2: %s\n", err.c_str());
                 m.reset();
                 held.clear();
                 finish = "cancel";
@@ -633,7 +638,7 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool s
                 if (i + 1 < out.size()) {
                     if (more) held.push_back(out[i]);   // (a kept draft: the context read it)
                     else if (!m.keep((int) i + 1, err)) {   // (an end token among the kept drafts: the context ends before it)
-                        std::fprintf(stderr, "inkling2: %s\n", err.c_str());
+                        std::fprintf(stderr, "ik2: %s\n", err.c_str());
                         m.reset();
                         held.clear();
                     }
@@ -649,7 +654,7 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool s
         std::fflush(stdout);
         m.vram_notes("after a request");
         std::fprintf(stderr,
-                     "maya inkling2 serve: prompt %zu tokens = %zu reused (%zu held in common) + %zu read in %.0f ms (%.1f "
+                     "maya ik2 serve: prompt %zu tokens = %zu reused (%zu held in common) + %zu read in %.0f ms (%.1f "
                      "tok/s), %lld generated in %.0f ms (%.1f tok/s), %s; VRAM hit %.1f%%, CPU lane %.1f%%, %lld cache moves "
                      "so far\n",
                      n, from, lcp, n - from, (t1 - t0) * 1e3, t1 > t0 ? (double) (n - from) / (t1 - t0) : 0.0, produced,
@@ -658,22 +663,25 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool s
                      100.0 * (double) (st.cpu_experts - cpu0) / (double) std::max<int64_t>(1, st.experts - ex0),
                      (long long) st.swaps);
         if (dr.on) {
-            std::fprintf(stderr, "maya inkling2 serve: drafts %lld of %lld kept in %lld drafted rounds of %lld (%.2f tokens a pass), "
+            std::fprintf(stderr, "maya ik2 serve: drafts %lld of %lld kept in %lld drafted rounds of %lld (%.2f tokens a pass), "
                                  "k histogram", dr.accepted - d0.accepted, dr.offered - d0.offered, dr.drafted - d0.drafted,
                          dr.rounds - d0.rounds, (double) (dr.tokens - d0.tokens) / (double) std::max(1ll, dr.passes - d0.passes));
             for (int k = 0; k < 8; ++k) std::fprintf(stderr, " %lld", dr.khist[k] - d0.khist[k]);
             std::fprintf(stderr, "; draft %.1f ms a round, a pass %.1f + %.1f ms a row, rests %lld\n", dr.t_draft, dr.a, dr.b,
                          dr.rested - d0.rested);
         }
-        if (!m.save_profile(err)) std::fprintf(stderr, "inkling2: the expert profile: %s\n", err.c_str());
+        if (!m.save_profile(err)) std::fprintf(stderr, "ik2: the expert profile: %s\n", err.c_str());
     }
     return 0;
 }
 
 int usage() {
     std::fprintf(stderr,
-                 "maya-inkling2 --pack <dir> (--tokens <ids> [--n-predict N] | --parity <reference dir> [--parity <dir> ...])\n"
-                 "  --gpus 0,1,2,3      the GPUs (default: all)\n"
+                 "maya-ik2 (AMD build) --pack <dir> | --model <first .gguf> (--tokens <ids> [--n-predict N] | --serve\n"
+                 "           | --parity <reference dir> [--parity <dir> ...])\n"
+                 "  --pack DIR          the pack of the GGUF set (tools/ik2/pack_gguf.py: <the set's folder>/maya-ik2)\n"
+                 "  --model F           the GGUF set's first shard, as the CUDA build takes it: its folder's pack\n"
+                 "  --gpus N | 0,1,..   the first N GPUs, as the CUDA build's --gpus N, or these GPUs (default: all)\n"
                  "  --max-context N     positions the global layers' caches hold (default 32768)\n"
                  "  --reserve-mib N     VRAM each GPU keeps free, MiB (default 600)\n"
                  "  --vram-experts X    the share of a layer's experts in VRAM at most (default 1.0)\n"
@@ -688,7 +696,7 @@ int usage() {
                  "  --parity-max N      (parity) the first N positions only\n"
                  "  --parity-detail     (parity) a line a position and tensor\n"
                  "  --parity-decode     (parity) the prompt token by token (the decode path), not the prompt path\n"
-                 "  --prefill-chunk N   a prompt's tokens a chunk (default 512; 1: token by token)\n"
+                 "  --prefill-chunk N   a prompt's tokens a chunk (default 512; 1: token by token; --chunk N the same)\n"
                  "  --parity-force-picks  (parity) each reference a second time, every layer taking the reference's\n"
                  "                      picks (what is left is not the router's near-ties)\n"
                  "  --no-expert-cache   the experts stay where the load put them (no cache moves)\n"
@@ -708,14 +716,14 @@ int usage() {
                  "  --dspark on|off|none  the DSpark drafter (maya-ds4's): speculative decoding with it (on, the default),\n"
                  "                      loaded but a request drafts only when it asks (off: GEN spec=1), or not loaded\n"
                  "                      (none).  idle (tests; maya-ds4 has none): loaded and fed, never asked for drafts\n"
-                 "  --dspark-index DIR  its index (tools/inkling2/convert_dspark.py's maya-inkling2-dspark-q8_0; none given:\n"
+                 "  --dspark-index DIR  its index (tools/ik2/convert_dspark.py's maya-ik2-dspark-q8_0; none given:\n"
                  "                      decoding without drafts)\n"
                  "  --dspark-cum F      the floor on the running product of the drafts' probabilities (default 0.5; a\n"
                  "                      request's dspark_cum key)\n"
                  "  --temperature F / --seed N   (tests, with --tokens) sampled decoding\n"
                  "  --prompts F         (tests) a prompt a line (ids), each decoded from an empty context\n"
                  "  --ab                (tests) each prompt twice, without drafts and with them: the speeds, the tokens compared\n"
-                 "  --sweep VAR=a,b,..  (tests, with --prompts) each prompt's drafted decode with each value of the INKLING2_*\n"
+                 "  --sweep VAR=a,b,..  (tests, with --prompts) each prompt's drafted decode with each value of the IK2_HIP_*\n"
                  "                      override VAR (--sweep-rounds N times, 2 by default, the order reversed every other)\n"
                  "  --window-bits       (tests, with --window-test) which part of a window differs from the token steps\n"
                  "  --verbose\n");
@@ -725,7 +733,7 @@ int usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    inkling2::Options o;
+    ik2hip::Options o;
     std::vector<std::string> parities;
     std::string tokens;
     // (short_n: --short-bench after the 2.7k-token prompt, ms, prompt path / decode path: 3 tokens 118.7 / 95.9, 4 tokens
@@ -740,7 +748,7 @@ int main(int argc, char** argv) {
     std::vector<int> stops = {200006, 199999};
     std::string rewind_test, tokens_file, window_test, prompts_file;
     bool ab = false;
-    // (tests) --sweep VAR=v1,v2,..: the drafted decode of each prompt with each value of the INKLING2_* override VAR,
+    // (tests) --sweep VAR=v1,v2,..: the drafted decode of each prompt with each value of the IK2_HIP_* override VAR,
     // --sweep-rounds times (ABBA order); several --sweep: one after the other, each VAR unset after its own
     std::vector<std::pair<std::string, std::vector<std::string>>> sweeps;
     int sweep_rounds = 2;
@@ -751,11 +759,21 @@ int main(int argc, char** argv) {
     bool detail = false;   // (parity) a line a position and tensor
     bool force_only = false;   // (parity) that second run alone
     bool force_opt = false;   // (parity) a second run in which every layer takes the reference's picks
+    std::string model_gguf;   // (--model: the CUDA build's way to name the model - the pack beside it)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "--pack") o.pack = val();
-        else if (a == "--gpus") o.gpus = int_list(val());
+        else if (a == "--model") model_gguf = val();   // (maya-ik2's CUDA build's flag: the GGUF set's first shard)
+        else if (a == "--gpus") {   // (a count, as the CUDA build's --gpus N: the first N visible GPUs; or a list)
+            const std::string v = val();
+            if (v.find(',') == std::string::npos && !v.empty() && std::all_of(v.begin(), v.end(), ::isdigit)) {
+                o.gpus.clear();
+                for (int g = 0; g < std::atoi(v.c_str()); ++g) o.gpus.push_back(g);
+            } else {
+                o.gpus = int_list(v);
+            }
+        }
         else if (a == "--max-context" || a == "--ctx") o.max_ctx = std::atoll(val().c_str());
         else if (a == "--reserve-mib") o.reserve_mib = std::atoll(val().c_str());
         else if (a == "--vram-experts") o.vram_experts = std::atof(val().c_str());
@@ -811,7 +829,7 @@ int main(int argc, char** argv) {
         else if (a == "--short-bench") short_bench = true;
         else if (a == "--parity-detail") detail = true;
         else if (a == "--parity-decode") decode_only = true;
-        else if (a == "--prefill-chunk") o.prefill_chunk = std::atoi(val().c_str());
+        else if (a == "--prefill-chunk" || a == "--chunk") o.prefill_chunk = std::atoi(val().c_str());
         else if (a == "--parity-force-picks") force_opt = true;
         else if (a == "--parity-force-only") force_opt = force_only = true;
         else if (a == "--dspark") dspark = val();
@@ -820,6 +838,19 @@ int main(int argc, char** argv) {
         else if (a == "--temperature") temperature = std::strtof(val().c_str(), nullptr);
         else if (a == "--seed") seed = std::strtoull(val().c_str(), nullptr, 10);
         else return usage();
+    }
+    if (o.pack.empty() && !model_gguf.empty()) {   // (the setup's layout: <the set's folder>/maya-ik2)
+        const std::filesystem::path dir = std::filesystem::path(model_gguf).parent_path();
+        for (const char* name : {"maya-ik2", "maya-inkling2"})   // (maya-inkling2: the pack's name before)
+            if (std::filesystem::exists(dir / name / "inkling2.txt")) {
+                o.pack = (dir / name).string();
+                break;
+            }
+        if (o.pack.empty()) {
+            std::fprintf(stderr, "maya-ik2: no pack beside %s - tools/ik2/pack_gguf.py --model %s builds it (or "
+                                 "./maya.sh --setup)\n", model_gguf.c_str(), dir.string().c_str());
+            return 2;
+        }
     }
     if (o.pack.empty() || (parities.empty() && tokens.empty() && !serving && rewind_test.empty() && tokens_file.empty() &&
                            window_test.empty() && prompts_file.empty()))
@@ -835,24 +866,24 @@ int main(int argc, char** argv) {
                           tokens_file.empty();
     if (drafting) {
         if (dspark_index.empty()) {
-            std::fprintf(stderr, "maya-inkling2: no drafter given (--dspark-index): decoding without drafts\n");
+            std::fprintf(stderr, "maya-ik2: no drafter given (--dspark-index): decoding without drafts\n");
         } else if (std::ifstream(dspark_index + "/dspark.txt").good()) {
             o.dspark_index = dspark_index;
             o.dspark_cum = dspark_cum;
         } else {
-            std::fprintf(stderr, "maya-inkling2: no drafter at %s: decoding without drafts\n", dspark_index.c_str());
+            std::fprintf(stderr, "maya-ik2: no drafter at %s: decoding without drafts\n", dspark_index.c_str());
         }
     }
     for (const std::string& d : parities) {   // (a wrong folder: said before the load)
         Ref r;
         if (!r.load(d, err)) {
-            std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
+            std::fprintf(stderr, "maya-ik2: %s\n", err.c_str());
             return 1;
         }
     }
-    inkling2::Model model;
+    ik2hip::Model model;
     if (!model.load(o, err)) {
-        std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
+        std::fprintf(stderr, "maya-ik2: %s\n", err.c_str());
         return 1;
     }
     const bool swap_opt = o.expert_cache;
@@ -865,7 +896,7 @@ int main(int argc, char** argv) {
                                     dspark == "on" ? "" : " (fed, not asked)");
     if (!tokens_file.empty()) {
         // --tokens-file F: a prompt a line (ids), each read from an empty context and --n-predict tokens decoded after
-        // it - with --profile-out the routings of a corpus (data/expert-profile-inkling2.bin)
+        // it - with --profile-out the routings of a corpus (data/expert-profile-ik2.bin)
         std::ifstream tf(tokens_file);
         int np = 0;
         for (std::string line; std::getline(tf, line);) {
@@ -875,7 +906,7 @@ int main(int argc, char** argv) {
             model.reset();
             const double t0 = now_s();
             if (!model.forward(ids.data(), (int) ids.size(), 0, nullptr, err)) {
-                std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
+                std::fprintf(stderr, "maya-ik2: %s\n", err.c_str());
                 return 1;
             }
             const double t1 = now_s();
@@ -888,7 +919,7 @@ int main(int argc, char** argv) {
                         ids.size() / (t1 - t0), n, n / std::max(1e-9, now_s() - t1));
             std::fflush(stdout);
         }
-        if (!model.save_profile(err)) std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
+        if (!model.save_profile(err)) std::fprintf(stderr, "maya-ik2: %s\n", err.c_str());
         return 0;
     }
     if (!window_test.empty()) {
@@ -899,7 +930,7 @@ int main(int argc, char** argv) {
         if (!rf.load(window_test, err)) return 1;
         const int W = model.window_max(), V = model.vocab();
         if (W < 2) {
-            std::fprintf(stderr, "maya-inkling2: no verify windows in this configuration\n");
+            std::fprintf(stderr, "maya-ik2: no verify windows in this configuration\n");
             return 1;
         }
         auto cosine = [&](const float* a, const float* b) {
@@ -925,7 +956,7 @@ int main(int argc, char** argv) {
         }
         int bad = 0, n_bits = 0;
         if (model.rewind(P) != P || !model.window(gt.data(), W, P, tops.data(), lw.data(), err)) {
-            std::fprintf(stderr, "maya-inkling2: the window at %lld: %s\n", (long long) P, err.c_str());
+            std::fprintf(stderr, "maya-ik2: the window at %lld: %s\n", (long long) P, err.c_str());
             return 1;
         }
         std::printf("window of %d rows at position %lld against the same tokens a step each:\n", W, (long long) P);
@@ -946,7 +977,7 @@ int main(int argc, char** argv) {
         }
         // cut back to 4 rows, then the 5th token a step: its logits against the token steps'
         if (!model.keep(4, err) || !model.forward(&gt[4], 1, P + 4, l1.data(), err)) {
-            std::fprintf(stderr, "maya-inkling2: keep: %s\n", err.c_str());
+            std::fprintf(stderr, "maya-ik2: keep: %s\n", err.c_str());
             return 1;
         }
         {
@@ -1068,7 +1099,7 @@ int main(int argc, char** argv) {
             !run("diverges 37 before A's end", nA - 37, 64, 0, true) ||
             !run("diverges 2000 before A's end", nA - std::min<size_t>(2000, nA - 1), 300, 0, true) ||
             !run("diverges in the decoded part", nA, 50, 200, false) || !run("B is A and 5 more", nA, 5, 0, false)) {
-            std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
+            std::fprintf(stderr, "maya-ik2: %s\n", err.c_str());
             return 1;
         }
         return bad ? 3 : 0;
@@ -1160,7 +1191,7 @@ int main(int argc, char** argv) {
             }
             t0 = now_s();
             if (!model.forward(ids.data(), (int) ids.size(), 0, nullptr, err)) {
-                std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
+                std::fprintf(stderr, "maya-ik2: %s\n", err.c_str());
                 return 1;
             }
             t1 = now_s();
@@ -1186,7 +1217,7 @@ int main(int argc, char** argv) {
             std::vector<int> hist = ids, out;
             std::vector<float> lgw;
             if (temperature > 0.0f) {   // (the prompt's last row again for its logits: a token's step back)
-                std::fprintf(stderr, "maya-inkling2: --temperature: the first token is the greedy one\n");
+                std::fprintf(stderr, "maya-ik2: --temperature: the first token is the greedy one\n");
             }
             int tok = model.top();
             bool more = n_predict > 0;
@@ -1201,7 +1232,7 @@ int main(int argc, char** argv) {
             while (more) {
                 hist.push_back(tok);
                 if (!draft_round(model, dr, tok, rq, hist, rng, n_predict - n, true, out, lgw, err)) {
-                    std::fprintf(stderr, "\nmaya-inkling2: %s\n", err.c_str());
+                    std::fprintf(stderr, "\nmaya-ik2: %s\n", err.c_str());
                     return 1;
                 }
                 for (size_t i = 0; i < out.size() && more; ++i) {
@@ -1212,7 +1243,7 @@ int main(int argc, char** argv) {
             }
         }
         const double t2 = now_s();
-        const inkling2::Stats& st = model.stats();
+        const ik2hip::Stats& st = model.stats();
         model.vram_notes(dr.on ? "after a drafted decode" : "after a decode");
         if (n > 0) {
             std::printf("\ndecode: %d tokens, %.2f tok/s; %.1f%% of the routed experts on the CPU lane (%.1f ms a token), %lld "
@@ -1242,7 +1273,7 @@ int main(int argc, char** argv) {
         }
         std::fflush(stdout);
         }
-        if (!model.save_profile(err)) std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
+        if (!model.save_profile(err)) std::fprintf(stderr, "maya-ik2: %s\n", err.c_str());
         return 0;
     }
 
@@ -1361,7 +1392,7 @@ int main(int argc, char** argv) {
         const int64_t n = !decode_only && p == 0 ? std::min(total, np) : 1;
         cur_p = p + n - 1;
         if (!model.forward(&ids[(size_t) p], (int) n, p, logits.data(), err)) {
-            std::fprintf(stderr, "maya-inkling2: position %lld: %s\n", (long long) p, err.c_str());
+            std::fprintf(stderr, "maya-ik2: position %lld: %s\n", (long long) p, err.c_str());
             return 1;
         }
         p += n;
@@ -1425,7 +1456,7 @@ int main(int argc, char** argv) {
     std::printf("\nreference:    ");
     for (int tkn : ref.greedy) std::printf(" %d", tkn);
     std::printf("\ngreedy tokens the same: %d of %d\n", greedy_same, greedy_all);
-    const inkling2::Stats& st = model.stats();
+    const ik2hip::Stats& st = model.stats();
     std::printf("routed experts: %lld, %.1f%% on the CPU lane (%.2f ms a token)\n", (long long) st.experts,
                 100.0 * (double) st.cpu_experts / (double) std::max<int64_t>(1, st.experts),
                 st.cpu_ms / (double) std::max<int64_t>(1, st.tokens));
@@ -1442,6 +1473,6 @@ int main(int argc, char** argv) {
     if (full && !pass_ok) rc = 3;
     std::fflush(stdout);
     }
-    if (!model.save_profile(err)) std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
+    if (!model.save_profile(err)) std::fprintf(stderr, "maya-ik2: %s\n", err.c_str());
     return rc;
 }

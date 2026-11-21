@@ -1,6 +1,6 @@
-# Inkling 2 Small's DSpark drafter on Maya: the port spec (maya-inkling2)
+# Inkling 2 Small's DSpark drafter on Maya: the port spec (maya-ik2)
 
-Working spec for speculative decoding in `maya-inkling2` with Thinking Machines' own drafter (`mtp.safetensors`,
+Working spec for speculative decoding in `maya-ik2` with Thinking Machines' own drafter (`mtp.safetensors`,
 `mtp_config`). Companion to [INKLING2_AMD.md](INKLING2_AMD.md) (the target's forward pass, whose notation this
 uses: `rms(x)`, `rmsg(x, g)`, eps 1e-6). The equations are read from the reference's source; the acceptance rate and the tap / RoPE questions are measured
 on the reference (Measured); the cost model is arithmetic over measured routing, and a window's cost on our engine
@@ -28,12 +28,12 @@ Sources:
 | `mtp.safetensors`, `config.json` | Thinking Machines' checkpoint: 84 BF16 tensors, 3,423,420,768 bytes of weights |
 | `Inkling-2-Small-DSpark-BF16.gguf` (3.44 GB) | the matrices as they are; every 1-D tensor and `dspark_fuse` F32. Checked against the checkpoint to the bit |
 | `Inkling-2-Small-DSpark-Q8_0.gguf` (1.83 GB) | the matrices as ggml Q8_0 blocks, the rest F32. Checked: every value within its block's rounding |
-| `maya-inkling2-dspark-bf16/`, `maya-inkling2-dspark-q8_0/` | the engine's index of each: `dspark.txt` (geometry, `key value`), `tensors.txt` (`file 0 <gguf>`, then `t <name> <type> <file> <offset> <bytes> <ne...>`, the format of `tools/inkling2/pack_gguf.py`) |
+| `maya-ik2-dspark-bf16/`, `maya-ik2-dspark-q8_0/` | the engine's index of each: `dspark.txt` (geometry, `key value`), `tensors.txt` (`file 0 <gguf>`, then `t <name> <type> <file> <offset> <bytes> <ne...>`, the format of `tools/ik2/pack_gguf.py`) |
 
-Written by `tools/inkling2/convert_dspark.py` (no torch; 33 s niced for both):
+Written by `tools/ik2/convert_dspark.py` (no torch; 33 s niced for both):
 
 ```sh
-nice -n 19 python3 tools/inkling2/convert_dspark.py --mtp <models>/Inkling-2-Small-MTP \
+nice -n 19 python3 tools/ik2/convert_dspark.py --mtp <models>/Inkling-2-Small-MTP \
   --tokenizer-gguf <models>/Inkling-2-Small-GGUF/UD-Q2_K_XL/Inkling-2-Small-UD-Q2_K_XL-00001-of-00006.gguf
 ```
 
@@ -45,7 +45,7 @@ The GGUFs follow the PR's converter (`Inkling2DSparkModel`): architecture `dflas
 `tokenizer.ggml.mask_token_id 0`). The tokenizer keys are copied from the target's GGUF. Not yet loaded by a llama.cpp
 build - the first step of the parity plan.
 
-The engine should load the **Q8_0** file: `ds4_iq`'s GEMVs take Q8_0, while `inkling2_model.cu` expands BF16 to F32 in
+The engine should load the **Q8_0** file: `ds4_iq`'s GEMVs take Q8_0, while `ik2_hip_model.cu` expands BF16 to F32 in
 VRAM (4 bytes a weight: 6.4 GB read a block instead of 1.7). One caveat: `joint_proj.weight` has small weights, and
 46% of its Q8_0 blocks get an F16-subnormal step (coarser rounding, worst error 0.6% of a block's largest value).
 It is 15 MB: take it (and `dspark_hidden_out`) from the BF16 file if the drafts look worse than the reference's.
@@ -261,7 +261,7 @@ Reusable as is or nearly:
   should be the default rather than opt-in, because a row costs much more here (Cost model).
 - `strata::spec::SuffixDrafter` (prompt lookup): `verify` takes drafts from any source.
 - The acceptance rules: `strata::kernels::sample_tokens` / `sample_verify` / `SpecList` if the head's rows stay on
-  the device; today maya-inkling2 samples on the host (`mm3_sample.hpp`), where the same rules are a few lines.
+  the device; today maya-ik2 samples on the host (`mm3_sample.hpp`), where the same rules are a few lines.
 - `ds4_iq`'s Q8_0 GEMVs for every drafter matrix; the engine's own window K / V rings, global cache and chunk
   attention GEMMs (the drafter has the target's 48 / 8 / 128 geometry and window).
 - The shape of `seed_drafter` (taps -> context -> K / V -> ring, called from `verify` with the kept rows) and of
@@ -392,7 +392,7 @@ Expected speed against no drafting (Q8_0 folded, 7 ms), best window in brackets:
 ## Measured (2026-11-20, the reference run)
 
 llama.cpp PR #32218's head (842c10f61) in a worktree (`<llama.cpp>-dspark`, built in the
-ROCm container), with `tools/inkling2/ref/inkling-dspark-eval.cpp` (`examples/inkling-dspark-eval` there),
+ROCm container), with `tools/ik2/ref/inkling-dspark-eval.cpp` (`examples/inkling-dspark-eval` there),
 `dspark-eval-worktree.patch` (env-switched variants; the extra tap candidates) and `run_dspark_eval.sh`. Our GGUFs
 load in the PR's loader as they are. The PR head's target gives the reference's greedy tokens after the long prompt
 (`13 198 12`), so its older Inkling 2 code is good enough for this.
@@ -459,7 +459,7 @@ tokens of ours, which is why the fold and a device-side head loop matter. Inject
 
 ## In the engine (2026-11-20: wired, measured)
 
-`maya-inkling2` drafts by default (`--dspark on|off|none`, maya-ds4's, and `idle` for tests; `--dspark-index DIR`, `--dspark-cum F`; a request's
+`maya-ik2` drafts by default (`--dspark on|off|none`, maya-ds4's, and `idle` for tests; `--dspark-index DIR`, `--dspark-cum F`; a request's
 `spec=0|1` and `dspark_cum=F` keys). The module loads on the last GPU with the engine's own output matrix
 (`DsparkOptions::output_dev`); the engine keeps 3.09 GB of that GPU for it (`Options::dspark_reserve_gb`: what the
 drafter reports at a 32k context - the setup's and the Models page's figure too, serve/models.py's `IK2_DSPARK_GB`),
@@ -470,7 +470,7 @@ a tap (4, 10, ..., 40) publishes its rows to host memory the last GPU maps (the 
 head adds its input (the fused mix + norm, `result_norm`), one gather interleaves them. Two buffers by turns: the
 drafter reads the last step's on its own stream while the next step writes the other. The order is by construction, not by
 timing: `Dspark::feed_dev` records an event on the drafter's stream after its reads of a buffer, and the step that
-writes that buffer again waits on it on its own stream first (no measurable cost: `--sweep INKLING2_TAP_EVENT=1,0`,
+writes that buffer again waits on it on its own stream first (no measurable cost: `--sweep IK2_HIP_TAP_EVENT=1,0`,
 two rounds in ABBA order, prose 64.7 / 65.7 tok/s, code 55.6 / 56.0, thinking 38.4 / 38.3, within the runs' noise of
 3 - 10 tok/s). They are fed
 (`Dspark::feed_dev`) when the rows are kept - at the next draft, step or rewind - so `Model::keep` only shortens what
@@ -478,7 +478,7 @@ is pending. The prompt path does the same a chunk at a time (the taps through pi
 each; the head's mix + norm for every row), fed by the last GPU's stage. A rewind rolls the drafter back to the
 context's end (`Dspark::rollback`), its rings as long as the engine's.
 
-**A round** (`draft_round`, inkling2_main.cpp; the decode loop and `--serve` share it): `Model::draft(tok)` ->
+**A round** (`draft_round`, ik2_hip_main.cpp; the decode loop and `--serve` share it): `Model::draft(tok)` ->
 `Model::window([tok, d_1 .. d_k])` -> the verdicts -> `Model::keep(m + 1)` -> out: `d_1 .. d_m`, next.
 
 - The window: k maximizes (1 + sum_{i<=k} prod_{j<=i} p_j) / (t(k + 1) + t_draft), p the drafter's probabilities, under
@@ -494,7 +494,7 @@ context's end (`Dspark::rollback`), its rings as long as the engine's.
   long one sleeps through the code after a thinking block (measured through the server with rests up to 128 rounds).
 - An end token among the kept drafts: the context is cut back to before it (`keep`), as an undrafted answer leaves it.
 
-**The window's cost** (2.7k context, ms a pass; `--window-test`, `INKLING2_PHASES=1` for the parts):
+**The window's cost** (2.7k context, ms a pass; `--window-test`, `IK2_HIP_PHASES=1` for the parts):
 
 | T | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
 |---|---|---|---|---|---|---|---|---|---|
@@ -583,7 +583,7 @@ drafter's VRAM; a sampled window's logits go to the host a row (0.8 MB) for the 
    GGUF meets the PR's loader; a missing key or tensor shows here. If it balks, the fallback is the PR's own
    `convert_hf_to_gguf.py --dspark` on the checkpoint folder (it needs the model's tokenizer files beside
    `mtp.safetensors`), compared tensor by tensor with ours.
-4. **The dump tool**: `tools/inkling2/ref/inkling-dspark-dump.cpp`, built as `examples/inkling-dspark-dump` in the
+4. **The dump tool**: `tools/ik2/ref/inkling-dspark-dump.cpp`, built as `examples/inkling-dspark-dump` in the
    worktree: `examples/speculative-simple/speculative-simple.cpp` with `inkling-dump.cpp`'s `dump_cb` on both
    contexts (the draft context's `cb_eval` set in the `common_params` handed to
    `common_speculative_init_from_params`; its tensors written under `dft/`). Steps: the prompt as one batch
@@ -604,7 +604,7 @@ drafter's VRAM; a sampled window's logits go to the host a row (0.8 MB) for the 
      -md /models/Inkling-2-Small-MTP/Inkling-2-Small-DSpark-BF16.gguf --spec-type draft-dspark --spec-draft-n-max 7 \
      -fa on -c 4096 -b 4096 -ub 4096 -t 16 --temp 0 -n 512 -f /prompt/prompt-long.txt
    ```
-   (wrapped like `tools/inkling2/ref/run_dump.sh`, a second script `run_dspark_dump.sh`; a short-prompt run first.)
+   (wrapped like `tools/ik2/ref/run_dump.sh`, a second script `run_dspark_dump.sh`; a short-prompt run first.)
 5. **The acceptance rate**: the same binary without the filter (or `llama-speculative-simple`), 512 greedy tokens
    after the long prompt and after 2-3 chat / code prompts: `n_drafted`, `n_accept`, and from `rounds.jsonl` the
    kept / reached count **by draft position 1..7** - the table the break-even above needs. Then once with the Q8_0

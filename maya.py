@@ -92,7 +92,7 @@ import calibrate_ds4 as CDS  # noqa: E402  DeepSeek's: the DSpark drafter or non
 import calibrate_mm3_prefill as CPF  # noqa: E402  MiniMax's: how this PC reads prompts fastest (chunk, GEMMs)
 from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa)
 from serve import glm_link as GL  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
-from serve import models as SM  # noqa: E402  the Models page's: maya-inkling2's memory figures (IK2_KV_BYTES ...)
+from serve import models as SM  # noqa: E402  the Models page's: maya-ik2's memory figures (IK2_KV_BYTES ...)
 from strata import maya_sync  # noqa: E402  (tools/strata/) a glm-dsa pack's expert profile and drafting
 
 WIN = S.WIN
@@ -803,9 +803,9 @@ QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 HY4 = Q.MODEL["hy4"]                               # "Hy4-Flash" (its id: the installer record, --model)
 HY4_SHOWN = Q.SHOWN["hy4"]
 HY4_EXE = BUILD / ("maya-hy4.exe" if WIN else "maya-hy4")
-# Inkling 2 Small's AMD engine, maya-inkling2 (src/inkling2, docs/INKLING2_AMD.md; set_up_ik2).  On NVIDIA its engine is
-# maya-ik2 (docs/INKLING2.md), which has no setup yet: its config is written by hand
-INK_EXE = BUILD / ("maya-inkling2.exe" if WIN else "maya-inkling2")
+# Inkling 2 Small's engine, maya-ik2: set up on AMD, its HIP build (src/ik2/hip, docs/INKLING2_AMD.md; set_up_ik2).
+# On NVIDIA (docs/INKLING2.md) it has no setup yet: its config is written by hand
+INK_EXE = BUILD / ("maya-ik2.exe" if WIN else "maya-ik2")
 HY4_MANIFEST = ROOT / "tools" / "hy4" / "download.json"
 HY4_PACK_TOOLS = ("tools/hy4/pack_gguf.py", "tools/ds4/pack_gguf.py", "tools/strata_tokenizer.py")
 HY4_PACK = "maya-hy4"                              # (the pack's folder in the model's: hy4.txt, tensors.txt, tokenizer/)
@@ -870,20 +870,20 @@ HY4_KV_RESIDENT = 32768                            # (KV streaming: the global l
 # a small-card layout's prompt chunk doubled where it fits: the prompt scratch grows by about 0.9 GiB from 256 to 512
 # tokens (an 8 GB card at 4K: measured) - counted as 0.95, conservatively
 HY4_CHUNK_UP_GIB = 0.95
-# Thinking Machines' Inkling 2 Small on AMD (maya-inkling2): unsloth's UD-Q2_K_XL GGUF set (tools/inkling2/download.json)
-# in <models folder>/Inkling-2-Small-GGUF/UD-Q2_K_XL, its pack beside the shards (tools/inkling2/pack_gguf.py), the
+# Thinking Machines' Inkling 2 Small on AMD (maya-ik2's HIP build): unsloth's UD-Q2_K_XL GGUF set (tools/ik2/download.json)
+# in <models folder>/Inkling-2-Small-GGUF/UD-Q2_K_XL, its pack beside the shards (tools/ik2/pack_gguf.py), the
 # model's DSpark drafter (Thinking Machines' mtp.safetensors and config.json) in <models folder>/Inkling-2-Small-MTP with
-# the engine's Q8_0 copy and its index (tools/inkling2/convert_dspark.py); its config maya-inkling2-hip.json
+# the engine's Q8_0 copy and its index (tools/ik2/convert_dspark.py); its config maya-ik2-hip.json
 IK2 = Q.MODEL["ik2"]                               # "Inkling-2-Small" (its id: the installer record, --model)
 IK2_SHOWN = Q.SHOWN["ik2"]
-IK2_MANIFEST = ROOT / "tools" / "inkling2" / "download.json"
-IK2_PACK = "maya-inkling2"                         # (the pack's folder in the model's: inkling2.txt, tensors.txt, tokenizer/)
-IK2_PACK_TOOLS = ("tools/inkling2/pack_gguf.py", "tools/hy4/pack_gguf.py", "tools/ik2/chat_template.jinja")
-IK2_QUANT = "ud-q2_k_xl"                           # (the files maya-inkling2 runs: its key in maya_quants' OTHERS)
+IK2_MANIFEST = ROOT / "tools" / "ik2" / "download.json"
+IK2_PACK = "maya-ik2"                              # (the pack's folder in the model's: inkling2.txt, tensors.txt, tokenizer/)
+IK2_PACK_TOOLS = ("tools/ik2/pack_gguf.py", "tools/hy4/pack_gguf.py", "tools/ik2/chat_template.jinja")
+IK2_QUANT = "ud-q2_k_xl"                           # (the files maya-ik2 runs on AMD: its key in maya_quants' OTHERS)
 IK2_GGUF_DIR = "Inkling-2-Small-GGUF"
 IK2_MTP_DIR = "Inkling-2-Small-MTP"                # (serve/models.py's IK2_MTP_DIR / IK2_DSPARK: the page finds it there)
-IK2_DSPARK = "maya-inkling2-dspark-q8_0"           # (the drafter's index the engine loads: the Q8_0 copy's)
-IK2_CONFIG = "maya-inkling2-hip.json"
+IK2_DSPARK = "maya-ik2-dspark-q8_0"                # (the drafter's index the engine loads: the Q8_0 copy's)
+IK2_CONFIG = "maya-ik2-hip.json"
 IK2_MODEL_NAME = "inkling-2-small"
 # the contexts offered: DeepSeek's (DS4_CONTEXTS: from 32K), up to the model's trained 1M (the pack's inkling2.txt
 # context_length, the official config's model_max_length); recommended as DeepSeek's (ik2_recommended_context): 256K
@@ -896,7 +896,7 @@ IK2_RECOMMENDED_CONTEXT = 262144                    # (DS4_RECOMMENDED_CONTEXT)
 # drafter's (the last GPU, while it drafts); the experts give it up to RAM
 IK2_KV_BYTES, IK2_ATTN_BYTES, IK2_DSPARK_KV_BYTES = SM.IK2_KV_BYTES, SM.IK2_ATTN_BYTES, SM.IK2_DSPARK_KV_BYTES
 # VRAM + RAM that hold the whole model, the context aside (as DS4_MEMORY_GB: GiB, the unit of mem_gb and the GPUs'
-# vram_gb), tools/inkling2/download.json's "memory_gb": ceil(files + margin + drafter) = ceil(190.9 + 8 + 3.2) = 203 -
+# vram_gb), tools/ik2/download.json's "memory_gb": ceil(files + margin + drafter) = ceil(190.9 + 8 + 3.2) = 203 -
 #   files    204,969,055,296 bytes = 190.9 GiB, the six shards' sizes in download.json: every tensor, each once (in VRAM,
 #            or the experts VRAM does not hold copied into RAM - the engine never reads them from the SSD);
 #   margin   8 GiB, IK2_RAM_MARGIN_GIB: the RAM the engine leaves the rest beyond its RAM experts (it stops at its
@@ -904,11 +904,11 @@ IK2_KV_BYTES, IK2_ATTN_BYTES, IK2_DSPARK_KV_BYTES = SM.IK2_KV_BYTES, SM.IK2_ATTN
 #   drafter  IK2_DSPARK_GB, 3.47 GB = 3.2 GiB of the last GPU at a 32K context, measured (docs/INKLING2_AMD.md,
 #            "VRAM"): the calibration may turn drafting on, so it is counted (its experts then go to RAM)
 IK2_MEMORY_GB = 203
-IK2_RAM_MARGIN_GIB = 8                              # (the engine's ram_margin(), maya-ds4's: INKLING2_RAM_MARGIN_GB)
+IK2_RAM_MARGIN_GIB = 8                              # (the engine's ram_margin(), maya-ds4's: IK2_HIP_RAM_MARGIN_GB)
 IK2_DSPARK_GB = SM.IK2_DSPARK_GB                    # (measured: serve/models.py)
 # its expert profile (uint32 [48][384] routings, the most routed in VRAM at the load): the pack's expert-profile.bin
 # (maya-ds4's name), copied from here where the pack has none - the engine reads it by itself and writes back to it
-IK2_PROFILE = ROOT / "data" / "expert-profile-inkling2.bin"
+IK2_PROFILE = ROOT / "data" / "expert-profile-ik2.bin"
 FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4")
 # (Inkling 2 Small, "ik2": set up on AMD only - its picker row on --backend hip, before Hy4-flash's; set_up_ik2)
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
@@ -919,7 +919,7 @@ def exe_for_target(target: str) -> Path:
     fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
     if target == "maya-glm-helper":                    # (GLM's AMD helper program for the two-GPU mode: mixed_builds)
         return BUILD / ("maya-glm-helper.exe" if WIN else "maya-glm-helper")
-    return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE, "maya-hy4": HY4_EXE, "maya-inkling2": INK_EXE}[target]
+    return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE, "maya-hy4": HY4_EXE, "maya-ik2": INK_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 
 
@@ -1128,7 +1128,7 @@ def select_build_backend(backend: str) -> None:
     DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
     MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
     HY4_EXE = BUILD / ("maya-hy4.exe" if WIN else "maya-hy4")
-    INK_EXE = BUILD / ("maya-inkling2.exe" if WIN else "maya-inkling2")
+    INK_EXE = BUILD / ("maya-ik2.exe" if WIN else "maya-ik2")
     STAMP = BUILD / "MAYA-BUILD.json"
 
 
@@ -1680,12 +1680,12 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
              "Linux) - if it does not start or its answers look wrong, docs/AMD_MAYA.md says how to report it and "
              "what to use instead")
     if family == "ik2" and (a.backend != "hip" or WIN):
-        # (Inkling 2 Small's setup is its AMD engine's, maya-inkling2 - built and run on Linux; on NVIDIA the model's
-        #  engine is maya-ik2, which has no setup yet: said, not built)
-        fail(f"Maya's setup runs {IK2_SHOWN} on AMD GPUs under Linux only (its engine there: maya-inkling2, "
+        # (Inkling 2 Small's setup is maya-ik2's AMD build's - built and run on Linux; on NVIDIA maya-ik2 has no setup
+        #  yet: said, not built)
+        fail(f"Maya's setup runs {IK2_SHOWN} on AMD GPUs under Linux only (maya-ik2's AMD build, "
              "--backend hip)" if a.backend == "hip" or a.backend == "metal" else
-             f"Maya's setup runs {IK2_SHOWN} on AMD GPUs only (maya-inkling2, --backend hip): on NVIDIA its engine is "
-             "maya-ik2, which has no setup yet",
+             f"Maya's setup runs {IK2_SHOWN} on AMD GPUs only so far (maya-ik2's AMD build, --backend hip): "
+             "on NVIDIA maya-ik2 has no setup yet",
              "NVIDIA: build maya-ik2 and write its config by hand - docs/INKLING2.md says how; AMD under Linux: "
              f"{ME} --setup --backend hip --model {IK2.lower()}")
     if a.backend == "hip":
@@ -2073,14 +2073,14 @@ def choose_family(a, prev: dict) -> str:
              f"Or the base model itself in unsloth's UD-IQ2_XS GGUF ({qwen_entry(QWEN_UD)['download_gb']:.0f} GB).")]
     keys = ("glm", "glm53") + FAMILIES[1:]             # (the rows: GLM-5.3 (744B) is its own row of the "glm" family)
     if getattr(a, "backend", None) == "hip" or default == "ik2":
-        # Inkling 2 Small: on AMD (its engine there, maya-inkling2), before Hy4-flash's row; on NVIDIA its engine is
-        # maya-ik2, which has no setup - not offered (--model inkling-2-small says so there)
+        # Inkling 2 Small: on AMD (maya-ik2's HIP build), before Hy4-flash's row; on NVIDIA maya-ik2 has no setup -
+        # not offered (--model inkling-2-small says so there)
         rows.append((IK2, None,
-                     f"Thinking Machines' Inkling 2 Small (384 experts, 8 a token) on its AMD engine, maya-inkling2: "
+                     f"Thinking Machines' Inkling 2 Small (384 experts, 8 a token) on its engine maya-ik2, for AMD: "
                      f"unsloth's UD-Q2_K_XL GGUF ({ik2_entry()['download_gb']:.0f} GB) with the model's own DSpark "
                      f"drafter; AMD GPUs on Linux, about {IK2_MEMORY_GB} GB of VRAM and RAM together{here} (the experts "
                      "VRAM does not hold in RAM); the layers split across the GPUs, tool calls, thinking, up to a 1M "
-                     "context; text only. On NVIDIA its engine is maya-ik2, which has no setup yet (docs/INKLING2.md)."))
+                     "context; text only. On NVIDIA maya-ik2 has no setup yet (docs/INKLING2.md)."))
         keys = keys[:-1] + ("ik2", keys[-1])
     # Hy4-Flash, the last row: Maya's own sizes that are uploaded (hy4_published), then Tencent's own Q4_K_M;
     # --model / --hy4-quant name it either way (AMD under Windows: experimental - check_pc says so)
@@ -3146,7 +3146,7 @@ def refresh_engine(cfg: dict) -> None:
     meta = read_json(STAMP)
     exe = Path(cfg["exe"]).resolve()
     target = "maya-ds4" if exe == DS4_EXE.resolve() else "maya-mm3" if exe == MM3_EXE.resolve() else \
-        "maya-hy4" if exe == HY4_EXE.resolve() else "maya-inkling2" if exe == INK_EXE.resolve() else "maya"
+        "maya-hy4" if exe == HY4_EXE.resolve() else "maya-ik2" if exe == INK_EXE.resolve() else "maya"
     if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve(), MM3_EXE.resolve(), HY4_EXE.resolve(), INK_EXE.resolve()):
         return
     src = S.source_hash(S.ENGINE_SOURCES)
@@ -4872,7 +4872,7 @@ def busy_gpus(cfg: dict) -> list:
 DISPLAY_MIB = 1536
 
 # Maya's engines as the GPU's process list names them (and the names they had before the rename)
-ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-inkling2", "maya-glm-helper", "strata",
+ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2", "maya-glm-helper", "strata",
                     "strata-ds4")
 
 
@@ -6412,7 +6412,7 @@ BENCH_TOPICS = [
 def bench_exe(cfg: dict) -> Path:
     """Which engine binary a HIP config's --bench should relaunch - config_family(cfg)'s target, through the same
     exe_for_target every build step uses, so this can't drift out of sync with either."""
-    if config_family(cfg) == "ik2":                    # (Inkling 2: the engine its config names - maya-inkling2 on AMD)
+    if config_family(cfg) == "ik2":                    # (Inkling 2: the engine its config names - maya-ik2 on AMD)
         return Path(cfg["exe"])
     return exe_for_target({"deepseek": "maya-ds4", "minimax": "maya-mm3", "hy4": "maya-hy4"}.get(config_family(cfg), "maya"))
 
@@ -10022,12 +10022,12 @@ def set_up_hy4(a, prev: dict) -> Path | None:
 
 # ------------------------------------------------------------------------------------------------ Inkling 2 Small (AMD)
 def ik2_entry(quant: str = IK2_QUANT) -> dict:
-    """unsloth's GGUF set of Inkling 2 Small as offer_download's form (tools/inkling2/download.json): every shard, its
+    """unsloth's GGUF set of Inkling 2 Small as offer_download's form (tools/ik2/download.json): every shard, its
     size and sha256, at the pinned revision; "memory_gb" the VRAM + RAM that hold it."""
     man = read_json(IK2_MANIFEST)
     q = (man.get("quants") or {}).get(quant) or {}
     if not q.get("files") or not man.get("revision"):
-        fail(f"{IK2_MANIFEST} is missing or damaged", "restore it (git checkout tools/inkling2/download.json)")
+        fail(f"{IK2_MANIFEST} is missing or damaged", "restore it (git checkout tools/ik2/download.json)")
     return {"about": f"{IK2} in unsloth's {Q.OTHERS[('ik2', quant)]} GGUF (Thinking Machines' Apache 2.0 weights)",
             "format": "ik2-gguf", "repo": man["repo"], "revision": man["revision"], "folder": q["folder"],
             "files": {k: v[0] for k, v in q["files"].items()}, "sha256": {k: v[1] for k, v in q["files"].items()},
@@ -10040,7 +10040,7 @@ def ik2_drafter_entry() -> dict:
     describes it (its mtp_config), from the model's own repo (download.json's "drafter")."""
     dr = read_json(IK2_MANIFEST).get("drafter") or {}
     if not dr.get("files") or not dr.get("revision"):
-        fail(f"{IK2_MANIFEST} is missing or damaged", "restore it (git checkout tools/inkling2/download.json)")
+        fail(f"{IK2_MANIFEST} is missing or damaged", "restore it (git checkout tools/ik2/download.json)")
     return {"about": "the model's own DSpark drafter (it drafts a few tokens at a time for the model to check: the "
                      "same answers, faster on prose and code), Thinking Machines' mtp.safetensors with its config.json",
             "format": "ik2-drafter", "repo": dr["repo"], "revision": dr["revision"], "folder": "",
@@ -10077,7 +10077,7 @@ def ik2_recommended_context(vram: float, ram: float, need: float, gpus: int = 1,
 
 def ik2_models_dir(a, prev: dict) -> Path:
     """The models folder: --models-dir, else the setup's before, else the one a config's pack sits in by the setup's
-    layout (<models>/Inkling-2-Small-GGUF/<quant>/maya-inkling2: a config written by hand), else Maya-data/models."""
+    layout (<models>/Inkling-2-Small-GGUF/<quant>/maya-ik2: a config written by hand), else Maya-data/models."""
     inst = prev.get("installer") or {}
     if a.models_dir:
         return Path(a.models_dir).expanduser().resolve()
@@ -10144,7 +10144,7 @@ def ik2_drafter_index(mtp: Path) -> Path | None:
 
 def ik2_drafter_step(a, mtp: Path, first: Path, llama: Path) -> Path | None:
     """The DSpark drafter in mtp (beside the model's folder): Thinking Machines' mtp.safetensors and config.json,
-    downloaded when they are not there, then the engine's Q8_0 copy and its index (tools/inkling2/convert_dspark.py,
+    downloaded when they are not there, then the engine's Q8_0 copy and its index (tools/ik2/convert_dspark.py,
     the tokenizer's keys from the set's first shard) - an index already there is used as it is.  Its index, or None
     (not downloaded): the model runs without drafts."""
     index = ik2_drafter_index(mtp)
@@ -10159,7 +10159,7 @@ def ik2_drafter_step(a, mtp: Path, first: Path, llama: Path) -> Path | None:
     if not os.access(mtp, os.W_OK):
         fail(f"{mtp} is not writable: the drafter's Q8_0 copy is written beside its files")
     say("  Converting the drafter to the engine's Q8_0 copy and its index (about a minute) ...")
-    run([sys.executable, str(ROOT / "tools" / "inkling2" / "convert_dspark.py"), "--mtp", str(mtp),
+    run([sys.executable, str(ROOT / "tools" / "ik2" / "convert_dspark.py"), "--mtp", str(mtp),
          "--tokenizer-gguf", str(first), "--type", "q8_0", "--gguf-py", str(llama / "gguf-py")])
     index = ik2_drafter_index(mtp)
     if index is None:
@@ -10184,7 +10184,7 @@ def ik2_pack_by_hand(pack: Path, d: Path, files: list) -> str | None:
 
 
 def ik2_pack_step(a, d: Path, files: list) -> Path:
-    """tools/inkling2/pack_gguf.py's pack in <model>/maya-inkling2: the geometry, where every tensor sits in the GGUF
+    """tools/ik2/pack_gguf.py's pack in <model>/maya-ik2: the geometry, where every tensor sits in the GGUF
     set (read in place) and the tokenizer with Thinking Machines' own chat template - built again when its tools or
     the model's files changed (--repack: always).  A pack built before the setup (by hand) that fits the set is used
     as it is: nothing is written into it."""
@@ -10205,7 +10205,7 @@ def ik2_pack_step(a, d: Path, files: list) -> Path:
     if not os.access(d, os.W_OK):
         fail(f"{d} is not writable: the pack is written inside the model's folder")
     say("  Indexing every tensor of the GGUF files (the weights stay where they are) and the tokenizer ...")
-    run([sys.executable, str(ROOT / "tools" / "inkling2" / "pack_gguf.py"), "--model", str(d), "--out", str(pack),
+    run([sys.executable, str(ROOT / "tools" / "ik2" / "pack_gguf.py"), "--model", str(d), "--out", str(pack),
          "--files"] + [f.name for f in files])
     missing = [f for f in IK2_PACK_NEEDS if not (pack / f).exists()]
     if missing:
@@ -10243,7 +10243,7 @@ def ik2_seed_profile(pack: Path) -> Path | None:
 
 def write_config_ik2(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path,
                      index: Path | None, quant: str = IK2_QUANT) -> Path:
-    """maya-inkling2-hip.json and its start script.  The drafter's index is written whenever it is there
+    """maya-ik2-hip.json and its start script.  The drafter's index is written whenever it is there
     (--dspark-index), with --dspark none until the speed calibration finds that drafting pays here (DeepSeek's
     setup's rule - the Models page switches it), the model's own sampling and thinking level at every setup; a setup
     again keeps what the config before says that this one does not ask - where the server listens, its key, the env,
@@ -10305,11 +10305,11 @@ def write_config_ik2(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
 
 
 def set_up_ik2(a, prev: dict) -> Path | None:
-    """Inkling 2 Small's steps 1-9, on AMD only (its engine maya-inkling2; on NVIDIA the model's engine is maya-ik2,
-    which has no setup yet - check_pc says so and stops): the PC (AMD on Linux; the memory, as DeepSeek's setup: below
+    """Inkling 2 Small's steps 1-9, on AMD only (maya-ik2's HIP build; on NVIDIA maya-ik2 has no setup yet -
+    check_pc says so and stops): the PC (AMD on Linux; the memory, as DeepSeek's setup: below
     VRAM + RAM that hold the model it warns and goes on - the engine then reads the experts RAM does not hold in place
     from the model's files, --mmap-experts auto), the context (up to the model's 1M, recommended as
-    DeepSeek's), the engine (build-hip/maya-inkling2), unsloth's UD-Q2_K_XL set, the model's DSpark drafter (converted
+    DeepSeek's), the engine (build-hip/maya-ik2), unsloth's UD-Q2_K_XL set, the model's DSpark drafter (converted
     to the engine's Q8_0 copy), the pack with its expert profile, the config, and the speed calibration - the drafter
     or none, as DeepSeek's (--drafting measure | on | off).  Files already there are used as they are: nothing is
     downloaded, converted or packed again."""
@@ -10344,7 +10344,7 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     mtp = ik2_mtp_dir(models, prev)
     ok(f"model folder: {d}")
     llama = tools_step(a)                              # 3
-    meta = build_step(a, pc, llama, "maya-inkling2")   # 4
+    meta = build_step(a, pc, llama, "maya-ik2")   # 4
     files = ik2_model_step(a, d, quant)                # 5
     if files is None:
         return None
@@ -11085,9 +11085,9 @@ def main() -> int:
             else:
                 set_mixed_gpus(cfg, a.mixed_gpus)
                 pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-        if a.mmap_experts:   # (#422: given on a start too - written into a DeepSeek or maya-inkling2 config, which keeps it)
+        if a.mmap_experts:   # (#422: given on a start too - written into a DeepSeek or maya-ik2 AMD config, which keeps it)
             cfg = read_json(pick)
-            if config_family(cfg) != "deepseek" and not Path(str(cfg.get("exe", ""))).name.startswith("maya-inkling2"):
+            if config_family(cfg) != "deepseek" and not SM.ik2_amd(cfg):
                 warn("--mmap-experts is a DeepSeek and Inkling 2 Small (AMD) setting: this config does not use it")
             else:
                 set_arg(cfg.setdefault("args", []), "--mmap-experts", a.mmap_experts)

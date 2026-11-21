@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Compare two llama.cpp reference dumps of the same prompt (tools/inkling2/ref/run_dump.sh), e.g. F16 KV + flash
-attention against F32 KV without it: the reference's own noise floor, to read maya-inkling2's --parity numbers against.
+"""Compare two llama.cpp reference dumps of the same prompt (tools/ik2/ref/run_dump.sh), e.g. F16 KV + flash
+attention against F32 KV without it: the reference's own noise floor, to read maya-ik2's --parity numbers against.
 
   compare_dumps.py <dump A> <dump B> [--tensor l_out] [--worst N]
 

@@ -1,6 +1,6 @@
-// src/inkling2/inkling2_kernels.cu - maya-inkling2's own kernels (inkling2_kernels.cuh).  Written for clarity first
+// src/ik2/hip/ik2_hip_kernels.cu - maya-ik2's AMD build's own kernels (ik2_hip_kernels.cuh).  Written for clarity first
 // (the decode path's small vectors: one launch a step of the reference graph); the sums are F32 in a fixed order.
-#include "inkling2_kernels.cuh"
+#include "ik2_hip_kernels.cuh"
 
 #include <cuda_fp16.h>
 
@@ -12,7 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace inkling2::k {
+namespace ik2hip::k {
 
 namespace {
 
@@ -21,7 +21,7 @@ std::atomic<int> g_err{0};
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "maya-inkling2 kernel %s: %s\n", what, cudaGetErrorString(e));
+        std::fprintf(stderr, "maya-ik2 kernel %s: %s\n", what, cudaGetErrorString(e));
         g_err.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -171,7 +171,7 @@ __global__ void attn_softmax_kernel(float* __restrict__ S, int nk) {
 // block = (a tile of kTile keys, a kv head): the tile's K rows and the kv head's queries in shared memory, then a
 // thread a (query head, key) - its score (a thread reading its own K row from the cache took most of a decode step's
 // attention time)
-constexpr int kTile = 32, kSeg = 128;   // (a tile's shared memory against blocks: measurable with INKLING2_PHASES)
+constexpr int kTile = 32, kSeg = 128;   // (a tile's shared memory against blocks: measurable with IK2_HIP_PHASES)
 __global__ void attn_score_tile_kernel(const float* __restrict__ q, const float* __restrict__ rel,
                                        const float* __restrict__ sink, int H, int Hkv, int D, int n_rel,
                                        const float* __restrict__ rel_bias, int extent, const __half* __restrict__ K, int ring,
@@ -1027,7 +1027,7 @@ unsigned blocks_of(size_t n, int per = 256) { return (unsigned) ((n + (size_t) p
 void mix(const float* blocks, int nb, const float* cur, int E, const float* query, int nq, float eps, float* stat,
          float* out, cudaStream_t s) {
     if (nb + 1 > kMaxStates || nq > 3) {
-        std::fprintf(stderr, "maya-inkling2 mix: %d states, %d queries\n", nb + 1, nq);
+        std::fprintf(stderr, "maya-ik2 mix: %d states, %d queries\n", nb + 1, nq);
         g_err.fetch_add(1);
         return;
     }
@@ -1045,7 +1045,7 @@ void conv(float* y, float* hist, const float* w, int C, const float* dyn, int he
 }
 void head_clip(float* x, int H, int n, const float* scale, float thr, float mul, cudaStream_t s) {
     if (n > 256) {
-        std::fprintf(stderr, "maya-inkling2 head_clip: rows of %d\n", n);
+        std::fprintf(stderr, "maya-ik2 head_clip: rows of %d\n", n);
         g_err.fetch_add(1);
         return;
     }
@@ -1082,12 +1082,12 @@ void attention(const float* q, const float* rel, const float* sink, int H, int H
 }
 namespace {
 // keys a tile.  Measured at a full 1024-key window (ms of attention a token over the 48 layers): 64 keys 11.2, 32
-// keys 8.9, 16 keys 6.4 - the smaller the tile the faster, against what its work would say.  INKLING2_ATTN_TK=a,b
+// keys 8.9, 16 keys 6.4 - the smaller the tile the faster, against what its work would say.  IK2_HIP_ATTN_TK=a,b
 // (tests): a for up to 2048 keys, b beyond.
 int split_tk(int nk) {
     static int t1 = 16, t2 = 16;
     static const bool init = [] {
-        if (const char* e = std::getenv("INKLING2_ATTN_TK")) {
+        if (const char* e = std::getenv("IK2_HIP_ATTN_TK")) {
             int a = 0, b2 = 0;
             if (std::sscanf(e, "%d,%d", &a, &b2) == 2 && a >= 8 && a <= 64 && b2 >= 16 && b2 <= 64) t1 = a, t2 = b2;
         }
@@ -1099,7 +1099,7 @@ int split_tk(int nk) {
 }  // namespace
 size_t attention_split_floats(int H, int D, int64_t max_keys) {
     const int64_t nk = std::max<int64_t>(max_keys, 2048);
-    // (at least 256 tiles: INKLING2_ATTN_TK's smallest tile, 8, over 2048 keys)
+    // (at least 256 tiles: IK2_HIP_ATTN_TK's smallest tile, 8, over 2048 keys)
     const int64_t tiles = std::max<int64_t>((2048 + 7) / 8, (nk + 15) / 16);
     return (size_t) H * (size_t) tiles * (size_t) (D + 2);
 }
@@ -1108,7 +1108,7 @@ void attention_split(const float* q, const float* rel, const float* sink, int H,
                      int64_t lo, float scale, float* S, const float* gate, float* out, cudaStream_t s) {
     const int nk = (int) (p - lo + 1), per = H / Hkv, TK = split_tk(nk), ntile = (nk + TK - 1) / TK;
     if (per > 8 || D > 256) {
-        std::fprintf(stderr, "maya-inkling2 attention_split: %d query heads a kv head, rows of %d\n", per, D);
+        std::fprintf(stderr, "maya-ik2 attention_split: %d query heads a kv head, rows of %d\n", per, D);
         g_err.fetch_add(1);
         return;
     }
@@ -1177,7 +1177,7 @@ void argmax(const float* x, int n, float* out, cudaStream_t s) {
 void mix_rows(const float* blocks, size_t ldb, int nb, const float* cur, int T, int E, const float* query, int nq,
               float eps, float* stat, float* out, cudaStream_t s) {
     if (nb + 1 > kMaxStates || nq > 3) {
-        std::fprintf(stderr, "maya-inkling2 mix: %d states, %d queries\n", nb + 1, nq);
+        std::fprintf(stderr, "maya-ik2 mix: %d states, %d queries\n", nb + 1, nq);
         g_err.fetch_add(1);
         return;
     }
@@ -1254,7 +1254,7 @@ void combine_rows(const float* ent, const float* w, int T, int nu, int E, float*
 void mix_rms(const float* blocks, int nb, const float* cur, int E, const float* query, int nq, const float* g0,
              const float* g1, const float* g2, float eps, float* out, cudaStream_t s) {
     if (nb + 1 > kMaxStates || nq > 3 || E > 8 * 1024) {
-        std::fprintf(stderr, "maya-inkling2 mix_rms: %d states, %d queries, width %d\n", nb + 1, nq, E);
+        std::fprintf(stderr, "maya-ik2 mix_rms: %d states, %d queries, width %d\n", nb + 1, nq, E);
         g_err.fetch_add(1);
         return;
     }
@@ -1349,4 +1349,4 @@ void argmax_rows(const float* x, size_t ld, int rows, int n, float* out, cudaStr
 }
 int errors() { return g_err.exchange(0); }
 
-}  // namespace inkling2::k
+}  // namespace ik2hip::k

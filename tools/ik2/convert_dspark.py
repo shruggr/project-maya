@@ -1,21 +1,21 @@
-"""tools/inkling2/convert_dspark.py - Inkling 2 Small's DSpark drafter (Thinking Machines' mtp.safetensors, 84 BF16
-tensors, with its config.json's mtp_config) as a GGUF, and maya-inkling2's index of it (docs/INKLING2_DSPARK.md).
+"""tools/ik2/convert_dspark.py - Inkling 2 Small's DSpark drafter (Thinking Machines' mtp.safetensors, 84 BF16
+tensors, with its config.json's mtp_config) as a GGUF, and maya-ik2's index of it (docs/INKLING2_DSPARK.md).
 
-    nice -n 19 python tools/inkling2/convert_dspark.py --mtp <models>/Inkling-2-Small-MTP \
+    nice -n 19 python tools/ik2/convert_dspark.py --mtp <models>/Inkling-2-Small-MTP \
         --tokenizer-gguf <target set>/Inkling-2-Small-UD-Q2_K_XL-00001-of-00006.gguf [--type bf16|q8_0|both]
 
 writes into --out (default: the --mtp folder):
   Inkling-2-Small-DSpark-BF16.gguf   the matrices as they are (BF16), every 1-D tensor and dspark_fuse F32
   Inkling-2-Small-DSpark-Q8_0.gguf   the matrices as ggml Q8_0 blocks (rounded here: gguf.quants), the rest F32
-  maya-inkling2-dspark-<type>/       dspark.txt (the geometry, `key value` lines, lists comma-separated) and
+  maya-ik2-dspark-<type>/       dspark.txt (the geometry, `key value` lines, lists comma-separated) and
                                      tensors.txt (`file 0 <gguf>`, then `t <name> <type> <file> <offset> <bytes>
-                                     <ne0> <ne1> ...`, as tools/inkling2/pack_gguf.py writes the model's)
+                                     <ne0> <ne1> ...`, as tools/ik2/pack_gguf.py writes the model's)
 
 The GGUF is what llama.cpp PR #32218's `convert_hf_to_gguf.py --dspark` writes (conversion/inkling2.py's
 Inkling2DSparkModel, architecture `dflash`): its tensor names, its dims (ne0 innermost, the checkpoint's [out, in]
 reversed) and its keys, so that a reference llama.cpp run can load the same file.  The tokenizer keys are copied from
 the target's GGUF (--tokenizer-gguf: the same vocabulary, 200058 tokens); without it the file has no tokenizer, which
-maya-inkling2 does not need and llama.cpp does.
+maya-ik2 does not need and llama.cpp does.
 
 No torch, no safetensors: the checkpoint's header is read here and its tensors are mapped.
 """
@@ -204,10 +204,10 @@ def write(gguf, st: Safetensors, text: dict, mtp: dict, tok, out: pathlib.Path, 
 
 def index(gguf, path: pathlib.Path, text: dict, mtp: dict, kind: str) -> pathlib.Path:
     r = gguf.GGUFReader(str(path))
-    d = path.parent / ("maya-inkling2-dspark-" + kind)
+    d = path.parent / ("maya-ik2-dspark-" + kind)
     d.mkdir(exist_ok=True)
     nl = mtp["num_hidden_layers"]
-    geo = [("format", "maya-inkling2-dspark 1"), ("model_dir", ".."), ("type", kind), ("n_layer", nl),
+    geo = [("format", "maya-ik2-dspark 1"), ("model_dir", ".."), ("type", kind), ("n_layer", nl),
            ("n_embd", mtp["hidden_size"]), ("n_ff", mtp["intermediate_size"]), ("n_head", mtp["num_attention_heads"]),
            ("n_head_kv", mtp["num_key_value_heads"]), ("head_dim", mtp["head_dim"]), ("eps", mtp["rms_norm_eps"]),
            ("rope_theta", mtp["rope_theta"]), ("n_swa", mtp["sliding_window_size"]),
@@ -279,7 +279,7 @@ def main() -> int:
     expect_shapes(st, text, mtp)
     tok = gguf.GGUFReader(a.tokenizer_gguf) if a.tokenizer_gguf else None
     if tok is None:
-        print("no --tokenizer-gguf: the files have no tokenizer (llama.cpp needs one, maya-inkling2 does not)")
+        print("no --tokenizer-gguf: the files have no tokenizer (llama.cpp needs one, maya-ik2 does not)")
     for kind in (("bf16", "q8_0") if a.type == "both" else (a.type,)):
         path = out / ("Inkling-2-Small-DSpark-%s.gguf" % kind.upper())
         print("%s:" % path, flush=True)

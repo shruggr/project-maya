@@ -1,4 +1,4 @@
-// src/inkling2/inkling2_model.cu - maya-inkling2's model (inkling2_model.hpp): loading, placement over the GPUs, and
+// src/ik2/hip/ik2_hip_model.cu - maya-ik2's model (ik2_hip_model.hpp): loading, placement over the GPUs, and
 // the forward.
 //
 // A layer, for the token at position p (llama.cpp's src/models/inkling2.cpp; docs/INKLING2_AMD.md):
@@ -13,13 +13,13 @@
 //   xf = rms(mix(blocks, cur, ffn_res_query)) ffn_norm;  the router (sigmoid, + bias, top 8, renormalised, * 8), the
 //   picks' experts: down(situ(gate xf, up xf));  cur += conv(their weighted sum)
 // and logits = softcap(Wout rms(mix(blocks, cur, output_res_query)) output_norm).
-#include "inkling2_model.hpp"
+#include "ik2_hip_model.hpp"
 
-#include "inkling2_dspark.hpp"
+#include "ik2_hip_dspark.hpp"
 
-#include "inkling2_kernels.cuh"
-#include "inkling2_lane.hpp"
-#include "inkling2_pack.hpp"
+#include "ik2_hip_kernels.cuh"
+#include "ik2_hip_lane.hpp"
+#include "ik2_hip_pack.hpp"
 #include "hy4_kernels.cuh"
 #include "../ds4/ds4_iq.cuh"
 
@@ -43,7 +43,7 @@
 #include <map>
 #include <thread>
 
-namespace inkling2 {
+namespace ik2hip {
 
 namespace iq = strata::ds4::gguf::iq;
 namespace hk = hy4::k;
@@ -92,7 +92,7 @@ struct Layer {
     float *win_in = nullptr, *win_h0 = nullptr;   // (a step's conv inputs [K | V | attention | FFN][kWin]; the other
                                                   //  buffers of the histories: a step writes hist_* -> alt_*, swapped)
     float *alt_k = nullptr, *alt_v = nullptr, *alt_a = nullptr, *alt_f = nullptr;
-    cudaEvent_t pe[10] = {};      // (INKLING2_PHASES: the host-free step's phase marks on its GPU's stream)
+    cudaEvent_t pe[10] = {};      // (IK2_HIP_PHASES: the host-free step's phase marks on its GPU's stream)
     float *m_pub = nullptr, *m_cpu = nullptr;   // (mapped host memory: its routing out to the lane, the lane's sum back)
     float* snap = nullptr;        // the histories' saved copies [kSnaps][k | v | attention | FFN]
     // the routed experts: a blob each (the fused gate | up rows, then down), in VRAM or in RAM
@@ -212,10 +212,10 @@ struct Gpu {
         return true;
     }
 
-    // INKLING2_VRAM_LOG=1 (tests): this GPU's VRAM at a stage - free, this engine's own allocations (`extra`: the
+    // IK2_HIP_VRAM_LOG=1 (tests): this GPU's VRAM at a stage - free, this engine's own allocations (`extra`: the
     // drafter's), and what left the GPU besides them since the start (free0)
     void note(const char* what, size_t extra = 0) const {
-        static const bool on = std::getenv("INKLING2_VRAM_LOG") != nullptr;
+        static const bool on = std::getenv("IK2_HIP_VRAM_LOG") != nullptr;
         if (!on) return;
         size_t fr = 0, tot = 0;
         cudaSetDevice(dev);
@@ -287,15 +287,15 @@ struct Model::Impl {
     size_t max_keys = 0;
     int Tc = 0;                      // the prompt path's chunk (0: none)
     // ---- the values the measurement phase swept (docs/INKLING2_AMD.md, "Values and their sources"), each with an
-    // INKLING2_<NAME> override as maya-ds4's DS4_CACHE_*: read at the load; Model::retune reads the run-time ones again
-    // (--sweep).  The load's: INKLING2_STAGE, INKLING2_TS_MAX, INKLING2_S_FLOOR_MI, INKLING2_WARM_TOKENS
+    // IK2_HIP_<NAME> override as maya-ds4's DS4_CACHE_*: read at the load; Model::retune reads the run-time ones again
+    // (--sweep).  The load's: IK2_HIP_STAGE, IK2_HIP_TS_MAX, IK2_HIP_S_FLOOR_MI, IK2_HIP_WARM_TOKENS
     static double env_d(const char* k, double d, double lo, double hi) {
         const char* v = std::getenv(k);
         if (v == nullptr || *v == 0) return d;
         char* end = nullptr;
         const double x = std::strtod(v, &end);
         if (end == v || !(x >= lo && x <= hi)) {
-            std::fprintf(stderr, "maya-inkling2: %s=%s is not a number from %g to %g: keeping %g\n", k, v, lo, hi, d);
+            std::fprintf(stderr, "maya-ik2: %s=%s is not a number from %g to %g: keeping %g\n", k, v, lo, hi, d);
             return d;
         }
         return x;
@@ -303,42 +303,42 @@ struct Model::Impl {
     struct Tune {
         // the expert cache's rule, maya-ds4's (DS4_CACHE_DECAY / _MARGIN / _BONUS): the experts' heat x 0.9 every 256
         // tokens (here a token's share of it, 0.9^(1/256), as each token decays), and a RAM expert moves in when its heat
-        // passes the coldest VRAM one's x 1.25 + 1.0 (INKLING2_CACHE_DECAY / _MARGIN / _BONUS; measured against this
+        // passes the coldest VRAM one's x 1.25 + 1.0 (IK2_HIP_CACHE_DECAY / _MARGIN / _BONUS; measured against this
         // engine's earlier x0.995 a token, 1.5 and 0.5: a six-turn chat 51.3 / 51.0 tok/s against 48.7 / 51.2 - docs)
         double cache_decay = 0.9;
         float tok_decay = 0.9995885f;    // (retune sets it from cache_decay)
         float cache_margin = 1.25f, cache_bonus = 1.0f;
         float prompt_rows = 64.0f;     // a prompt chunk of T rows: each routing counts min(1, this / T) (_CACHE_PROMPT_ROWS)
-        int win_rows = 4;              // a window's moves: its rows count as this many tokens' at most (INKLING2_SWAP_WIN_ROWS)
+        int win_rows = 4;              // a window's moves: its rows count as this many tokens' at most (IK2_HIP_SWAP_WIN_ROWS)
         int lane_spin_us = 20000;      // the lane's dispatcher spins this long between two tokens, then sleeps (_LANE_SPIN_US:
                                        // maya-ds4's DS4_LANE_SPIN_US; 200 / 1800 / 20000 us decoded alike - docs)
-        int snap_every = 64;           // the histories saved every this many decoded tokens (INKLING2_SNAP_EVERY)
-        int burst_rounds = 48, burst_moves = 64, burst_min = 64;   // the swap burst (INKLING2_BURST_ROUNDS / _MOVES / _MIN)
-        bool tap_event = true;         // (tests, INKLING2_TAP_EVENT=0: the taps' hand-off without its event - timing alone)
-        // (tests, --sweep: at most this much of the load's allocation - INKLING2_STAGE_USE experts a staging pass,
-        //  INKLING2_TS_USE tokens an attention pass, INKLING2_S_USE_MI Mi score floats; 0: all of it)
+        int snap_every = 64;           // the histories saved every this many decoded tokens (IK2_HIP_SNAP_EVERY)
+        int burst_rounds = 48, burst_moves = 64, burst_min = 64;   // the swap burst (IK2_HIP_BURST_ROUNDS / _MOVES / _MIN)
+        bool tap_event = true;         // (tests, IK2_HIP_TAP_EVENT=0: the taps' hand-off without its event - timing alone)
+        // (tests, --sweep: at most this much of the load's allocation - IK2_HIP_STAGE_USE experts a staging pass,
+        //  IK2_HIP_TS_USE tokens an attention pass, IK2_HIP_S_USE_MI Mi score floats; 0: all of it)
         int stage_use = 0, ts_use = 0;
         size_t s_use = 0;
     } tn;
     void retune() {
-        tn.cache_decay = env_d("INKLING2_CACHE_DECAY", 0.9, 0.0, 1.0);
+        tn.cache_decay = env_d("IK2_HIP_CACHE_DECAY", 0.9, 0.0, 1.0);
         tn.tok_decay = (float) std::pow(tn.cache_decay, 1.0 / 256.0);
-        tn.cache_margin = (float) env_d("INKLING2_CACHE_MARGIN", 1.25, 0.0, 100.0);
-        tn.cache_bonus = (float) env_d("INKLING2_CACHE_BONUS", 1.0, 0.0, 1e6);
-        tn.prompt_rows = (float) env_d("INKLING2_CACHE_PROMPT_ROWS", 64, 1, 1 << 20);
-        tn.win_rows = (int) env_d("INKLING2_SWAP_WIN_ROWS", 4, 1, 16);
-        tn.lane_spin_us = (int) env_d("INKLING2_LANE_SPIN_US", 20000, 0, 1e6);
-        tn.snap_every = (int) env_d("INKLING2_SNAP_EVERY", 64, 1, 1 << 20);
-        tn.burst_rounds = (int) env_d("INKLING2_BURST_ROUNDS", 48, 1, 1 << 20);
-        tn.burst_moves = (int) env_d("INKLING2_BURST_MOVES", 64, 1, 16);
-        tn.burst_min = (int) env_d("INKLING2_BURST_MIN", 64, 1, 1 << 30);
-        tn.tap_event = env_d("INKLING2_TAP_EVENT", 1, 0, 1) != 0;
-        tn.stage_use = (int) env_d("INKLING2_STAGE_USE", 0, 0, 384);
-        tn.ts_use = (int) env_d("INKLING2_TS_USE", 0, 0, 1 << 16);
-        tn.s_use = (size_t) env_d("INKLING2_S_USE_MI", 0, 0, 1 << 16) << 20;
+        tn.cache_margin = (float) env_d("IK2_HIP_CACHE_MARGIN", 1.25, 0.0, 100.0);
+        tn.cache_bonus = (float) env_d("IK2_HIP_CACHE_BONUS", 1.0, 0.0, 1e6);
+        tn.prompt_rows = (float) env_d("IK2_HIP_CACHE_PROMPT_ROWS", 64, 1, 1 << 20);
+        tn.win_rows = (int) env_d("IK2_HIP_SWAP_WIN_ROWS", 4, 1, 16);
+        tn.lane_spin_us = (int) env_d("IK2_HIP_LANE_SPIN_US", 20000, 0, 1e6);
+        tn.snap_every = (int) env_d("IK2_HIP_SNAP_EVERY", 64, 1, 1 << 20);
+        tn.burst_rounds = (int) env_d("IK2_HIP_BURST_ROUNDS", 48, 1, 1 << 20);
+        tn.burst_moves = (int) env_d("IK2_HIP_BURST_MOVES", 64, 1, 16);
+        tn.burst_min = (int) env_d("IK2_HIP_BURST_MIN", 64, 1, 1 << 30);
+        tn.tap_event = env_d("IK2_HIP_TAP_EVENT", 1, 0, 1) != 0;
+        tn.stage_use = (int) env_d("IK2_HIP_STAGE_USE", 0, 0, 384);
+        tn.ts_use = (int) env_d("IK2_HIP_TS_USE", 0, 0, 1 << 16);
+        tn.s_use = (size_t) env_d("IK2_HIP_S_USE_MI", 0, 0, 1 << 16) << 20;
     }
     // streamed experts a pass, in two buffers: one is copied while the other's experts run - fewer passes against
-    // 2 x kStage blobs of VRAM (INKLING2_STAGE).  Measured, 2048-token chunks, tok/s at 24 / 48 / 64 / 96: a 20K prompt
+    // 2 x kStage blobs of VRAM (IK2_HIP_STAGE).  Measured, 2048-token chunks, tok/s at 24 / 48 / 64 / 96: a 20K prompt
     // 1579 / 1713 / 1812 / 1831, 80K 1358 / 1436 / 1499 / 1509 - 64's 0.8 GiB a GPU more, with E9's and E42's, cost the
     // shorter prompts and the RAM (Options::prefill_chunk), so 24
     int kStage = 24;
@@ -364,8 +364,8 @@ struct Model::Impl {
         sync_wait_s += now_s() - t;
         return e;
     }
-    // INKLING2_PROF=1 (tests): the decode step's time by part (a synchronisation each: slower in all), printed at the end
-    bool prof = std::getenv("INKLING2_PROF") != nullptr;
+    // IK2_HIP_PROF=1 (tests): the decode step's time by part (a synchronisation each: slower in all), printed at the end
+    bool prof = std::getenv("IK2_HIP_PROF") != nullptr;
     double prof_t[8] = {0, 0, 0, 0, 0, 0, 0, 0}, prof_last = 0;
     void mark(Gpu& gp, int part) {
         if (!prof) return;
@@ -376,11 +376,11 @@ struct Model::Impl {
     }
     ~Impl() {
         fast_stop();
-        if (step_n > 0 && std::getenv("INKLING2_TIMELINE"))
+        if (step_n > 0 && std::getenv("IK2_HIP_TIMELINE"))
             std::fprintf(stderr, "TIMELINE (the step with a host round trip a layer): %.2f ms a token, %.2f ms of it waiting on the GPU, "
                                  "%.2f ms queueing\n", 1e3 * step_s / step_n, 1e3 * sync_wait_s / step_n,
                          1e3 * (step_s - sync_wait_s) / step_n);
-        if (fast_n > 0 && std::getenv("INKLING2_TIMELINE"))
+        if (fast_n > 0 && std::getenv("IK2_HIP_TIMELINE"))
             std::fprintf(stderr, "TIMELINE (the host-free step): %.2f ms a token; queueing a GPU's layers %.2f ms (each GPU's own thread), "
                                  "the lane's work %.2f ms, the lane waiting for routes %.2f ms\n", 1e3 * fast_s / fast_n,
                          1e3 * fast_enq_s / fast_n / std::max<size_t>(1, G.size()), 1e3 * lane_work_s / fast_n,
@@ -477,7 +477,7 @@ struct Model::Impl {
         m.ld = m.type == kF32 ? (size_t) m.k * 4 : (iq::mv_supported(m.type) && m.k % iq::block_values(m.type) == 0
                                                          ? iq::row_bytes(m.type, m.k) : 0);
         if (m.ld == 0 || m.ld * (size_t) m.n != t->bytes) {
-            err = n + ": " + t->type + ", not a type maya-inkling2's GEMVs read";
+            err = n + ": " + t->type + ", not a type maya-ik2's GEMVs read";
             return false;
         }
         uint8_t* d = nullptr;
@@ -500,13 +500,13 @@ struct Model::Impl {
     int n_states() const { return (g.n_layer + g.res_block - 1) / g.res_block; }
     // the attention's scores (F32, and their F16 copy beside): floats.  A pass of ts tokens over nk keys takes
     // n_head x ts x nk of them (attention_rows halves ts until it fits), so they must hold one token over every key
-    // the context has, n_head x max_keys (48 x 1M = 50.3M at the model's 1M).  kS_n, the floor (INKLING2_S_FLOOR_MI):
+    // the context has, n_head x max_keys (48 x 1M = 50.3M at the model's 1M).  kS_n, the floor (IK2_HIP_S_FLOOR_MI):
     // the passes a long prompt's chunk takes - measured, an 80K-token prompt in 2048-token chunks, tok/s at 11 / 22 /
     // 44 / 88 / 176 / 352 Mi: 853 / 1082 / 1247 / 1354 / 1409 / 1400 (20K: within 1%, 352 3% slower); 44 Mi is 264 MiB
     // a GPU (F32 + F16) - 176's 0.8 GiB more, with E9's and E44's, cost the shorter prompts and the RAM (prefill_chunk)
     size_t kS_n = (size_t) 44 << 20;
     size_t S_n() const { return std::max(kS_n, (size_t) g.n_head * max_keys); }
-    // ... and its tokens a pass at most (INKLING2_TS_MAX); its rel-bias table is kTsMax x n_head x rel_extent floats,
+    // ... and its tokens a pass at most (IK2_HIP_TS_MAX); its rel-bias table is kTsMax x n_head x rel_extent floats,
     // 25 MB.  Measured, 2048-token chunks, tok/s at 32 / 64 / 128 / 256 / 512: a 20K prompt 1806 / 1861 / 1875 / 1844 /
     // 1841, 80K 1483 / 1524 / 1532 / 1513 / -
     int kTsMax = 128;
@@ -571,7 +571,7 @@ struct Model::Impl {
         if (!iq::expert_supported(l.tg) || !iq::expert_supported(l.td) || !iq::mv_supported(l.tg) ||
             !iq::mv_supported(l.td) || l.t_gu->n(0) != E || l.t_gu->n(1) != 2 * ff || l.t_gu->n(2) != g.n_expert ||
             l.t_dn->n(0) != ff || l.t_dn->n(1) != E || l.t_dn->n(2) != g.n_expert) {
-            err = p + ": routed experts " + l.t_gu->type + " / " + l.t_dn->type + " (maya-inkling2 runs ggml's expert "
+            err = p + ": routed experts " + l.t_gu->type + " / " + l.t_dn->type + " (maya-ik2 runs ggml's expert "
                   "types, a fused gate | up tensor)";
             return false;
         }
@@ -620,17 +620,17 @@ struct Model::Impl {
                (!last || gp.alloc(gp.logits, (size_t) g.n_vocab, err));
     }
 
-    // RAM left to the rest (the system, the page cache's churn): 8 GiB, or INKLING2_RAM_MARGIN_GB=<GiB> (0 to 4096; read
+    // RAM left to the rest (the system, the page cache's churn): 8 GiB, or IK2_HIP_RAM_MARGIN_GB=<GiB> (0 to 4096; read
     // once, logged once; an unreadable value keeps the 8) - maya-ds4's ram_margin and its DS4_RAM_MARGIN_GB
     static uint64_t ram_margin() {
         static const uint64_t m = [] {
             double gib = 8.0;
-            if (const char* v = std::getenv("INKLING2_RAM_MARGIN_GB")) {
+            if (const char* v = std::getenv("IK2_HIP_RAM_MARGIN_GB")) {
                 char* end = nullptr;
                 const double x = std::strtod(v, &end);
                 if (end != v && x >= 0.0 && x <= 4096.0) gib = x;
-                else std::fprintf(stderr, "inkling2: INKLING2_RAM_MARGIN_GB=%s is not a number from 0 to 4096: keeping 8 GiB\n", v);
-                if (gib != 8.0) std::fprintf(stderr, "inkling2: RAM margin %.1f GiB (INKLING2_RAM_MARGIN_GB)\n", gib);
+                else std::fprintf(stderr, "ik2: IK2_HIP_RAM_MARGIN_GB=%s is not a number from 0 to 4096: keeping 8 GiB\n", v);
+                if (gib != 8.0) std::fprintf(stderr, "ik2: RAM margin %.1f GiB (IK2_HIP_RAM_MARGIN_GB)\n", gib);
             }
             return (uint64_t) (gib * 1073741824.0);
         }();
@@ -774,9 +774,9 @@ struct Model::Impl {
         const uint64_t avail = hy4::ram_available();
         const double can = avail == 0 ? 1e300 : std::max(0.0, (double) avail - (double) ram_margin());
         double budget = o.mmap_experts > 0 ? 0.0 : std::min(all, can);
-        if (const char* v = std::getenv("INKLING2_COPY_GB")) budget = std::atof(v) * 1e9;   // (tests: the hottest n GB)
+        if (const char* v = std::getenv("IK2_HIP_COPY_GB")) budget = std::atof(v) * 1e9;   // (tests: the hottest n GB)
         if (o.mmap_experts <= 0 && all > can)
-            std::fprintf(stderr, "maya-inkling2: --mmap-experts %s: the CPU lane's experts (%.1f GB) do not all fit the RAM "
+            std::fprintf(stderr, "maya-ik2: --mmap-experts %s: the CPU lane's experts (%.1f GB) do not all fit the RAM "
                                  "this process can get (%.1f GB beside %.0f GB for the rest) - the most routed copied, the "
                                  "others read in place from the model's files\n", o.mmap_experts < 0 ? "auto" : "off",
                          all / 1e9, can / 1e9, ram_margin() / 1e9);
@@ -968,7 +968,7 @@ struct Model::Impl {
     }
     std::atomic<bool> ram_unlocked{false}, ram_unreg{false};
 
-    // INKLING2_VERIFY_LOAD=1 (tests): every expert's bytes in VRAM and in RAM against the file's, a line a difference
+    // IK2_HIP_VERIFY_LOAD=1 (tests): every expert's bytes in VRAM and in RAM against the file's, a line a difference
     bool verify(std::string& err) {
         long bad = 0;
         for (Layer& l : L) {
@@ -1041,7 +1041,7 @@ struct Model::Impl {
     // dummy false: the same chunk once the experts are in place - the first run of their own layout (the VRAM experts'
     // sets) pays seconds more, here and not in the first prompt
     bool warm_up(std::string& err, bool dummy = true) {
-        if (Tc <= 1 || std::getenv("INKLING2_NO_WARMUP")) return true;
+        if (Tc <= 1 || std::getenv("IK2_HIP_NO_WARMUP")) return true;
         const double t0 = now_s();
         if (!dummy) {
             const std::vector<uint32_t> keep = prof_cnt;
@@ -1130,10 +1130,10 @@ struct Model::Impl {
         max_keys = (size_t) std::max<int64_t>(g.n_swa, o.max_ctx);
         Tc = o.prefill_chunk > 1 ? (int) std::min<int64_t>(o.prefill_chunk, o.max_ctx) : 0;
         retune();
-        kStage = (int) env_d("INKLING2_STAGE", 24, 1, 384);
-        kTsMax = (int) env_d("INKLING2_TS_MAX", 128, 16, 1 << 16);
-        kS_n = (size_t) env_d("INKLING2_S_FLOOR_MI", 44, 1, 4096) << 20;
-        warm_n = (int) env_d("INKLING2_WARM_TOKENS", 256, 2, 1 << 20);
+        kStage = (int) env_d("IK2_HIP_STAGE", 24, 1, 384);
+        kTsMax = (int) env_d("IK2_HIP_TS_MAX", 128, 16, 1 << 16);
+        kS_n = (size_t) env_d("IK2_HIP_S_FLOOR_MI", 44, 1, 4096) << 20;
+        warm_n = (int) env_d("IK2_HIP_WARM_TOKENS", 256, 2, 1 << 20);
         o.rewind = (int) std::max<int64_t>(0, std::min<int64_t>(o.rewind, o.max_ctx));
         for (int64_t& x : snap_pos) x = -1;
         int ndev = 0;
@@ -1158,7 +1158,7 @@ struct Model::Impl {
             CK(cudaStreamCreateWithFlags(&G[i].s, cudaStreamNonBlocking));
             CK(cudaMemGetInfo(&G[i].free0, &G[i].total));
             if (!granule(G[i], err)) return false;
-            if (std::getenv("INKLING2_VRAM_LOG"))
+            if (std::getenv("IK2_HIP_VRAM_LOG"))
                 std::fprintf(stderr, "VRAM GPU %d at the start: free %.1f MiB, %.1f MiB after its first stream; allocations "
                              "over 1 MiB rounded to %zu KiB\n", G[i].dev, f_pre / 1048576.0, G[i].free0 / 1048576.0,
                              G[i].gran >> 10);
@@ -1256,7 +1256,7 @@ struct Model::Impl {
         }
         {   // the drafter (its load's own temporaries fit here, before the experts take the room)
             std::string e;
-            if (!dspark_init(e)) std::fprintf(stderr, "maya-inkling2: no drafter (%s): decoding without drafts\n", e.c_str());
+            if (!dspark_init(e)) std::fprintf(stderr, "maya-ik2: no drafter (%s): decoding without drafts\n", e.c_str());
         }
         notes("after the drafter");
         if (!warm_up(err)) return false;
@@ -1301,7 +1301,7 @@ struct Model::Impl {
                     return false;
                 }
         }
-        if (std::getenv("INKLING2_VERIFY_LOAD") && !verify(err)) return false;
+        if (std::getenv("IK2_HIP_VERIFY_LOAD") && !verify(err)) return false;
         {   // the RAM experts registered with the driver, a thread a GPU's layers
             const double tr = now_s();
             std::vector<std::thread> rt;
@@ -1339,13 +1339,13 @@ struct Model::Impl {
                 G[gi].sw_thread = std::thread([this, gi] { swap_run(gi); });
             }
         // (at least one move; above 16 swap_poll's bounce cap takes it)
-        if (const char* e = std::getenv("INKLING2_SWAP_BATCH")) swap_batch = std::max(1, std::min(64, std::atoi(e)));
-        if (const char* e = std::getenv("INKLING2_SWAP_BURST_MS")) burst_s = std::atof(e) * 1e-3;
+        if (const char* e = std::getenv("IK2_HIP_SWAP_BATCH")) swap_batch = std::max(1, std::min(64, std::atoi(e)));
+        if (const char* e = std::getenv("IK2_HIP_SWAP_BURST_MS")) burst_s = std::atof(e) * 1e-3;
         notes("after the cache's movers");
         st.ram_locked = st.ram_gb > 0 && !ram_unlocked.load();
         st.ram_pinned = st.ram_gb > 0 && !ram_unreg.load();
         if (Tc > 0 && st.ram_gb > 0 && !st.ram_pinned) {
-            std::fprintf(stderr, "maya-inkling2: the RAM experts could not be registered with the GPUs' driver: prompts "
+            std::fprintf(stderr, "maya-ik2: the RAM experts could not be registered with the GPUs' driver: prompts "
                                  "run token by token\n");
             Tc = 0;
         }
@@ -1414,7 +1414,7 @@ struct Model::Impl {
         const bool lane_on = l.n_res < g.n_expert;
         CK(cudaMemcpyAsync(h_ids, gp.ids, sizeof(int) * nu, cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_w, gp.rw, sizeof(float) * nu, cudaMemcpyDeviceToHost, s));
-        static const bool check = std::getenv("INKLING2_EXPERT_CHECK") != nullptr;   // (tests: see below)
+        static const bool check = std::getenv("IK2_HIP_EXPERT_CHECK") != nullptr;   // (tests: see below)
         if (lane_on || check) CK(cudaMemcpyAsync(h_xf, gp.xf, sizeof(float) * E, cudaMemcpyDeviceToHost, s));
         if (tapf || pick_hook) CK(cudaMemcpyAsync(h_rl.data(), gp.rl, sizeof(float) * g.n_expert, cudaMemcpyDeviceToHost, s));
         CK(sync_timed(s));
@@ -1459,7 +1459,7 @@ struct Model::Impl {
             }
         }
         bool ok = true;
-#if defined(INKLING2_IQ_SITU)
+#if defined(IK2_HIP_IQ_SITU)
         // ds4_iq's token kernels with the SITU activation: the plan a blob a pick (0: the CPU lane's, its weight 0)
         const int rows = nu;
         if (m > 0) {
@@ -1534,7 +1534,7 @@ struct Model::Impl {
         }
         k::wsum(gp.part, m, E, gp.wres, gp.y, s);
 #endif
-        // INKLING2_EXPERT_CHECK=1 (tests): every pick the GPU ran against the CPU lane's arithmetic on the file's bytes
+        // IK2_HIP_EXPERT_CHECK=1 (tests): every pick the GPU ran against the CPU lane's arithmetic on the file's bytes
         if (check && m > 0) {
             std::vector<float> hp((size_t) nu * E), ref((size_t) E);
             CK(cudaMemcpyAsync(hp.data(), gp.part, sizeof(float) * nu * E, cudaMemcpyDeviceToHost, s));
@@ -1550,7 +1550,7 @@ struct Model::Impl {
             int r = 0;
             for (int j = 0; j < nu; ++j) {
                 if (l.slot_of[(size_t) h_ids[j]] < 0) continue;
-#if defined(INKLING2_IQ_SITU)
+#if defined(IK2_HIP_IQ_SITU)
                 const float* mine = hp.data() + (size_t) j * E;
 #else
                 const float* mine = hp.data() + (size_t) r * E;
@@ -1628,7 +1628,7 @@ struct Model::Impl {
             return false;
         const int64_t lo = l.swa ? std::max<int64_t>(0, p - (g.n_swa - 1)) : 0;
         mark(gp, 1);
-        // (the keys split over tiles, the output gate in the combine: INKLING2_ATTN_OLD=1 for the earlier launches)
+        // (the keys split over tiles, the output gate in the combine: IK2_HIP_ATTN_OLD=1 for the earlier launches)
         if (!attn_old) {
             k::attention_split(gp.q, gp.rel, gp.sink, H, Hkv, D, g.d_rel, l.rel_bias, l.swa ? g.n_swa : g.rel_extent, l.K, l.V,
                                l.ring, p, lo, 1.0f / std::sqrt((float) D), gp.S, tapf ? nullptr : gp.gate, gp.ao, s);
@@ -1863,10 +1863,10 @@ struct Model::Impl {
     double fast_s = 0, fast_enq_s = 0, lane_work_s = 0, lane_wait_s = 0;
     int64_t fast_n = 0;
     bool fast_ready = false;
-    // INKLING2_PHASES=1 (tests): device-side marks between a layer's phases in the host-free step (events on the
+    // IK2_HIP_PHASES=1 (tests): device-side marks between a layer's phases in the host-free step (events on the
     // streams, read after the token: no extra waits), summed over the layers and tokens
-    bool phases = std::getenv("INKLING2_PHASES") != nullptr;
-    bool attn_old = std::getenv("INKLING2_ATTN_OLD") != nullptr;
+    bool phases = std::getenv("IK2_HIP_PHASES") != nullptr;
+    bool attn_old = std::getenv("IK2_HIP_ATTN_OLD") != nullptr;
     double ph_ms[kWin + 1][10] = {}, ph_s[kWin + 1] = {};
     int64_t ph_n[kWin + 1] = {};
     void ph(Layer& l, Gpu& gp, int k) {
@@ -1875,7 +1875,7 @@ struct Model::Impl {
     bool fast_on() const { return fast_ready && !tapf && !pick_hook && !prof; }
 
     bool fast_init(std::string& err) {
-        if (std::getenv("INKLING2_OLD_STEP")) return true;
+        if (std::getenv("IK2_HIP_OLD_STEP")) return true;
         const size_t E = (size_t) g.n_embd;
         const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
         CK(cudaSetDevice(G[0].dev));
@@ -3082,9 +3082,9 @@ struct Model::Impl {
         }
         return true;
     }
-    int swap_batch = 4;        // moves a GPU a round between two decode steps (INKLING2_SWAP_BATCH; measured: 4 and 8
+    int swap_batch = 4;        // moves a GPU a round between two decode steps (IK2_HIP_SWAP_BATCH; measured: 4 and 8
                                // decode alike, the CPU lane at 2 - 3 % of the picks)
-    double burst_s = 0.0;      // a prompt's burst at most, seconds (INKLING2_SWAP_BURST_MS; off: the first prompt after
+    double burst_s = 0.0;      // a prompt's burst at most, seconds (IK2_HIP_SWAP_BURST_MS; off: the first prompt after
                                // a load was seen to take 5 s longer with it - not understood yet)
     void use_decay(float f) {
         for (Layer& l : L)
@@ -3272,7 +3272,7 @@ struct Model::Impl {
     std::vector<std::string> info_lines() const {
         std::vector<std::string> v;
         char b[512];
-        std::snprintf(b, sizeof b, "maya-inkling2: %d layers, %d experts a layer (top %d), context %lld, floor %.0f",
+        std::snprintf(b, sizeof b, "maya-ik2: %d layers, %d experts a layer (top %d), context %lld, floor %.0f",
                       NL, g.n_expert, g.n_used, (long long) o.max_ctx, g.log_floor);
         v.push_back(b);
         for (const Gpu& gp : G) {
@@ -3324,13 +3324,13 @@ bool Model::forward(const int* ids, int n, int64_t pos0, float* logits_out, std:
 }
 void Model::reset() {
     std::string err;
-    if (!m->reset(err)) std::fprintf(stderr, "maya-inkling2 reset: %s\n", err.c_str());
+    if (!m->reset(err)) std::fprintf(stderr, "maya-ik2 reset: %s\n", err.c_str());
 }
 int64_t Model::end() const { return m->n_end; }
 int64_t Model::rewind(int64_t pos) {
     std::string err;
     int64_t at = 0;
-    if (!m->rewind(pos, false, at, err)) std::fprintf(stderr, "maya-inkling2 rewind: %s\n", err.c_str());
+    if (!m->rewind(pos, false, at, err)) std::fprintf(stderr, "maya-ik2 rewind: %s\n", err.c_str());
     return at;
 }
 void Model::set_progress(std::function<bool(int64_t)> f) { m->progress = std::move(f); }
@@ -3414,4 +3414,4 @@ void Model::set_pick_hook(PickHook h) { m->pick_hook = std::move(h); }
 void Model::vram_notes(const char* what) const { m->notes(what); }
 void Model::retune() { m->retune(); }
 
-}  // namespace inkling2
+}  // namespace ik2hip

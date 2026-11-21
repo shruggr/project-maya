@@ -600,12 +600,12 @@ function hy4Fields(m, d, s, ch, images, gpus) {
   ];
 }
 
-// Inkling 2 Small's (family "ik2": maya-ik2 on NVIDIA, maya-inkling2 on AMD - text only, one answer at a time; either
-// engine's other flags stay as the config has them).  Its VRAM a context position: maya-inkling2's figures from the
-// server (serve/models.py, the setup's too: m.kv_bytes for all the GPUs' caches, m.kv_gpu_bytes on each GPU, the
-// drafter's m.dspark_kv_bytes while it drafts); maya-ik2's the 8 global layers' K and V rows alone (8 heads x 128 in
-// F16 - the sliding-window layers' rings do not grow with the context).  Drafting: maya-inkling2's DSpark drafter
-// (choices.drafting: the engine has the switch; maya-ik2 has no drafter), m.dspark_gb of the last GPU's VRAM
+// Inkling 2 Small's (family "ik2", its engine maya-ik2 - text only, one answer at a time; the engine's other flags stay
+// as the config has them).  Its VRAM a context position: on AMD the figures from the server (serve/models.py, the
+// setup's too: m.kv_bytes for all the GPUs' caches, m.kv_gpu_bytes on each GPU, the drafter's m.dspark_kv_bytes while
+// it drafts); on NVIDIA the 8 global layers' K and V rows alone (8 heads x 128 in F16 - the sliding-window layers'
+// rings do not grow with the context).  Drafting: the AMD build's DSpark drafter (choices.drafting: the engine has the
+// switch; on NVIDIA it drafts in its CLI only), m.dspark_gb of the last GPU's VRAM
 const IK2_KV_BYTES = 32768;
 function ik2Fields(m, d, ch, gpus, reserve) {
   const dspark = m.choices.draft.includes("dspark"), amd = m.choices.drafting;
@@ -618,9 +618,9 @@ function ik2Fields(m, d, ch, gpus, reserve) {
           : "No DSpark drafter for this model on this PC: the setup downloads Thinking Machines' drafter and converts it."}>
         <${Seg} label="Drafting" value=${d.draft} options=${[...(dspark ? [{id: "dspark", label: "DSpark"}] : []), {id: "none", label: "Off"}]}
           onChange=${(v) => setDraft({draft: v})}/><//>` : null,
-      html`<${Row} label="Images" hint="Inkling 2 Small's engines read text only for now."/>`,
+      html`<${Row} label="Images" hint="Inkling 2 Small's engine reads text only for now."/>`,
       html`<${Row} label="Answers at once" hint="Inkling 2 Small answers one request at a time for now."/>`].filter(Boolean)},
-    // (maya-inkling2: DeepSeek's rows for the settings it shares with maya-ds4; maya-ik2 has none of them)
+    // (maya-ik2 on AMD: DeepSeek's rows for the settings it shares with maya-ds4; on NVIDIA it has none of them)
     {label: "GPUs and memory", rows: amd ? [gpus, reserve,
       html`<${Row} label="Experts VRAM does not hold" flag="--mmap-experts" changed=${ch("mmap")}
         hint="Auto (as In RAM here) copies the most used into RAM as far as it holds them and reads the others from the SSD in place.">

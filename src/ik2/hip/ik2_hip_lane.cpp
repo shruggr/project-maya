@@ -1,10 +1,10 @@
-// src/inkling2/inkling2_lane.cpp - maya-inkling2's CPU lane (inkling2_lane.hpp)
-#include "inkling2_lane.hpp"
+// src/ik2/hip/ik2_hip_lane.cpp - maya-ik2's CPU lane (ik2_hip_lane.hpp)
+#include "ik2_hip_lane.hpp"
 
 #include <algorithm>
 #include <cmath>
 
-namespace inkling2 {
+namespace ik2hip {
 
 namespace iqc = strata::ds4::gguf;
 
@@ -23,7 +23,7 @@ struct Scratch {
 
 bool CpuExperts::init(int tg, int td, int n_embd, int n_ff, std::string& err) {
     if (!iqc::iq_cpu_fmt(tg, td, n_embd, n_ff, f, err)) return false;
-#if defined(INKLING2_IQ_SITU)
+#if defined(IK2_HIP_IQ_SITU)
     f.act = iqc::kIqActSitu;   // (ds4_iq_cpu's own SITU epilogue over the fused rows)
     f.situ_beta = beta;
     f.situ_lb = lb;
@@ -48,7 +48,7 @@ void cpu_experts(hy4::Lane& lane, const CpuExperts& ex, const std::vector<CpuEnt
     iqc::iq_cpu_quant(f.gu_act, x, E, sc.act.data());
     [[maybe_unused]] const int gu_chunks = (2 * F + kRowChunk - 1) / kRowChunk;
     const int dn_chunks = (E + kRowChunk - 1) / kRowChunk;
-#if defined(INKLING2_IQ_SITU)
+#if defined(IK2_HIP_IQ_SITU)
     const int h_chunks = (F + kRowChunk - 1) / kRowChunk;
     lane.parallel_for(n * h_chunks, [&](int it) {
         const int i = it / h_chunks, r0 = (it % h_chunks) * kRowChunk, r1 = std::min(F, r0 + kRowChunk);
@@ -93,7 +93,7 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
     const int E = f.n_embd, F = f.n_ff, n = (int) entries.size();
     std::fill(out, out + (size_t) T * E, 0.0f);
     if (n == 0) return;
-#if !defined(INKLING2_IQ_SITU)
+#if !defined(IK2_HIP_IQ_SITU)
     {   // (no fused SITU rows in this build: a row at a time)
         std::vector<CpuEntry> one;
         std::vector<float> o((size_t) E);
@@ -180,4 +180,4 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
 }
 
 
-}  // namespace inkling2
+}  // namespace ik2hip

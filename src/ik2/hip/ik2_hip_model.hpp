@@ -1,5 +1,5 @@
-// src/inkling2/inkling2_model.hpp - maya-inkling2: Thinking Machines' Inkling 2 Small (a GGUF set,
-// tools/inkling2/pack_gguf.py) on the GPUs (docs/INKLING2_AMD.md).
+// src/ik2/hip/ik2_hip_model.hpp - maya-ik2: Thinking Machines' Inkling 2 Small (a GGUF set,
+// tools/ik2/pack_gguf.py) on the GPUs (docs/INKLING2_AMD.md).
 //
 // The 48 layers split over the GPUs by their memory, each holding its layers' dense matrices, its share of the routed
 // experts (in VRAM, an expert's gate | up | down a blob: the most routed by a profile), the K / V caches (the
@@ -7,7 +7,7 @@
 // histories.  The experts that do not fit are copied into RAM at the load and run on the CPU lane.
 //
 // A step takes 1 .. window_max() tokens (forward: one; window: a verify window, cut back with keep); a prompt goes
-// through the layers a chunk at a time.  With Options::dspark_index the DSpark drafter (inkling2_dspark.hpp) sits on
+// through the layers a chunk at a time.  With Options::dspark_index the DSpark drafter (ik2_hip_dspark.hpp) sits on
 // the last GPU and is fed every kept position's taps: draft() gives the tokens after the next one.
 #pragma once
 
@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-namespace inkling2 {
+namespace ik2hip {
 
 struct Options {
     std::string pack;
@@ -50,7 +50,7 @@ struct Options {
     int prefill_chunk = 512;
     int layers = 0;               // (tests) only the first `layers` layers are loaded and run (0: all)
     double log_floor = 0;         // log_scaling_n_floor in place of the pack's (0: the pack's)
-    std::string dspark_index;     // the drafter's index folder (inkling2_dspark.hpp; empty: no drafter): loaded on the
+    std::string dspark_index;     // the drafter's index folder (ik2_hip_dspark.hpp; empty: no drafter): loaded on the
                                   // last GPU, fed every position's taps by the steps and the prompt path
     float dspark_cum = 0.5f;      // its cut on the running product of the drafts' probabilities (Model::set_draft_cum)
     bool expert_cache = true;     // experts move between VRAM and the CPU lane as they are used (maya-ds4's)
@@ -153,9 +153,9 @@ public:
     /// (T tokens' picks, n each, the first token at position pos0)
     using PickHook = std::function<bool(int il, int* ids, int n, int64_t pos0, int T)>;
     void set_pick_hook(PickHook h);
-    /// (tests, INKLING2_VRAM_LOG=1) a line a GPU: its free VRAM, this engine's allocations and the rest
+    /// (tests, IK2_HIP_VRAM_LOG=1) a line a GPU: its free VRAM, this engine's allocations and the rest
     void vram_notes(const char* what) const;
-    /// (tests, --sweep) the run-time INKLING2_* overrides read again (the expert cache's rule, the lane's spin, the
+    /// (tests, --sweep) the run-time IK2_HIP_* overrides read again (the expert cache's rule, the lane's spin, the
     /// histories' cadence, the burst)
     void retune();
 
@@ -164,4 +164,4 @@ private:
     std::unique_ptr<Impl> m;
 };
 
-}  // namespace inkling2
+}  // namespace ik2hip

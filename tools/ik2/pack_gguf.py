@@ -1,9 +1,9 @@
-"""tools/inkling2/pack_gguf.py - maya-inkling2's pack for an Inkling 2 GGUF set (Thinking Machines' Inkling 2 Small,
+"""tools/ik2/pack_gguf.py - maya-ik2's pack for an Inkling 2 GGUF set (Thinking Machines' Inkling 2 Small,
 the GGUF's `inkling2` layout: unsloth's UD-Q2_K_XL build), beside the model's files (no weights copied).
 
-    python tools/inkling2/pack_gguf.py --model ~/models/Inkling-2-Small-GGUF/UD-Q2_K_XL [--log-floor 8192]
+    python tools/ik2/pack_gguf.py --model ~/models/Inkling-2-Small-GGUF/UD-Q2_K_XL [--log-floor 8192]
 
-writes <model>/maya-inkling2/:
+writes <model>/maya-ik2/:
   inkling2.txt  the geometry, one `key value` a line (lists comma-separated), from the GGUF's inkling2.* keys
                 (log_scaling_n_floor: the GGUF's, with its stale 128000 read as 8192 - STALE_FLOOR; --log-floor
                 overrides it)
@@ -100,7 +100,7 @@ def geometry(kv: dict, log_floor: int | None) -> dict:
     }
     if int(g("attention.value_length")) != geo["head_dim"] or geo["n_head"] % geo["n_head_kv"] or \
             geo["shortconv_kernel"] != 4 or geo["n_embd"] % 256 or geo["n_ff_exp"] % 256 or geo["n_expert_used"] > 16:
-        raise SystemExit("a geometry maya-inkling2 does not run")
+        raise SystemExit("a geometry maya-ik2 does not run")
     return geo
 
 
@@ -128,12 +128,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="the folder of the GGUF set")
     ap.add_argument("--files", nargs="*", help="the set's shards (default: every .gguf in the folder)")
-    ap.add_argument("--out", help="the pack's folder (default: <model>/maya-inkling2)")
+    ap.add_argument("--out", help="the pack's folder (default: <model>/maya-ik2)")
     ap.add_argument("--log-floor", type=int, help="log_scaling_n_floor in place of the GGUF's (default: the GGUF's, "
                                                   "its stale 128000 read as Thinking Machines' fixed 8192)")
     a = ap.parse_args()
     model = pathlib.Path(a.model).expanduser().resolve()
-    out = pathlib.Path(a.out).expanduser().resolve() if a.out else model / "maya-inkling2"
+    out = pathlib.Path(a.out).expanduser().resolve() if a.out else model / "maya-ik2"
     gs = find_shards(model, a.files)
     kv = {}
     for g in gs:

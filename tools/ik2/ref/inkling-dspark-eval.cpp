@@ -1,5 +1,5 @@
 // inkling-dspark-eval: the acceptance rate of Inkling 2 Small's DSpark drafter, measured offline against the target's
-// own greedy continuation (maya-inkling2, docs/INKLING2_DSPARK.md).  Built in a worktree of llama.cpp PR #32218.
+// own greedy continuation (maya-ik2, docs/INKLING2_DSPARK.md).  Built in a worktree of llama.cpp PR #32218.
 //
 // The target reads each prompt and decodes INK_N greedy tokens once, keeping every position's tap candidates
 // (llama_get_embeddings_layer_inp: the PR's slots 5..41 and 48, plus - INK_TAP_EXTRA=1, this worktree's patch - slot 0
