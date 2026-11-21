@@ -233,12 +233,22 @@ int sample(const float* row, int V, const mm3::sample::Req& r, const std::vector
 // little where drafts are break-even and much where the text turns to code or prose - measured through the server:
 // rests of up to 128 rounds carried from a thinking block slept through most of the code after it.)
 // (a, b and t_draft's starting values, rest_len / its cap 32, the 8 rounds before judging, the 0.1 a / 0.3 a bars, the
-//  0.9 / 0.1 averages and b's 0.5 ms floor: MEASURE - docs/INKLING2_AMD.md, "Values and their sources")
+//  0.9 / 0.1 averages and b's 0.5 ms floor: each with an INKLING2_DRAFT_* override, read when a Drafting is made -
+//  docs/INKLING2_AMD.md, "Values and their sources")
+double env_d(const char* k, double d) {
+    const char* v = std::getenv(k);
+    return v != nullptr && *v != 0 ? std::strtod(v, nullptr) : d;
+}
 struct Drafting {
     bool on = false;
-    double a = 30.0, b = 7.0, t_draft = 10.0;   // ms: a token's pass, a window row more, a draft
+    double a = env_d("INKLING2_DRAFT_A0", 30.0), b = env_d("INKLING2_DRAFT_B0", 7.0),
+           t_draft = env_d("INKLING2_DRAFT_T0", 10.0);   // ms: a token's pass, a window row more, a draft
     double gain = 0.0;                          // ms a drafted round gains over plain steps (EMA)
-    int n_d = 0, rest = 0, rest_len = 8;
+    int rest_len0 = (int) env_d("INKLING2_DRAFT_REST", 8), rest_max = (int) env_d("INKLING2_DRAFT_REST_MAX", 32),
+        warm = (int) env_d("INKLING2_DRAFT_WARM", 8);
+    double rest_gain = env_d("INKLING2_DRAFT_REST_GAIN", 0.1), reset_gain = env_d("INKLING2_DRAFT_RESET_GAIN", 0.3),
+           ema = env_d("INKLING2_DRAFT_EMA", 0.9), b_min = env_d("INKLING2_DRAFT_B_MIN", 0.5);
+    int n_d = 0, rest = 0, rest_len = rest_len0;
     int rest0 = 0;   // rounds without a draft after one whose drafts were not worth a window (--dspark-rest0; measured:
                      // 1 costs prose a sixth of its drafted rounds and gains thinking text nothing)
     // (counters over the engine's life; a request's are differences)
@@ -266,26 +276,26 @@ struct Drafting {
         return best;
     }
     void observe_pass(int T, double ms) {
-        if (T == 1) a = 0.9 * a + 0.1 * ms;
-        else b = 0.9 * b + 0.1 * std::max(0.5, (ms - a) / (T - 1));
+        if (T == 1) a = ema * a + (1 - ema) * ms;
+        else b = ema * b + (1 - ema) * std::max(b_min, (ms - a) / (T - 1));
     }
     void observe_round(bool was_drafted, int k, int kept, double t_draft_ms) {
         if (!was_drafted) return;
         const double g = kept * a - (t_draft_ms + k * b);
-        gain = n_d > 0 ? 0.9 * gain + 0.1 * g : g;
-        if (++n_d < 8) return;
-        if (gain < 0.1 * a) {   // drafting does not pay here: rest, longer each time in a row
+        gain = n_d > 0 ? ema * gain + (1 - ema) * g : g;
+        if (++n_d < warm) return;
+        if (gain < rest_gain * a) {   // drafting does not pay here: rest, longer each time in a row
             rest = rest_len;
-            rest_len = std::min(32, rest_len * 2);
+            rest_len = std::min(rest_max, rest_len * 2);
             n_d = 0;
             ++rested;
-        } else if (gain > 0.3 * a) {
-            rest_len = 8;
+        } else if (gain > reset_gain * a) {
+            rest_len = rest_len0;
         }
     }
     void start() {   // (a request's first round: no rest left over from the last one)
         rest = 0;
-        rest_len = 8;
+        rest_len = rest_len0;
         n_d = 0;
     }
 };
@@ -375,7 +385,7 @@ bool draft_round(inkling2::Model& m, Drafting& dr, int tok, const mm3::sample::R
             const int max_n = (int) std::min<long long>({7, room - 1, (long long) m.window_max() - 1, ctx_room - 1});
             if (!m.draft(tok, max_n, toks, probs, err)) return false;
             const double td = (now_s() - t0) * 1e3;
-            dr.t_draft = 0.9 * dr.t_draft + 0.1 * td;
+            dr.t_draft = dr.ema * dr.t_draft + (1 - dr.ema) * td;
             dr.draft_ms += td;
             ++dr.drafted;
             was_drafted = true;
@@ -637,6 +647,7 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool s
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, n, (t1 - t0) * 1e3, (t2 - t1) * 1e3, finish,
                     dr.accepted - d0.accepted, dr.offered - d0.offered, from);
         std::fflush(stdout);
+        m.vram_notes("after a request");
         std::fprintf(stderr,
                      "maya inkling2 serve: prompt %zu tokens = %zu reused (%zu held in common) + %zu read in %.0f ms (%.1f "
                      "tok/s), %lld generated in %.0f ms (%.1f tok/s), %s; VRAM hit %.1f%%, CPU lane %.1f%%, %lld cache moves "
@@ -701,6 +712,8 @@ int usage() {
                  "  --temperature F / --seed N   (tests, with --tokens) sampled decoding\n"
                  "  --prompts F         (tests) a prompt a line (ids), each decoded from an empty context\n"
                  "  --ab                (tests) each prompt twice, without drafts and with them: the speeds, the tokens compared\n"
+                 "  --sweep VAR=a,b,..  (tests, with --prompts) each prompt's drafted decode with each value of the INKLING2_*\n"
+                 "                      override VAR (--sweep-rounds N times, 2 by default, the order reversed every other)\n"
                  "  --window-bits       (tests, with --window-test) which part of a window differs from the token steps\n"
                  "  --verbose\n");
     return 2;
@@ -712,7 +725,9 @@ int main(int argc, char** argv) {
     inkling2::Options o;
     std::vector<std::string> parities;
     std::string tokens;
-    int n_predict = 0, repeat = 1, short_n = 3;   // (short_n: MEASURE with --short-bench)
+    // (short_n: --short-bench after the 2.7k-token prompt, ms, prompt path / decode path: 3 tokens 118.7 / 95.9, 4 tokens
+    //  125.9 / 123.2, 5 tokens 129.8 / 148.1 - means of 5, each within 3 ms; docs/INKLING2_AMD.md)
+    int n_predict = 0, repeat = 1, short_n = 4;
     bool serving = false, short_bench = false, window_bits = false;
     std::string dspark = "on", dspark_index;   // (the drafter's index: the config names it, the setup writes it)
     float dspark_cum = 0.5f, temperature = 0.0f;
@@ -722,6 +737,10 @@ int main(int argc, char** argv) {
     std::vector<int> stops = {200006, 199999};
     std::string rewind_test, tokens_file, window_test, prompts_file;
     bool ab = false;
+    // (tests) --sweep VAR=v1,v2,..: the drafted decode of each prompt with each value of the INKLING2_* override VAR,
+    // --sweep-rounds times (ABBA order); several --sweep: one after the other, each VAR unset after its own
+    std::vector<std::pair<std::string, std::vector<std::string>>> sweeps;
+    int sweep_rounds = 2;
     std::vector<int> rest0_list;   // (tests: prompt i's Drafting::rest0)
     std::vector<int> try_chunks;
     int64_t parity_max = -1;
@@ -765,6 +784,18 @@ int main(int argc, char** argv) {
         else if (a == "--window-bits") window_bits = true;
         else if (a == "--prompts") prompts_file = val();
         else if (a == "--ab") ab = true;
+        else if (a == "--sweep") {
+            const std::string v = val();
+            const size_t eq = v.find('=');
+            if (eq == std::string::npos) return usage();
+            sweeps.push_back({v.substr(0, eq), {}});
+            for (size_t i = eq + 1; i <= v.size();) {
+                const size_t c = std::min(v.find(',', i), v.size());
+                sweeps.back().second.push_back(v.substr(i, c - i));
+                i = c + 1;
+            }
+        }
+        else if (a == "--sweep-rounds") sweep_rounds = std::max(1, std::atoi(val().c_str()));
         else if (a == "--dspark-rest0") rest0_list = int_list(val());
         else if (a == "--short-bench") short_bench = true;
         else if (a == "--parity-detail") detail = true;
@@ -1038,8 +1069,9 @@ int main(int argc, char** argv) {
         for (int n : {1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32, 64}) {
             if ((size_t) n * 2 > ids.size()) break;
             const size_t base = ids.size() - (size_t) n;
-            double tp = 0, td = 0;
-            for (int rep2 = 0; rep2 < 2; ++rep2) {
+            double tp = 0, td = 0, tp_all = 0, td_all = 0;
+            const int reps = std::max(3, repeat);
+            for (int rep2 = 0; rep2 < reps; ++rep2) {
                 model.reset();
                 if (!model.forward(ids.data(), (int) base, 0, nullptr, err)) return 1;
                 double t0 = now_s();
@@ -1051,9 +1083,12 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < n; ++i)
                     if (!model.forward(&ids[base + (size_t) i], 1, (int64_t) base + i, nullptr, err)) return 1;
                 td = now_s() - t0;
+                if (rep2 > 0) tp_all += tp, td_all += td;   // (the first of each: warm-up)
+                if (rep2 > 0) std::printf("short-bench %d tokens, run %d: the prompt path %.1f ms, the decode path %.1f ms\n", n,
+                                          rep2, tp * 1e3, td * 1e3);
             }
-            std::printf("short-bench %d tokens after %zu: the prompt path %.0f ms, the decode path %.0f ms\n", n, base,
-                        tp * 1e3, td * 1e3);
+            std::printf("short-bench %d tokens after %zu: the prompt path %.1f ms, the decode path %.1f ms (means of %d)\n", n,
+                        base, tp_all * 1e3 / (reps - 1), td_all * 1e3 / (reps - 1), reps - 1);
             std::fflush(stdout);
         }
         return 0;
@@ -1074,8 +1109,35 @@ int main(int argc, char** argv) {
         }
         if (plist.empty() || plist[0].empty()) return usage();
         std::vector<int> gen, gen_a;
-        for (size_t pi = 0; pi < plist.size(); ++pi)
-        for (int mode = ab ? 0 : 1; mode < 2; ++mode) {
+        struct Run {
+            size_t pi;
+            int mode, sw, sv;
+        };
+        std::vector<Run> runs;
+        if (!sweeps.empty()) {
+            for (size_t sw = 0; sw < sweeps.size(); ++sw) {
+                const int nv = (int) sweeps[sw].second.size();
+                for (int r = 0; r < sweep_rounds; ++r)
+                    for (size_t pi = 0; pi < plist.size(); ++pi) {
+                        runs.push_back({pi, 1, (int) sw, -2});   // (a warm run first: the cache settled on the prompt)
+                        for (int j = 0; j < nv; ++j) runs.push_back({pi, 1, (int) sw, r % 2 ? nv - 1 - j : j});
+                    }
+            }
+        } else {
+            for (size_t pi = 0; pi < plist.size(); ++pi)
+                for (int mode = ab ? 0 : 1; mode < 2; ++mode) runs.push_back({pi, mode, -1, -1});
+        }
+        for (const Run& run : runs) {
+        const size_t pi = run.pi;
+        const int mode = run.mode;
+        if (run.sw >= 0) {
+            const auto& [var, vals] = sweeps[(size_t) run.sw];
+            if (run.sw > 0) unsetenv(sweeps[(size_t) run.sw - 1].first.c_str());
+            if (run.sv >= 0) setenv(var.c_str(), vals[(size_t) run.sv].c_str(), 1);
+            else unsetenv(var.c_str());
+            model.retune();
+            std::printf("sweep %s=%s prompt %zu\n", var.c_str(), run.sv >= 0 ? vals[(size_t) run.sv].c_str() : "warm", pi + 1);
+        }
         const std::vector<int>& ids = plist[pi];
         gen.clear();
         double t0 = 0, t1 = 0;

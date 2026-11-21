@@ -280,9 +280,62 @@ struct Model::Impl {
     float* h_big = nullptr;          // (pinned: a tap's tensor, the logits on their way out)
     size_t max_keys = 0;
     int Tc = 0;                      // the prompt path's chunk (0: none)
+    // ---- the values the measurement phase swept (docs/INKLING2_AMD.md, "Values and their sources"), each with an
+    // INKLING2_<NAME> override as maya-ds4's DS4_CACHE_*: read at the load; Model::retune reads the run-time ones again
+    // (--sweep).  The load's: INKLING2_STAGE, INKLING2_TS_MAX, INKLING2_S_FLOOR_MI, INKLING2_WARM_TOKENS
+    static double env_d(const char* k, double d, double lo, double hi) {
+        const char* v = std::getenv(k);
+        if (v == nullptr || *v == 0) return d;
+        char* end = nullptr;
+        const double x = std::strtod(v, &end);
+        if (end == v || !(x >= lo && x <= hi)) {
+            std::fprintf(stderr, "maya-inkling2: %s=%s is not a number from %g to %g: keeping %g\n", k, v, lo, hi, d);
+            return d;
+        }
+        return x;
+    }
+    struct Tune {
+        // the expert cache's rule, maya-ds4's (DS4_CACHE_DECAY / _MARGIN / _BONUS): the experts' heat x 0.9 every 256
+        // tokens (here a token's share of it, 0.9^(1/256), as each token decays), and a RAM expert moves in when its heat
+        // passes the coldest VRAM one's x 1.25 + 1.0 (INKLING2_CACHE_DECAY / _MARGIN / _BONUS; measured against this
+        // engine's earlier x0.995 a token, 1.5 and 0.5: a six-turn chat 51.3 / 51.0 tok/s against 48.7 / 51.2 - docs)
+        double cache_decay = 0.9;
+        float tok_decay = 0.9995885f;    // (retune sets it from cache_decay)
+        float cache_margin = 1.25f, cache_bonus = 1.0f;
+        float prompt_rows = 64.0f;     // a prompt chunk of T rows: each routing counts min(1, this / T) (_CACHE_PROMPT_ROWS)
+        int win_rows = 4;              // a window's moves: its rows count as this many tokens' at most (INKLING2_SWAP_WIN_ROWS)
+        int lane_spin_us = 20000;      // the lane's dispatcher spins this long between two tokens, then sleeps (_LANE_SPIN_US:
+                                       // maya-ds4's DS4_LANE_SPIN_US; 200 / 1800 / 20000 us decoded alike - docs)
+        int snap_every = 64;           // the histories saved every this many decoded tokens (INKLING2_SNAP_EVERY)
+        int burst_rounds = 48, burst_moves = 64, burst_min = 64;   // the swap burst (INKLING2_BURST_ROUNDS / _MOVES / _MIN)
+        bool tap_event = true;         // (tests, INKLING2_TAP_EVENT=0: the taps' hand-off without its event - timing alone)
+        // (tests, --sweep: at most this much of the load's allocation - INKLING2_STAGE_USE experts a staging pass,
+        //  INKLING2_TS_USE tokens an attention pass, INKLING2_S_USE_MI Mi score floats; 0: all of it)
+        int stage_use = 0, ts_use = 0;
+        size_t s_use = 0;
+    } tn;
+    void retune() {
+        tn.cache_decay = env_d("INKLING2_CACHE_DECAY", 0.9, 0.0, 1.0);
+        tn.tok_decay = (float) std::pow(tn.cache_decay, 1.0 / 256.0);
+        tn.cache_margin = (float) env_d("INKLING2_CACHE_MARGIN", 1.25, 0.0, 100.0);
+        tn.cache_bonus = (float) env_d("INKLING2_CACHE_BONUS", 1.0, 0.0, 1e6);
+        tn.prompt_rows = (float) env_d("INKLING2_CACHE_PROMPT_ROWS", 64, 1, 1 << 20);
+        tn.win_rows = (int) env_d("INKLING2_SWAP_WIN_ROWS", 4, 1, 16);
+        tn.lane_spin_us = (int) env_d("INKLING2_LANE_SPIN_US", 20000, 0, 1e6);
+        tn.snap_every = (int) env_d("INKLING2_SNAP_EVERY", 64, 1, 1 << 20);
+        tn.burst_rounds = (int) env_d("INKLING2_BURST_ROUNDS", 48, 1, 1 << 20);
+        tn.burst_moves = (int) env_d("INKLING2_BURST_MOVES", 64, 1, 16);
+        tn.burst_min = (int) env_d("INKLING2_BURST_MIN", 64, 1, 1 << 30);
+        tn.tap_event = env_d("INKLING2_TAP_EVENT", 1, 0, 1) != 0;
+        tn.stage_use = (int) env_d("INKLING2_STAGE_USE", 0, 0, 384);
+        tn.ts_use = (int) env_d("INKLING2_TS_USE", 0, 0, 1 << 16);
+        tn.s_use = (size_t) env_d("INKLING2_S_USE_MI", 0, 0, 1 << 16) << 20;
+    }
     // streamed experts a pass, in two buffers: one is copied while the other's experts run - fewer passes against
-    // 2 x 24 blobs of VRAM (measurable: a prompt's tok/s)
-    static constexpr int kStage = 24;
+    // 2 x kStage blobs of VRAM (INKLING2_STAGE).  Measured, 2048-token chunks, tok/s at 24 / 48 / 64 / 96: a 20K prompt
+    // 1579 / 1713 / 1812 / 1831, 80K 1358 / 1436 / 1499 / 1509 - 64's 0.8 GiB a GPU more, with E9's and E42's, cost the
+    // shorter prompts and the RAM (Options::prefill_chunk), so 24
+    int kStage = 24;
     size_t blob_max = 0;
     // the hand-off between two GPUs' stages of a chunk: slot gi is GPU gi's input ([1 + states][T][E], pinned)
     struct Slot {
@@ -441,13 +494,16 @@ struct Model::Impl {
     int n_states() const { return (g.n_layer + g.res_block - 1) / g.res_block; }
     // the attention's scores (F32, and their F16 copy beside): floats.  A pass of ts tokens over nk keys takes
     // n_head x ts x nk of them (attention_rows halves ts until it fits), so they must hold one token over every key
-    // the context has, n_head x max_keys (48 x 1M = 50.3M at the model's 1M) - 44 Mi floats alone stop a prompt at
-    // about 961K keys; kS_n, the floor, is a 512-token pass over 1,877 keys
-    static constexpr size_t kS_n = (size_t) 44 << 20;
+    // the context has, n_head x max_keys (48 x 1M = 50.3M at the model's 1M).  kS_n, the floor (INKLING2_S_FLOOR_MI):
+    // the passes a long prompt's chunk takes - measured, an 80K-token prompt in 2048-token chunks, tok/s at 11 / 22 /
+    // 44 / 88 / 176 / 352 Mi: 853 / 1082 / 1247 / 1354 / 1409 / 1400 (20K: within 1%, 352 3% slower); 44 Mi is 264 MiB
+    // a GPU (F32 + F16) - 176's 0.8 GiB more, with E9's and E44's, cost the shorter prompts and the RAM (prefill_chunk)
+    size_t kS_n = (size_t) 44 << 20;
     size_t S_n() const { return std::max(kS_n, (size_t) g.n_head * max_keys); }
-    // ... and its tokens a pass at most: the default prompt chunk (a longer chunk runs passes of 512); its rel-bias
-    // table is kTsMax x n_head x rel_extent floats, 100 MB
-    static constexpr int kTsMax = 512;
+    // ... and its tokens a pass at most (INKLING2_TS_MAX); its rel-bias table is kTsMax x n_head x rel_extent floats,
+    // 25 MB.  Measured, 2048-token chunks, tok/s at 32 / 64 / 128 / 256 / 512: a 20K prompt 1806 / 1861 / 1875 / 1844 /
+    // 1841, 80K 1483 / 1524 / 1532 / 1513 / -
+    int kTsMax = 128;
     bool chunk_scratch(Gpu& gp, std::string& err) {
         if (Tc <= 0) return true;
         const size_t blob_max = gp.blob_max;
@@ -470,7 +526,7 @@ struct Model::Impl {
         CK(cudaMallocHost((void**) &gp.hc_ids, T * nu * 4));
         CK(cudaMallocHost((void**) &gp.hc_rw, T * nu * 4));
         CK(cudaMallocHost((void**) &gp.hc_rl, T * (size_t) g.n_expert * 4));
-        CK(cudaMallocHost((void**) &gp.hc_pmap, (size_t) 32 * g.n_expert * 4));
+        CK(cudaMallocHost((void**) &gp.hc_pmap, (size_t) g.n_expert * g.n_expert * 4));   // (a pass's map each: one expert a pass at most)
         return gp.alloc(gp.c_cur, T * E, err) && gp.alloc(gp.c_blocks, (size_t) n_states() * T * E, err) &&
                gp.alloc(gp.c_mixo, 3 * T * E, err) && gp.alloc(gp.c_xn, 3 * T * E, err) &&
                gp.alloc(gp.c_stat, 4 * k::kMaxStates * T, err) && gp.alloc(gp.c_q, T * HD, err) &&
@@ -885,8 +941,23 @@ struct Model::Impl {
             const Stats st0 = st;
             const bool sw = o.expert_cache;
             o.expert_cache = false;
-            std::vector<int> ids((size_t) std::min(Tc, warm_n), 0);
-            const bool ok = prompt(ids.data(), (int) ids.size(), 0, nullptr, err) && reset(err);
+            // (what a request touches, again after the experts' load: that load's memory pressure sends the host memory
+            //  the first warm-up touched - the BLAS's tables, the runtime's, the engine's own - to swap, and the first
+            //  prompt then paged it back in: one of its layers 5.6 s, 2.7k tokens in 8.5 s instead of 2.8.  So a full
+            //  chunk and a part of one, tokens spread over the vocabulary - their picks stream many of the RAM experts
+            //  as a real prompt's do - then a few decode windows of a round's sizes)
+            std::vector<int> ids((size_t) std::min<int64_t>(Tc + std::max(2, Tc / 4), o.max_ctx - 16), 0);   // (16: the windows after it)
+            for (size_t t = 0; t < ids.size(); ++t) ids[t] = (int) ((t * 7919 + 13) % (size_t) g.n_vocab_unpadded);
+            bool ok = prompt(ids.data(), (int) ids.size(), 0, nullptr, err);
+            n_end = (int64_t) ids.size();
+            if (ok && fast_on()) {
+                int tops[kWin];
+                for (int T : {1, 4, kWin}) {
+                    ok = ok && step_win(ids.data(), T, n_end, tops, nullptr, err);
+                    n_end += T;
+                }
+            }
+            ok = ok && reset(err);
             o.expert_cache = sw;
             prof_cnt = keep;
             st = st0;
@@ -947,6 +1018,11 @@ struct Model::Impl {
         NL = o.layers > 0 ? std::min(o.layers, g.n_layer) : g.n_layer;
         max_keys = (size_t) std::max<int64_t>(g.n_swa, o.max_ctx);
         Tc = o.prefill_chunk > 1 ? (int) std::min<int64_t>(o.prefill_chunk, o.max_ctx) : 0;
+        retune();
+        kStage = (int) env_d("INKLING2_STAGE", 24, 1, 384);
+        kTsMax = (int) env_d("INKLING2_TS_MAX", 128, 16, 1 << 16);
+        kS_n = (size_t) env_d("INKLING2_S_FLOOR_MI", 44, 1, 4096) << 20;
+        warm_n = (int) env_d("INKLING2_WARM_TOKENS", 256, 2, 1 << 20);
         o.rewind = (int) std::max<int64_t>(0, std::min<int64_t>(o.rewind, o.max_ctx));
         for (int64_t& x : snap_pos) x = -1;
         int ndev = 0;
@@ -1015,7 +1091,9 @@ struct Model::Impl {
                 auto run = [&]() -> bool {
                     std::string& err = e;
                     CK(cudaSetDevice(gp.dev));
-                    gp.stage_bytes = (size_t) 256 << 20;   // (the load's pinned staging at least; MEASURE)
+                    // (the load's pinned staging at least: copies of 64 MiB already run at 99% of 1 GiB's, 56.3 against
+                    //  56.9 GB/s, and the load reads its files at about 1 GB/s - measured, docs/INKLING2_AMD.md)
+                    gp.stage_bytes = (size_t) 256 << 20;
                     for (int il = gp.l0; il < gp.l1; ++il) gp.stage_bytes = std::max(gp.stage_bytes, L[(size_t) il].blob);
                     CK(cudaMallocHost((void**) &gp.stage, gp.stage_bytes));
                     gp.note("after the load's pinned stage");
@@ -1123,10 +1201,13 @@ struct Model::Impl {
                         if (!l.ram_reg) ram_unreg = true;
                         // (each registered page's first copy to the device is several times slower than the later
                         //  ones: paid here, not by the first prompt)
-                        if (l.ram_reg && Tc > 0)
+                        // (on the side stream, as the prompt path copies them)
+                        if (l.ram_reg && Tc > 0) {
                             for (size_t o2 = 0; o2 < l.ram_bytes; o2 += (size_t) kStage * l.blob)
-                                cudaMemcpy(G[gi].xstage[0], l.ram + o2, std::min((size_t) kStage * l.blob, l.ram_bytes - o2),
-                                           cudaMemcpyHostToDevice);
+                                cudaMemcpyAsync(G[gi].xstage[0], l.ram + o2, std::min((size_t) kStage * l.blob, l.ram_bytes - o2),
+                                                cudaMemcpyHostToDevice, G[gi].s2);
+                            cudaStreamSynchronize(G[gi].s2);
+                        }
                     }
                 });
             for (auto& x : rt) x.join();
@@ -1497,10 +1578,10 @@ struct Model::Impl {
         else if (tok_type == 14) dequantize_row_q6_K(row, h_x, E);
         else std::memcpy(h_x, row, (size_t) E * 4);
         int nb = 0;
-        use_decay(0.995f);   // (a token's decay of the heat: MEASURE against maya-ds4's x0.9 every 256 tokens)
+        use_decay(tn.tok_decay);
         if (!swap_poll(err)) return false;
         hw = std::max(hw, p + 1);
-        const int slot = p % kSnapEvery == 0 || snap_next ? snap_alloc(p) : -1;
+        const int slot = p % tn.snap_every == 0 || snap_next ? snap_alloc(p) : -1;
         snap_next = false;
         for (size_t gi = 0; gi < G.size(); ++gi) {
             Gpu& gp = G[gi];
@@ -1592,7 +1673,7 @@ struct Model::Impl {
         if (!taps_on || ds->end() != tap_p0) return true;   // (the drafter is not at these rows: it rests until a rewind)
         const double t0 = now_s();
         const bool ok = ds->feed_dev(G.back().d_taps[tap_buf], tap_layers.size() * (size_t) g.n_embd, n, tap_p0, err,
-                                     (void*) G.back().ev_tap[tap_buf]);
+                                     tn.tap_event ? (void*) G.back().ev_tap[tap_buf] : nullptr);
         ds_feed_s += now_s() - t0;
         return ok;
     }
@@ -1734,11 +1815,12 @@ struct Model::Impl {
         std::vector<CpuEntry> ent;
         std::vector<CpuRowEntry> rent;
         for (;;) {
+            double idle_t0 = 0;
             for (unsigned idle = 0; lane_seq.load(std::memory_order_acquire) == at; ++idle) {
                 if (lane_quit.load()) return;
-                // (between two tokens: awake; no request: asleep - MEASURE: decode tok/s against CPU use; maya-ds4's
-                //  workers spin DS4_LANE_SPIN_US, 20000 us)
-                if (idle < 20000) std::this_thread::yield();
+                // (between two tokens: awake; no request: asleep - tn.lane_spin_us, maya-ds4's 20 ms)
+                if (idle == 0) idle_t0 = now_s();
+                if (now_s() - idle_t0 < tn.lane_spin_us * 1e-6) std::this_thread::yield();
                 else std::this_thread::sleep_for(std::chrono::microseconds(200));
             }
             const unsigned v = lane_seq.load();
@@ -2157,7 +2239,7 @@ struct Model::Impl {
             if (remote)
                 CK(cudaMemcpyAsync(gp.d_tapr, m_taps, sizeof(float) * (size_t) (nt - 1) * ldb, cudaMemcpyHostToDevice, gp.s));
             // (the drafter's last feed from this buffer read on its own stream: done before it is written again)
-            CK(cudaStreamWaitEvent(gp.s, gp.ev_tap[tap_buf], 0));
+            if (tn.tap_event) CK(cudaStreamWaitEvent(gp.s, gp.ev_tap[tap_buf], 0));
             k::taps_gather(srcs, 0u, nt, T, (int) E, gp.d_taps[tap_buf], (size_t) nt * E, gp.s);
         }
         if (!mmw(gp, head, gp.w_xf, T, gp.w_logits)) {
@@ -2198,12 +2280,12 @@ struct Model::Impl {
             else std::memcpy(dst, row, (size_t) E * 4);
         }
         if (!taps_flush(err)) return false;   // (the rows the last step left for the drafter: its buffer is the other one)
-        use_decay(T == 1 ? 0.995f : std::pow(0.995f, (float) T));
+        use_decay(T == 1 ? tn.tok_decay : std::pow(tn.tok_decay, (float) T));
         // (a window: its moves a batch as large as its rows' steps would have had, 16 at most)
         // (a window's rows route up to T tokens' worth: up to 4 of them count, at most the bounce's 16)
-        if (!swap_poll(err, std::min(16, swap_batch * std::min(T, 4)))) return false;
+        if (!swap_poll(err, std::min(16, swap_batch * std::min(T, tn.win_rows)))) return false;
         hw = std::max(hw, p0 + T);
-        job_slot = snap_next || p0 / kSnapEvery != (p0 + T - 1) / kSnapEvery || p0 % kSnapEvery == 0 ? snap_alloc(p0) : -1;
+        job_slot = snap_next || p0 / tn.snap_every != (p0 + T - 1) / tn.snap_every || p0 % tn.snap_every == 0 ? snap_alloc(p0) : -1;
         snap_next = false;
         job_p = p0;
         job_T = T;
@@ -2354,13 +2436,14 @@ struct Model::Impl {
         k::store_rows(gp.c_kc, T, kvd, l.K, l.ring, p0, s);
         k::store_rows(gp.c_vc, T, kvd, l.V, l.ring, p0, s);
         for (int t0 = 0; t0 < T;) {
-            int ts = std::min(gp.ts_max, T - t0);
+            const size_t s_n = tn.s_use > 0 ? std::min(tn.s_use, gp.S_n) : gp.S_n;
+            int ts = std::min(tn.ts_use > 0 ? std::min(tn.ts_use, gp.ts_max) : gp.ts_max, T - t0);
             int64_t pf = p0 + t0, klo = l.swa ? std::max<int64_t>(0, pf - (g.n_swa - 1)) : 0, nkr = pf + ts - klo;
-            while (ts > 1 && (size_t) H * ts * (size_t) nkr > gp.S_n) {
+            while (ts > 1 && (size_t) H * ts * (size_t) nkr > s_n) {
                 ts /= 2;
                 nkr = pf + ts - klo;
             }
-            if ((size_t) H * ts * (size_t) nkr > gp.S_n) {
+            if ((size_t) H * ts * (size_t) nkr > s_n) {
                 err = "layer " + std::to_string(l.il) + ": the attention's scores do not fit (" + std::to_string(nkr) + " keys)";
                 return false;
             }
@@ -2511,15 +2594,15 @@ struct Model::Impl {
         }
         int mr = 0;
         std::vector<int> u;   // (the RAM experts routed to, in their RAM slots' order)
-        // (a prompt chunk's routings weighted min(1, 64 / T): MEASURE)
-        for (int e = 0; e < ne; ++e) l.use[(size_t) e] += (float) cnt[(size_t) e] * std::min(1.0f, 64.0f / (float) T);
+        for (int e = 0; e < ne; ++e) l.use[(size_t) e] += (float) cnt[(size_t) e] * std::min(1.0f, tn.prompt_rows / (float) T);
         for (int e = 0; e < ne; ++e) {
             if (l.slot_of[(size_t) e] >= 0) mr = std::max(mr, cnt[(size_t) e]);
             else if (cnt[(size_t) e] > 0) u.push_back(e);
         }
         if (!sets(l, gp, T, l.slot_d, l.experts, l.n_res + 1, mr, false, err)) return false;
-        for (size_t q0 = 0, pass = 0; q0 < u.size(); q0 += (size_t) kStage, ++pass) {
-            const int np = (int) std::min(u.size() - q0, (size_t) kStage), b = (int) (pass & 1);
+        const size_t stg = (size_t) (tn.stage_use > 0 ? std::min(tn.stage_use, kStage) : kStage);
+        for (size_t q0 = 0, pass = 0; q0 < u.size(); q0 += stg, ++pass) {
+            const int np = (int) std::min(u.size() - q0, stg), b = (int) (pass & 1);
             int* pm = gp.hc_pmap + pass * (size_t) ne;
             for (int e = 0; e < ne; ++e) pm[e] = -1;
             int pmr = 0;
@@ -2816,8 +2899,7 @@ struct Model::Impl {
                         }
                     }
                     if (hot < 0 || cold < 0) continue;
-                    // (the swap rule: MEASURE against maya-ds4's heat > coldest x 1.25 + 1.0)
-                    const float gain = l.use[(size_t) hot] - 1.5f * l.use[(size_t) cold] - 0.5f;
+                    const float gain = l.use[(size_t) hot] - tn.cache_margin * l.use[(size_t) cold] - tn.cache_bonus;
                     if (gain > 0.0f) c.push_back({gain, {il, hot, cold, l.ram_of[(size_t) hot]}});
                 }
                 std::sort(c.begin(), c.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
@@ -2835,8 +2917,8 @@ struct Model::Impl {
     bool swap_burst(std::string& err) {
         if (!swap_on()) return true;
         const double t0 = now_s();
-        for (int round = 0; round < 48 && now_s() - t0 < burst_s; ++round) {   // (48 x 64: MEASURE, off while burst_s 0)
-            if (!swap_poll(err, 64)) return false;
+        for (int round = 0; round < tn.burst_rounds && now_s() - t0 < burst_s; ++round) {
+            if (!swap_poll(err, tn.burst_moves)) return false;
             bool any = false;
             for (Gpu& gp : G) {
                 if (!gp.sw_thread.joinable()) continue;
@@ -2858,8 +2940,9 @@ struct Model::Impl {
     }
 
     // ---- rewinds: the histories saved at positions (a ring of kSnaps slots, the same slot in every layer) -------------
-    // (96 x 64 = 6144 decoded positions, more than the 4096 a rewind reaches; the cadence: MEASURE)
-    static constexpr int kSnaps = 96, kSnapEvery = 64;
+    // (96 x 64 = 6144 decoded positions, more than the 4096 a rewind reaches; the cadence, tn.snap_every: every 16 /
+    //  64 / 256 decoded tokens alike, measured)
+    static constexpr int kSnaps = 96;
     int64_t snap_pos[kSnaps];
     int snap_head = 0;
     int64_t hw = 0;          // the furthest position ever read since the reset: the rings' rows before hw - ring are gone
@@ -2989,7 +3072,7 @@ struct Model::Impl {
             return rewind(p0, true, at, err);
         }
         snap_next = true;
-        if (n >= 64 && !swap_burst(err)) return false;   // (prompts of 64 tokens on: MEASURE)
+        if (n >= tn.burst_min && !swap_burst(err)) return false;
         for (Gpu& gp : G) {
             st.streamed += gp.n_streamed;
             st.experts += gp.n_experts;
@@ -3175,5 +3258,7 @@ const Stats& Model::stats() const { return m->st; }
 std::vector<std::string> Model::info_lines() const { return m->info_lines(); }
 void Model::set_tap(Tap t) { m->tapf = std::move(t); }
 void Model::set_pick_hook(PickHook h) { m->pick_hook = std::move(h); }
+void Model::vram_notes(const char* what) const { m->notes(what); }
+void Model::retune() { m->retune(); }
 
 }  // namespace inkling2

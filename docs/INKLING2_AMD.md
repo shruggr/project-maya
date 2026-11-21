@@ -98,7 +98,13 @@ physical core; N: at most N), `--expert-profile` (`<pack>/expert-profile.bin`, r
 [--window-bits] --prompts --ab --temperature --seed --dspark-rest0`. Environment: `INKLING2_PHASES` (device phase
 table, a line a window size), `INKLING2_ROUND_LOG` (a line a drafting round), `INKLING2_TIMELINE`, `INKLING2_PROF`,
 `INKLING2_OLD_STEP`, `INKLING2_SWAP_BATCH`, `INKLING2_SWAP_BURST_MS`, `INKLING2_VERIFY_LOAD`, `INKLING2_EXPERT_CHECK`,
-`INKLING2_NO_WARMUP`; `INKLING2_ATTN_OLD` / `INKLING2_ATTN_TK` now reach only the step with a tap or a pick hook.
+`INKLING2_NO_WARMUP`, `INKLING2_VRAM_LOG` (a line a GPU at each stage of the load and after each prompt, decode and
+request: free VRAM, the engine's own, the rest); the measured values' overrides ("The measured values"):
+`INKLING2_CACHE_DECAY` / `_MARGIN` / `_BONUS` / `_PROMPT_ROWS`, `INKLING2_SWAP_WIN_ROWS`, `INKLING2_LANE_SPIN_US`,
+`INKLING2_SNAP_EVERY`, `INKLING2_BURST_ROUNDS` / `_MOVES` / `_MIN`, `INKLING2_DRAFT_T0` / `_A0` / `_B0` / `_REST` /
+`_REST_MAX` / `_WARM` / `_REST_GAIN` / `_RESET_GAIN` / `_EMA` / `_B_MIN`, and at the load `INKLING2_STAGE`,
+`INKLING2_TS_MAX`, `INKLING2_S_FLOOR_MI`, `INKLING2_WARM_TOKENS` (tests: `INKLING2_STAGE_USE`, `INKLING2_TS_USE`,
+`INKLING2_S_USE_MI`, `INKLING2_TAP_EVENT`; `--sweep VAR=a,b,..`, `--sweep-rounds N`); `INKLING2_ATTN_OLD` / `INKLING2_ATTN_TK` now reach only the step with a tap or a pick hook.
 
 ## Goal and targets
 
@@ -391,8 +397,11 @@ experts one zero blob in pinned memory, the drafter fed and asked once), and onl
 free VRAM and fills it, less `--reserve-mib`, with its layers' experts (the most routed by the profile first, a spare
 slot a layer). A GPU's experts are one allocation, rounded up to the runtime's granularity - measured at the load with
 two probe allocations (here 2 MiB pages: `hipMalloc` of 1 MiB + 1 takes 2 MiB, of 2 MiB + 1 takes 4). A second
-warm-up with the experts in place pays their own first run (the first prompt was 3x slower without it; it takes no
-VRAM). There is no estimate left in the plan: the guessed slacks (+256 B a tensor, +4096 B a layer, +32 MiB prompt
+warm-up with the experts in place - a chunk and a quarter of tokens spread over the vocabulary, then decode windows of
+1, 4 and 9 rows - takes no VRAM; it pays what the experts' four-minute load undid: that load's memory pressure sends
+to swap (zram here) the host memory the first warm-up touched, and the first prompt then paged it back in - one of a
+GPU's layers stalled 5.6 - 5.8 s, a 2.7k-token prompt took 7.4 - 8.9 s instead of 2.8, in 11 of 16 loads. Now the
+load pays it (the second warm-up 1 - 7 s) and the first prompt reads as its repeat does. There is no estimate left in the plan: the guessed slacks (+256 B a tensor, +4096 B a layer, +32 MiB prompt
 path, +64 MiB decode scratch) and the drafter's 3.09 GB figure are gone. `INKLING2_VRAM_LOG=1` prints a line a GPU at
 each stage of the load and after each prompt, decode and served request: its free VRAM, the engine's own allocations
 and the rest.
@@ -430,6 +439,52 @@ free instead of 0.6), 9,646 at 256K (9,630 before) - the old plan's slacks and t
 about as much as the runtime's share it missed. The load is about a minute longer than before (247 - 293 s against
 166 - 225): the dense tensors and the experts are read in two passes over the files.
 
+## The measured values (2026-11-21)
+
+The measurement phase's list ("Values and their sources", the rows that were MEASURE), measured on this PC. Each value
+has an `INKLING2_<NAME>` override (maya-ds4's `DS4_CACHE_*` way: read at the load); `--sweep VAR=a,b,..`
+(tests, with `--prompts`) runs each prompt's drafted decode with each value in one load, after a warm run of the
+prompt, `--sweep-rounds` times in ABBA order, so the expert cache's state favours no value. Workloads: `--ab`'s three
+prompts (prose: the 2.7k-token document continued; code: the LRU-cache module; thinking: the sourdough question at
+effort 0.9), 256 greedy tokens; prompts of 5K / 20K / 80K tokens of the long document for the prompt path; a six-turn
+chat through serve/server.py for the cache and the rewind (the 2.7k document and five follow-ups, greedy, up to 3000
+tokens an answer, each answer sent back without its reasoning, as OpenAI clients do). Every load since the profile
+fix reads the shipped expert profile, read-only.
+
+Decision rule: where maya-ds4 has a counterpart and its value is within noise of the best, maya-ds4's; else the
+measured best; a value that does not matter within noise and has no counterpart is kept.
+
+**Noise.** The drafted decode of the same prompt in one load: prose 59 - 73 tok/s (greedy text forks at near-ties, and
+the drafts kept with it), code 54 - 63, thinking 37.3 - 41.0; the three prompts' mean, the default setting repeated
+across nine sweeps, 52.9 - 56.3. The prompt path repeats within 0.5%. A chat's decode speed: 48.7 - 51.3 tok/s
+between loads.
+
+| # | Value | Old | New | Alternatives, results (tok/s unless said) | Noise | Source |
+|---|---|---|---|---|---|---|
+| E9 | Prompt chunk (`--prefill-chunk`) | 512 | 512 | 512 / 1024 / 2048 / 4096, prompt tok/s (one allocation for all): 5K 1020 / 1110 / 1056 / 841; 20K 1128 / 1350 / 1546 / 1548; 80K 914 / 1065 / 1193 / 1222. Decode, two loads each: 2048 1% slower (undrafted 33.67 / 35.80 / 36.47 against 33.76 / 36.22 / 36.96). Against it, with E42 and E44: the 2048 chunk, the 176 Mi floor and 64-expert staging together take about 2.85 GiB a GPU of the experts' room (1,140 experts at 32K): prompts of 67 / 82 / 300 / 2698 tokens then read at 114 - 117 / 102 - 105 / 297 - 299 / 883 tok/s instead of 130 - 134 / 111 - 114 / 330 - 333 / 1022 (a prompt streams each RAM expert it routes to; 2.7K tokens are also two chunks instead of six to pipeline), and the setup's own config - 64K, --reserve-mib 3072, the drafter - no longer loads on this PC (the experts outside VRAM 109 GB and the 8 GiB margin against 116 GB: the speed calibration's drafter side) | prompt 0.5%; undrafted decode 0.3 | MEASURED (maya-ds4's 4096: 20% slower at 5K) |
+| E8, D2 | Rewind reach (`--rewind`) | 4096 | 4096 | The chat, prompt tokens read again past turn 1: 2048 11,486 (13.4 s), 4096 998 / 2,538 (3.1 / 5.6 s), 16384 745 (2.7 s); decode 49.8 / 50.0 / 50.9 | chat decode 48.7 - 51.3 | MEASURED (no maya-ds4 counterpart) |
+| E15 | `--short-prompt` | 3 | **4** | Prompt path / decode path, ms, after 2.7K tokens: 3 tokens 118.7 / 95.9, 4 125.9 / 123.2, 5 129.8 / 148.1 | 3 ms | MEASURED |
+| E27 | Draft time at start | 10 ms | 10 ms | 5 / 10 / 20: mean 54.9 / 55.0 / 55.0 | 52.9 - 56.3 | MEASURED (insensitive) |
+| E28 | Rest length | 8 | 8 | 4 / 8 / 16: 54.8 / 54.0 / 53.6 | as above | MEASURED (insensitive) |
+| E29 | Rest cap | 32 | 32 | 16 / 32 / 64: 55.9 / 54.9 / 53.6 | as above | MEASURED (insensitive) |
+| E30 | Rounds before judging | 8 | 8 | 4 / 8 / 16: 53.8 / 55.4 / 53.9 | as above | MEASURED (insensitive) |
+| E31 | Rest when gain < x·a | 0.1 | 0.1 | 0.05 / 0.1 / 0.2: 55.1 / 56.3 / 52.2 | as above | MEASURED (insensitive) |
+| E32 | Rest length reset when gain > x·a | 0.3 | 0.3 | 0.2 / 0.3 / 0.5: 57.2 / 54.6 / 52.9 | as above | MEASURED (insensitive) |
+| E33 | Averages' weight | 0.9 | 0.9 | 0.8 / 0.9 / 0.95: 51.8 / 52.9 / 53.8 | as above | MEASURED (insensitive) |
+| E34 | Row cost floor | 0.5 ms | 0.5 ms | 0.25 / 0.5 / 1: 54.2 / 55.8 / 53.4 | as above | MEASURED (insensitive) |
+| E42 | Score scratch floor (`kS_n`) | 44 Mi floats | 44 Mi | 80K prompt tok/s, 11 / 22 / 44 / 88 / 176 / 352 Mi: 853 / 1082 / 1247 / 1354 / 1409 / 1400; 20K within 1%; the larger floors' VRAM as E9 | 0.2% | MEASURED |
+| E43 | Tokens an attention pass (`kTsMax`) | 512 | **128** | 2048-token chunks, 32 / 64 / 128 / 256 / 512: 20K 1806 / 1861 / 1875 / 1844 / 1841 tok/s, 80K 1483 / 1524 / 1532 / 1513 / 1511 (its rel-bias table 25 MB instead of 100) | 0.1% | MEASURED |
+| E44 | Experts a staging pass (`kStage`) | 24 | 24 | 24 / 48 / 64 / 96: 20K 1579 / 1713 / 1812 / 1831 tok/s, 80K 1358 / 1436 / 1499 / 1509; the larger stages' VRAM (2 x 64 experts: 1.2 - 1.5 GiB a GPU) as E9 | 1% | MEASURED |
+| E52 | The load's pinned stage | 256 MiB | 256 MiB | Pinned copies: 64 MiB 56.3 GB/s, 256 MiB 56.7, 1 GiB 56.9; the load reads its files at about 1 GB/s | - | MEASURED (insensitive) |
+| E54 | Warm-up tokens | 256 | 256 | 16 / 64 / 256 all take the runtime's whole share (the free VRAM did not move after the load); the first 5K prompt after a 16-token warm-up 7% slower than its repeat, after 256 2% | - | MEASURED |
+| E56, E57 | Expert cache: decay; swap rule | x0.995 a token; hot > 1.5 cold + 0.5 | **x0.9 every 256 tokens; hot > 1.25 cold + 1.0** | The chat, two loads each: maya-ds4's 51.3 / 51.0 tok/s, the CPU lane 4.0 / 4.3 %; the old 48.7 / 51.2, 4.1 / 3.9 % | chat decode 48.7 - 51.3 | MAYA (within noise) |
+| E60, E61 | Burst size, trigger | 48 x 64, 64 tokens | kept | Inactive: the burst is off (E59) | - | MEASURED (inactive) |
+| E62 | A window's moves count its rows as up to | 4 tokens | 4 | 2 / 4 / 8: mean 54.2 / 55.0 / 52.1 | as E27 | MEASURED (insensitive) |
+| E63 | A prompt chunk's routing weight min(1, x/T) | 64 | 64 | 16 / 64 / 256: 52.5 / 52.1 / 53.5 | as E27 | MEASURED (insensitive) |
+| E65 | Histories saved every | 64 tokens | 64 | 16 / 64 / 256: 52.9 / 55.0 / 53.1 (96 snapshots x 64 = 6144 decoded positions cover the 4096 rewind; at 16 they would not) | as E27 | MEASURED (insensitive) |
+| E69 | The lane's spin | 20000 yields (1.8 ms) | **20 ms** | 200 µs / 1.8 ms / 20 ms: 57.0 / 55.0 / 55.2 | as E27 | MAYA (within noise) |
+| E74 | Token attention tiles | 32 / 128 | kept | Not on the serving path (the tapped step only) | - | CHOSEN (trade) |
+
 ## Values and their sources
 
 Every value of this engine, its drafter, the setup, the server's and the Models page's Inkling 2 rows and the tools,
@@ -441,8 +496,10 @@ with where it comes from (2026-11-20). Sources:
 - **MEASURED**: a recorded measurement (cited). **DERIVED**: computed from the above (the formula given).
 - **CHOSEN (kind)**: an internal implementation constant with the reason in its code comment - a bound it must
   cover, what it trades, a method, a name, a scope.
-- **MEASURE**: a speed-affecting choice no measurement backs yet; the measurement phase measures it (against
-  maya-ds4's where it has one) and the VRAM slacks become exact sizes. Unchanged until then.
+- **MEASURE**: none left. The measurement phase (2026-11-21, "The measured values" above) measured each: MEASURED
+  where the measured best was taken (with "insensitive" where no value mattered within noise and the value was kept,
+  "inactive" where it never runs), MAYA where maya-ds4's value was within noise of the best; the VRAM slacks are gone
+  ("VRAM" above).
 
 ### Engine
 
@@ -455,14 +512,14 @@ with where it comes from (2026-11-20). Sources:
 | E5 | Default profile `<pack>/expert-profile.bin` (a pack's `default.prof` read in its place) | Expert profile read when none is given | MAYA | ds4_main.cpp's `o.pack + "/expert-profile.bin"` |
 | E6 | Written back after each request and at the end; `--profile-readonly`; `--profile-out` this run's alone | Whether routing counts are saved | MAYA | ds4_model.hpp's profile_readonly, ds4_model.cu's save_profile |
 | E7 | `layer_split` empty: an equal share of all bytes per GPU | How the layers are split across the GPUs | CHOSEN (design) | Tensor parallel is ruled out (256-value blocks cannot split n_ff 2304: "The engine (design)" above); `--layer-split` sets it by hand |
-| E8 | `rewind` 4096 | Extra rows the sliding-window rings keep, so a rewind can reach back that far without reading the prompt again | MEASURE | Rows the SWA rings keep for a rewind: 0.75 GB over the 40 layers against prompts read again; maya-hy4 keeps 16384. Only correctness is tested (--rewind-test) |
-| E9 | `prefill_chunk` 512 | Prompt tokens per prompt-path chunk | MEASURE | Against maya-ds4's auto rule (2048 on one GPU, 4096 on several): `--try-chunks` |
+| E8 | `rewind` 4096 | Extra rows the sliding-window rings keep, so a rewind can reach back that far without reading the prompt again | MEASURED | The six-turn chat ("The measured values" below), prompt tokens read again past the first turn: 2048 11,486 (turns after a 3000-token answer read their whole prompt again: 13.4 s), 4096 998 - 2,538 (3.1 - 5.6 s), 16384 745 (2.7 s); decode 49.8 / 50.0 / 50.9 tok/s, alike. 4096 holds this chat's answers; 16384 (maya-hy4's ring_slack) costs 0.5 GB a GPU more and reached no more here; no maya-ds4 counterpart |
+| E9 | `prefill_chunk` 512 | Prompt tokens per prompt-path chunk | MEASURED | `--try-chunks` in one load, tok/s (two runs each, within 0.5%), 512 / 1024 / 2048 / 4096: 5K tokens 1020 / 1110 / 1056 / 841, 20K 1128 / 1350 / 1546 / 1548, 80K 914 / 1065 / 1193 / 1222 - one allocation for all, so the larger chunks' own cost is not in these: the 2048 chunk, the 176 Mi floor and 64-expert staging together take about 2.85 GiB a GPU of the experts' room (1,140 experts at 32K): prompts of 67 / 82 / 300 / 2698 tokens then read at 114 - 117 / 102 - 105 / 297 - 299 / 883 tok/s instead of 130 - 134 / 111 - 114 / 330 - 333 / 1022 (a prompt streams each RAM expert it routes to; 2.7K tokens are also two chunks instead of six to pipeline), and the setup's own config - 64K, --reserve-mib 3072, the drafter - no longer loads on this PC (the experts outside VRAM 109 GB and the 8 GiB margin against 116 GB: the speed calibration's drafter side). So 512, the best with what its VRAM costs counted. maya-ds4's auto rule, 4096 on several GPUs, is 20% slower at 5K even before that: not within noise |
 | E10 | `log_floor` 0, so the pack's 8192 is used | log_scaling_n_floor | MODEL | config.json `text_config.log_scaling_n_floor 8192`; inkling2.txt 8192. The GGUF still says 128000 (see T1). |
 | E11 | `dspark_cum` 0.5 | Floor on the running product of the drafts' probabilities | MEASURED | DSPARK.md: the ">= 0.5" row is the best of the projected rules. Also MAYA: ds4_main.cpp `0.5f` (measured there on a Radeon 8065S, +6.5%). |
 | E12 | Removed (`dspark_reserve_gb` 3.09) | - | MEASURED | The drafter is loaded before the experts are placed, so the plan measures it in place: 3314 MiB at 32K (its 3162.5 MiB and its runtime's 151.5), 4794 at 256K ("VRAM" above) |
 | E13 | `expert_cache` on, `--no-expert-cache` | Expert cache on by default | MAYA | ds4_model.hpp's expert_cache, ds4_main.cpp's flag |
 | E14 | `dspark_index` empty: no drafter | The drafter loads only when its index folder is named | CHOSEN (design) | The drafter is a download of its own beside the GGUF set (not in the pack, as maya-ds4's is): the config names its index, the setup writes it |
-| E15 | `--short-prompt` 3 | A prompt's unread tail of at most 3 tokens goes through the decode path | MEASURE | The comment's "measured" has no recorded numbers: `--short-bench` |
+| E15 | `--short-prompt` 4 | A prompt's unread tail of at most 4 tokens goes through the decode path | MEASURED | `--short-bench` after the 2.7k-token prompt, ms, prompt path / decode path (means of 5, each run within 3 ms): 3 tokens 118.7 / 95.9, **4 tokens 125.9 / 123.2**, 5 tokens 129.8 / 148.1, 8 tokens 146.4 / 231.7. Was 3; no maya-ds4 counterpart (its short prompts go through windows of 16) |
 | E16 | `--dspark` "on" | Drafting by default | MEASURED | INKLING2_AMD.md and DSPARK.md: prose 1.84x, code 1.47x, thinking 0.97x on a fresh load. The ds4 engine also defaults to on (ds4_model.hpp); the setup default is a separate question (S28). |
 | E17 | Stops `{200006, 199999}` | Ids that end an answer | MODEL | 200006 `<\|content_model_end_sampling\|>` (the GGUF's and config.json's eos_token_id), 199999 `<\|endoftext\|>` (vocab.json); the comment says so now |
 | E18 | GEN's `top_k` mm3's default, 64, unless the request sets it | No top-k by default | MAYA | ds4_main.cpp's Req (top_k 64). The server sends top_k only where the request or the config sets it (0 as 64), the same for every family |
@@ -474,14 +531,14 @@ with where it comes from (2026-11-20). Sources:
 | E24 | `INFO ... model=Inkling-2-Small engine=inkling2 mtp=0` | Model name and protocol keys at start | MODEL | GGUF `general.name Inkling-2-Small`. The protocol is maya-hy4's (INKLING2_AMD.md). |
 | E25 | `a` = 30 ms at start | Starting estimate of a one-row pass | MEASURED | INKLING2_AMD.md (t(1) = 29.9 ms at 2.7k context) |
 | E26 | `b` = 7 ms at start | Starting estimate of one more window row | MEASURED | INKLING2_AMD.md (6.7 ms a row); DSPARK.md (7 - 8 fitted) |
-| E27 | `t_draft` = 10 ms at start | Starting estimate of a draft's time | MEASURE | Starting estimate; measured 8.0 - 8.5 ms (INKLING2_DSPARK.md) |
-| E28 | `rest_len` 8 | Rounds without drafts after a round that did not pay | MEASURE | Only the upper side is measured (rests of 128 slept through code) |
-| E29 | Rest cap 32 (doubling) | Longest rest | MEASURE | As E28 |
-| E30 | 8 drafted rounds before judging | Warm-up of the gain average | MEASURE | The gain average's warm-up |
-| E31 | Rest when `gain < 0.1·a` | When drafting rests | MEASURE | The comment gives the reason (thinking text: half of 1.5 drafts kept), not the threshold |
-| E32 | `gain > 0.3·a` resets the rest length | Hysteresis | MEASURE | Hysteresis |
-| E33 | EMA 0.9 / 0.1 | Smoothing of a, b, gain and t_draft | MEASURE | Smoothing of a, b, gain and t_draft |
-| E34 | `b` floor 0.5 ms | Lower bound on the fitted row cost | MEASURE | Lower bound on the fitted row cost |
+| E27 | `t_draft` = 10 ms at start (INKLING2_DRAFT_T0) | Starting estimate of a draft's time | MEASURED (insensitive) | `--sweep` ("The measured values" below): 5 / 10 / 20 ms decode alike within noise |
+| E28 | `rest_len` 8 (INKLING2_DRAFT_REST) | Rounds without drafts after a round that did not pay | MEASURED (insensitive) | 4 / 8 / 16 alike within noise (below) |
+| E29 | Rest cap 32, doubling (INKLING2_DRAFT_REST_MAX) | Longest rest | MEASURED (insensitive) | 16 / 32 / 64 alike within noise (below) |
+| E30 | 8 drafted rounds before judging (INKLING2_DRAFT_WARM) | Warm-up of the gain average | MEASURED (insensitive) | 4 / 8 / 16 alike within noise (below) |
+| E31 | Rest when `gain < 0.1·a` (INKLING2_DRAFT_REST_GAIN) | When drafting rests | MEASURED (insensitive) | 0.05 / 0.1 / 0.2 alike within noise (below) |
+| E32 | `gain > 0.3·a` resets the rest length (INKLING2_DRAFT_RESET_GAIN) | Hysteresis | MEASURED (insensitive) | 0.2 / 0.3 / 0.5 alike within noise (below) |
+| E33 | EMA 0.9 / 0.1 (INKLING2_DRAFT_EMA) | Smoothing of a, b, gain and t_draft | MEASURED (insensitive) | 0.8 / 0.9 / 0.95 alike within noise (below) |
+| E34 | `b` floor 0.5 ms (INKLING2_DRAFT_B_MIN) | Lower bound on the fitted row cost | MEASURED (insensitive) | 0.25 / 0.5 / 1 alike within noise (below) |
 | E35 | `rest0` 0 | Rounds without a draft after k = 0 | MEASURED | main.cpp: "1 costs prose a sixth of its drafted rounds and gains thinking text nothing" |
 | E36 | At most 7 drafts | Drafts per round | MODEL | config `mtp_config.block_size 8`: the anchor plus 7 drafts |
 | E37 | Window sized by expected tokens per ms, on by default | How many drafts to verify | MEASURED | The rule's gain is in DSPARK.md. **Differs**: ds4's cost-aware window is off by default "until measured on GPUs" (ds4_main.cpp); ds4 uses only the fixed cum cut. |
@@ -489,9 +546,9 @@ with where it comes from (2026-11-20). Sources:
 | E39 | Removed (+256 B per tensor) | - | MEASURED | The plan no longer estimates: it reads the free VRAM after the other allocations and the runtime's warm-up ("VRAM" above: each allocation's real size, 64 KiB at least and whole 2 MiB pages above 1 MiB, is in what it reads) |
 | E40 | SWA ring = `n_swa + rewind + Tc` = 1024 + 4096 + 512 = 5632 rows | Rows of each sliding-window layer's cache | DERIVED | n_swa 1024 (GGUF `attention.sliding_window`) + E8 + E9 |
 | E41 | Removed (+32 MiB) | - | MEASURED | The plan no longer estimates: it reads the free VRAM after the other allocations and the runtime's warm-up ("VRAM" above: each allocation's real size, 64 KiB at least and whole 2 MiB pages above 1 MiB, is in what it reads) |
-| E42 | `S_n()` = max(44 Mi, n_head x max_keys) floats | Prompt-path attention score scratch | DERIVED | A pass of ts tokens over nk keys takes n_head x ts x nk scores and attention_rows halves ts until it fits: one token over every key, 48 x 1M, must fit (44 Mi alone stopped a prompt at about 961K keys). The floor 44 Mi (a 512-token pass over 1,877 keys) is CHOSEN |
-| E43 | `kTsMax` 512 | Tokens per pass of the prompt attention | CHOSEN (bound) | The default prompt chunk: its rel-bias table is kTsMax x 48 x 1024 floats (100 MB); a longer chunk runs passes of 512 |
-| E44 | `kStage` 24 | Experts streamed per staging pass (two buffers) | CHOSEN (trade) | Two staging buffers of 24 blobs: one copied while the other's experts run - fewer passes against VRAM. Measurable (prompt tok/s) |
+| E42 | `S_n()` = max(44 Mi, n_head x max_keys) floats (INKLING2_S_FLOOR_MI) | Prompt-path attention score scratch | MEASURED (the floor); DERIVED (n_head x max_keys) | A pass of ts tokens over nk keys takes n_head x ts x nk scores and attention_rows halves ts until it fits: one token over every key must fit (44 Mi alone stops a prompt at about 961K keys). The floor sets how many tokens a long prompt's passes take: an 80K-token prompt, 2048-token chunks, tok/s at 11 / 22 / 44 / 88 / 176 / 352 Mi: 853 / 1082 / 1247 / 1354 / 1409 / 1400 (two runs each, within 0.2%); a 20K prompt within 1% at all of them. 176 Mi's 0.8 GiB a GPU more cost what E9 says, so 44 |
+| E43 | `kTsMax` **128** (INKLING2_TS_MAX) | Tokens per pass of the prompt attention | MEASURED | 2048-token chunks, tok/s at 32 / 64 / 128 / 256 / 512 tokens a pass: a 20K prompt 1806 / 1861 / **1875** / 1844 / 1841, 80K 1483 / 1524 / 1532 / 1513 / 1511 ("The measured values" below); its rel-bias table kTsMax x 48 x 1024 floats, 25 MB. Was 512 (CHOSEN) |
+| E44 | `kStage` 24 (INKLING2_STAGE) | Experts streamed per staging pass (two buffers) | MEASURED | 2048-token chunks, tok/s at 24 / 48 / 64 / 96: a 20K prompt 1579 / 1713 / 1812 / 1831, 80K 1358 / 1436 / 1499 / 1509 ("The measured values" above); 64's 0.8 GiB a GPU more cost what E9 says, so 24 |
 | E45 | Removed (+4096 B per layer) | - | MEASURED | The plan no longer estimates: it reads the free VRAM after the other allocations and the runtime's warm-up ("VRAM" above: each allocation's real size, 64 KiB at least and whole 2 MiB pages above 1 MiB, is in what it reads) |
 | E46 | Window scratch: 9 rows over up to 4096 keys | Attention scratch size for a window | CHOSEN (trade) | 9 = kWin rows; 4096 keys holds every SWA window (1024) and a global layer's first 4096 positions in one launch pair (58 MB a GPU); past it a window's rows run one at a time |
 | E47 | Removed (+64 MiB) | - | MEASURED | The plan no longer estimates: it reads the free VRAM after the other allocations and the runtime's warm-up ("VRAM" above: each allocation's real size, 64 KiB at least and whole 2 MiB pages above 1 MiB, is in what it reads) |
@@ -499,29 +556,29 @@ with where it comes from (2026-11-20). Sources:
 | E49 | head + `8·n_embd` B | VRAM of output_norm + output_res_query (2 F32 vectors) | DERIVED | 2 x 4608 x 4 B |
 | E50 | One spare expert slot per layer | Room for the cache's moves | CHOSEN (bound) | One move at a time a layer: the hot expert lands in the spare slot, the cold one's slot is the next spare |
 | E51 | RAM experts + `ram_margin()` 8 GiB (INKLING2_RAM_MARGIN_GB) must fit in the RAM to be had | The load stops otherwise | MAYA | ds4_model.cu's ram_margin (8 GiB, DS4_RAM_MARGIN_GB); the setup's IK2_MEMORY_GB counts the same 8 GiB (IK2_RAM_MARGIN_GIB) |
-| E52 | Staging pinned buffer of at least 256 MiB | Load-time copy buffer | MEASURE | The load's pinned staging (host memory); becomes the exact size |
+| E52 | Staging pinned buffer of at least 256 MiB | Load-time copy buffer (host memory, not VRAM) | MEASURED (insensitive) | Pinned copies to an R9700: 64 MiB pieces 56.3 GB/s, 256 MiB 56.7, 1 GiB 56.9; the load reads the files at about 1 GB/s, so the piece's size is under 1% of it |
 | E53 | 16 blobs: the movers' bounce buffer, and the most moves per poll | Expert-cache copy buffer | CHOSEN (bound) | swap_poll's most moves a round (16): the movers' bounce holds that many blobs |
-| E54 | Warm-up chunk min(Tc, 256) tokens | First-run BLAS warm-up at load | MEASURE | The first-run BLAS warm-up's chunk |
+| E54 | Warm-up chunk min(Tc, 256) tokens (INKLING2_WARM_TOKENS) | The runtime's share taken before the experts are placed; the first run's seconds | MEASURED | 16, 64 and 256 tokens all take the runtime's whole share (the free VRAM never moved after the load, prompts up to 80K); with 16 the first 5K prompt read 7% slower than its repeat (946 / 1020 tok/s), with 256 2% (996 / 1013). The 256 tokens cost 0.2 s of the load |
 | E55 | token_embd as Q5_K / Q6_K / F32 | Embedding row types accepted | MODEL | The pack's tensors.txt: `token_embd.weight Q5_K` |
-| E56 | Use counts x **0.995 per token** | How fast an expert's heat decays | MEASURE | Against maya-ds4's x0.9 every 256 tokens (DS4_CACHE_*) |
-| E57 | Move when `use(hot) - 1.5·use(cold) - 0.5 > 0` | The swap rule | MEASURE | Against maya-ds4's heat > coldest x 1.25 + 1.0 |
+| E56 | The experts' heat x **0.9 every 256 tokens** (a token's share each token: 0.9^(1/256); INKLING2_CACHE_DECAY) | How fast an expert's heat decays | MAYA | maya-ds4's DS4_CACHE_DECAY 0.9 (ds4_model.cu ~1797), within noise of the earlier x0.995 a token: the six-turn chat, two loads each, 51.3 / 51.0 tok/s against 48.7 / 51.2, the CPU lane 4.0 / 4.3 % against 4.1 / 3.9 % |
+| E57 | Move when `heat(hot) > 1.25·heat(cold) + 1.0` (INKLING2_CACHE_MARGIN / _BONUS) | The swap rule | MAYA | maya-ds4's DS4_CACHE_MARGIN 1.25 and _BONUS 1.0, measured with E56 (against 1.5 and 0.5) |
 | E58 | `swap_batch` 4 | Moves per GPU between two steps | MEASURED | model.cu: "4 and 8 decode alike, the CPU lane at 2 - 3 % of the picks" |
 | E59 | `burst_s` 0 (off) | Swap burst after a prompt | MEASURED | model.cu: "the first prompt after a load was seen to take 5 s longer with it" |
-| E60 | 48 rounds x 64 moves | Burst size | MEASURE | Inactive while burst_s is 0 (E59) |
-| E61 | Burst only after prompts of at least 64 tokens | Burst trigger | MEASURE | Inactive while burst_s is 0 |
-| E62 | Window poll: min(16, batch x min(T, 4)) moves | Moves after a window | CHOSEN (bound) | At most the bounce's 16; a window's T rows count up to 4 tokens' worth (ties to E56 / E57) |
-| E63 | Prompt routings weighted min(1, 64/T) | A prompt chunk's share of the heat | MEASURE | A prompt chunk's share of the heat |
+| E60 | 48 rounds x 64 moves (INKLING2_BURST_ROUNDS / _MOVES) | Burst size | MEASURED (inactive) | The burst is off (E59, measured): these never run; kept |
+| E61 | Burst only after prompts of at least 64 tokens (INKLING2_BURST_MIN) | Burst trigger | MEASURED (inactive) | As E60 |
+| E62 | Window poll: min(16, batch x min(T, 4)) moves (INKLING2_SWAP_WIN_ROWS) | Moves after a window | MEASURED (insensitive) | 2 / 4 / 8 alike within noise ("The measured values" below); at most the bounce's 16 |
+| E63 | Prompt routings weighted min(1, 64/T) (INKLING2_CACHE_PROMPT_ROWS) | A prompt chunk's share of the heat | MEASURED (insensitive) | 16 / 64 / 256 alike within noise (below) |
 | E64 | `INKLING2_SWAP_BATCH` clamped to 1..64 | Env bounds | CHOSEN (bound) | Env bounds: at least one move; above 16 swap_poll's bounce cap takes it |
-| E65 | `kSnaps` 96, `kSnapEvery` 64 | Convolution-history checkpoints: a ring of 96, one every 64 decoded tokens | MEASURE | 96 x 64 = 6144 decoded positions, more than the 4096 rewind (E8): the bound holds; the cadence is the measurable part |
+| E65 | `kSnaps` 96, `kSnapEvery` 64 (INKLING2_SNAP_EVERY) | Convolution-history checkpoints: a ring of 96, one every 64 decoded tokens | MEASURED (insensitive) | Every 16 / 64 / 256 decoded tokens alike within noise (below); 96 x 64 = 6144 decoded positions, more than the 4096 rewind (E8): the bound holds (at 16 it would not) |
 | E66 | `kWin` 9 | Most rows in a window | CHOSEN (bound) | A round takes at most 8 rows (the anchor and 7 drafts, mtp_config.block_size 8); the 9th only --window-test's 9-row window uses |
 | E67 | Drafter taps 2..8, the last = n_layer | Check that the drafter fits the target | MODEL | config `mtp_config.target_layer_ids` (8 entries, the last 48) |
 | E68 | `kLine` 16 unsigned (64 B) | Spacing of the mapped flags | CHOSEN (bound) | 64 bytes, a cache line: each flag on its own line |
-| E69 | Lane spins 20000 yields, then sleeps 200 µs | CPU lane idle policy | MEASURE | Decode tok/s against CPU use; maya-ds4's lane spins DS4_LANE_SPIN_US 20000 us |
+| E69 | The lane's dispatcher spins 20 ms (INKLING2_LANE_SPIN_US), then sleeps 200 µs | CPU lane idle policy | MAYA | maya-ds4's DS4_LANE_SPIN_US 20000 us; measured within noise of the best: 200 / 1800 (the old 20000 yields) / 20000 us 57.0 / 55.0 / 55.2 tok/s (below) |
 | E70 | Depth-mix RMS eps `1e-6f` (hard-coded) | Depth-mix norm epsilon | MODEL\* | llama.cpp inkling2.cpp `ggml_rms_norm(ctx0, states, 1e-6f)`; also config `rms_norm_eps 1e-06` |
 | E71 | Router weight-sum eps `1e-20f` | Router normalization | MODEL\* | llama.cpp inkling2.cpp `expert_weights_norm_eps = 1e-20f` |
 | E72 | `tau = 1 + alpha·log(max(1, (p+1)/floor))` | Log attention scaling | MODEL | alpha 0.1 (GGUF / config), floor 8192 (E10) |
 | E73 | `kMaxStates` 16 | Cap on depth-mix states | CHOSEN (bound) | The model needs ceil(48 / 6) + 1 = 9 states (n_layers_per_attn_res_block 6) |
-| E74 | `kTile` 32, `kSeg` 128 | Token attention tiles | CHOSEN (trade) | Token attention tiles: shared memory a tile against blocks; measurable (INKLING2_PHASES) |
+| E74 | `kTile` 32, `kSeg` 128 | Token attention tiles | CHOSEN (trade) | Not on the serving path: k::attention runs only in the step with a tap or a pick hook (parity, the tests); the served steps use the split attention (E78). Kept |
 | E75 | `kATK` 16 | Keys per window-attention tile | MEASURED | 16-key tiles were the fastest of 64 / 32 / 16 at a 1024-key window (11.2 / 8.9 / 6.4 ms a token over the 48 layers: split_tk's comment); the window's tiles take the same size |
 | E76 | `kAU` 4 for up to four rows, 8 from five | Keys per thread in window scores | MEASURED | kernels.cu (ms by T for 1 / 2 / 4 / 8 keys) |
 | E77 | `kCombTiles` 8192 | Tiles per combine chunk (past 131072 keys) | CHOSEN (bound) | 8192 floats = 32 KB, a block's shared memory for the tiles' factors; past it (131072 keys at 16 a tile) the factors go a chunk at a time |
@@ -548,7 +605,7 @@ with where it comes from (2026-11-20). Sources:
 | # | Value | What it does | Source | Where it comes from |
 |---|---|---|---|---|
 | D1 | `DsparkOptions::max_ctx` 32768 | Global-layer cache positions | MAYA | The engine's Options::max_ctx default (maya-ds4's), which the engine passes anyway |
-| D2 | `rewind` 4096 (the engine passes `rewind + Tc`) | Ring margin | MEASURE | Follows E8 |
+| D2 | `rewind` 4096 (the engine passes `rewind + Tc`) | Ring margin | MEASURED | Follows E8 |
 | D3 | `cum_min` 0.5 | Draft cut | MEASURED | As E11 (DSPARK.md; ds4_main.cpp) |
 | D4 | `attn_tile` 8 | Keys per attention tile | MEASURED | dspark.hpp (8 / 16 / 24 keys at 300 / 2.7K / 16K) |
 | D5 | `attn_gemm_min` 1024 | GEMM attention from this many keys on | MEASURED | dspark.hpp |
@@ -594,7 +651,7 @@ with where it comes from (2026-11-20). Sources:
 | S14 | `IK2_CONTEXTS` 32K .. 1M | Contexts offered | MAYA | DS4_CONTEXTS |
 | S15 | `IK2_DEFAULT_CONTEXT` 65536 | Fallback and lower bound of the recommendation | MAYA | DS4_DEFAULT_CONTEXT maya.py. It is not what the engine defaults to (E1, 32768), and nothing was measured at 64K (INKLING2_AMD.md). Measurable here. |
 | S16 | `IK2_RECOMMENDED_CONTEXT` 262144 | Highest recommendation | MAYA | DS4_RECOMMENDED_CONTEXT (DeepSeek's reason: its indexer's quadratic cost). maya-inkling2 has been run end to end with a server at 256K and prompts up to 109,464 tokens (W2) |
-| S17 | IK2_KV_BYTES 32768 + IK2_ATTN_BYTES 1560 on each GPU (+ IK2_DSPARK_KV_BYTES 6400 while it drafts) | Cache VRAM per context token | DERIVED | From the engine's allocations (serve/models.py says which): the global layers' K / V rows; each GPU's attention_split scratch, 48 x 130 floats a 16-key tile (past its 58 MB floor, 37,152 positions); the SWA rings are 5632 rows whatever the context. The setup and the page read the same constants |
+| S17 | IK2_KV_BYTES 32768 + IK2_ATTN_BYTES 1560 on each GPU (+ IK2_DSPARK_KV_BYTES 6400 while it drafts) | Cache VRAM per context token | DERIVED | From the engine's allocations (serve/models.py says which): the global layers' K / V rows; each GPU's attention_split scratch, 48 x 130 floats a 16-key tile (past its 58 MB floor, 37,152 positions); the SWA rings are 7168 rows (E40) whatever the context. The setup and the page read the same constants |
 | S18 | `IK2_DSPARK_KV_BYTES` 6400 | The drafter's per token | DERIVED | = D10 |
 | S19 | `IK2_MEMORY_GB` 203 (download.json the same) | VRAM + RAM that must hold the model | DERIVED | ceil(files 190.9 GiB + the engine's RAM margin 8 GiB + the drafter's 3.47 GB = 3.2 GiB) |
 | S20 | `IK2_DSPARK_GB` 3.47 | Drafter's VRAM added to the need | MEASURED | The last GPU's free VRAM after the load's warm-up with the drafter and without it: 25124 against 28438 MiB at 32K ("VRAM" above) |
@@ -679,7 +736,4 @@ with where it comes from (2026-11-20). Sources:
 | T25 | `IK2_IDS` aliases | Setup ids | CHOSEN (names) | Setup ids |
 | T26 | `IK2_FAMILY_NAMES`, `IK2_EXES`, the `UD-...` regex | Family detection | CHOSEN (names) | Family detection; the engine names are MAYA (S1) |
 
-The measurement phase's list (MEASURE above): the prompt chunk (E9, against maya-ds4's 2048 / 4096); the rewind
-reach (E8, D2); the short prompt (E15); the drafting rounds' scheduler (E27 - E34); the expert cache's decay and swap
-rule (E56, E57, against maya-ds4's x0.9 every 256 tokens and heat > coldest x 1.25 + 1.0); the burst and the warm-up
-(E54, E60, E61, E63, E65); the lane's spin (E69); the VRAM slacks (E39, E41, E45, E47, E52), which become exact sizes.
+The measurement phase's list - the prompt chunk (E9), the rewind reach (E8, D2), the short prompt (E15), the drafting rounds' scheduler (E27 - E34), the expert cache's decay and swap rule (E56, E57), the burst and the warm-up (E54, E60, E61, E63, E65), the lane's spin (E69), E42's floor, E43, E44, E62, E74 and the VRAM slacks (E39, E41, E45, E47, E52) - is done: "The measured values" and "VRAM" above.

@@ -38,10 +38,16 @@ struct Options {
     std::string profile_out;
     std::vector<int> layer_split; // the first layer of each GPU after the first (empty: by the experts' bytes)
     int rewind = 4096;            // positions back from the furthest one read that a rewind may reach without the
-                                  // prompt being read again (the sliding-window rings keep that many rows more;
-                                  // MEASURE: 0.75 GB over the 40 layers against prompts read again)
-    int prefill_chunk = 512;      // a prompt's tokens a forward takes through the layers at once (<= 1: token by token;
-                                  // MEASURE against maya-ds4's 2048 / 4096: --try-chunks)
+                                  // prompt being read again (the sliding-window rings keep that many rows more,
+                                  // 0.75 GB over the 40 layers; measured in a six-turn chat whose answers, up to
+                                  // 3000 tokens, go back without their reasoning: past its first turn 2048 read
+                                  // 11,486 prompt tokens again, 4096 998 - 2,538, 16384 745 - docs/INKLING2_AMD.md)
+    // a prompt's tokens a forward takes through the layers at once (<= 1: token by token).  Measured (--try-chunks,
+    // tok/s, 512 / 1024 / 2048 / 4096): a 5K prompt 1020 / 1110 / 1056 / 841, 20K 1128 / 1350 / 1546 / 1548, 80K
+    // 914 / 1065 / 1193 / 1222 - but a larger chunk's buffers take experts' room: 2048 (with E42's and E44's larger
+    // values) read prompts under 3K tokens 9 - 14% slower and put the setup's own config (64K, --reserve-mib 3072, the
+    // drafter) over this PC's RAM, so 512; maya-ds4's 4096 is 20% slower at 5K - docs/INKLING2_AMD.md, "E9"
+    int prefill_chunk = 512;
     int layers = 0;               // (tests) only the first `layers` layers are loaded and run (0: all)
     double log_floor = 0;         // log_scaling_n_floor in place of the pack's (0: the pack's)
     std::string dspark_index;     // the drafter's index folder (inkling2_dspark.hpp; empty: no drafter): loaded on the
@@ -143,6 +149,9 @@ public:
     void set_pick_hook(PickHook h);
     /// (tests, INKLING2_VRAM_LOG=1) a line a GPU: its free VRAM, this engine's allocations and the rest
     void vram_notes(const char* what) const;
+    /// (tests, --sweep) the run-time INKLING2_* overrides read again (the expert cache's rule, the lane's spin, the
+    /// histories' cadence, the burst)
+    void retune();
 
 private:
     struct Impl;
