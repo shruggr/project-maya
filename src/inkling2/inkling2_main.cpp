@@ -675,7 +675,7 @@ int usage() {
                  "                      picks (what is left is not the router's near-ties)\n"
                  "  --no-swap           the experts stay where the load put them (no cache moves)\n"
                  "  --tokens-file F     (tests) a prompt a line; with --profile-out: a corpus' routings\n"
-                 "  --serve             the server's line protocol on stdin / stdout (docs/INKLING2_AMD.md, "Serving")\n"
+                 "  --serve             the server's line protocol on stdin / stdout (docs/INKLING2_AMD.md, \"Serving\")\n"
                  "  --rewind N          positions a rewind may go back without reading the prompt again (default 4096)\n"
                  "  --short-prompt N    (serve) a prompt's unread tokens up to N take the decode path (default 3: measured,\n"
                  "                      the prompt path is faster from about 4 tokens on)\n"
@@ -686,7 +686,8 @@ int usage() {
                  "  --short-bench       (tests, with --tokens) short suffixes on the prompt path and the decode path\n"
                  "  --dspark on|off|idle  the DSpark drafter: speculative decoding with it (on, the default), not loaded (off),\n"
                  "                      or loaded and fed but never asked for drafts (idle: tests)\n"
-                 "  --dspark-index DIR  its index (default /mnt/data/models/llm/Inkling-2-Small-MTP/maya-inkling2-dspark-q8_0)\n"
+                 "  --dspark-index DIR  its index (tools/inkling2/convert_dspark.py's maya-inkling2-dspark-q8_0; none given:\n"
+                 "                      decoding without drafts)\n"
                  "  --dspark-cum F      the floor on the running product of the drafts' probabilities (default 0.5; a\n"
                  "                      request's dspark_cum key)\n"
                  "  --temperature F / --seed N   (tests, with --tokens) sampled decoding\n"
@@ -705,7 +706,7 @@ int main(int argc, char** argv) {
     std::string tokens;
     int n_predict = 0, repeat = 1, short_n = 3;
     bool serving = false, short_bench = false, window_bits = false;
-    std::string dspark = "on", dspark_index = "/mnt/data/models/llm/Inkling-2-Small-MTP/maya-inkling2-dspark-q8_0";
+    std::string dspark = "on", dspark_index;   // (the drafter's index: the config names it, the setup writes it)
     float dspark_cum = 0.5f, temperature = 0.0f;
     unsigned long long seed = 0;
     std::vector<int> stops = {200006, 199999};   // the model's end of sequence and <|content_model_end_sampling|>
@@ -775,7 +776,9 @@ int main(int argc, char** argv) {
     const bool drafting = dspark != "off" && dspark != "none" && parities.empty() && rewind_test.empty() && !short_bench &&
                           tokens_file.empty();
     if (drafting) {
-        if (std::ifstream(dspark_index + "/dspark.txt").good()) {
+        if (dspark_index.empty()) {
+            std::fprintf(stderr, "maya-inkling2: no drafter given (--dspark-index): decoding without drafts\n");
+        } else if (std::ifstream(dspark_index + "/dspark.txt").good()) {
             o.dspark_index = dspark_index;
             o.dspark_cum = dspark_cum;
         } else {

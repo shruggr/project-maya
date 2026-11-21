@@ -601,13 +601,20 @@ function hy4Fields(m, d, s, ch, images, gpus) {
 
 // Inkling 2 Small's (family "ik2": maya-ik2 on NVIDIA, maya-inkling2 on AMD - text only, one answer at a time; either
 // engine's other flags stay as the config has them).  Its cache's VRAM a context token: the 8 global layers keep every
-// position, K and V of 8 heads x 128 in F16 (the 40 sliding-window layers keep 1024 positions whatever the context)
+// position, K and V of 8 heads x 128 in F16 (the 40 sliding-window layers keep 1024 positions whatever the context).
+// Drafting: maya-inkling2's DSpark drafter (choices.drafting: the engine has the switch; maya-ik2 has no drafter)
 const IK2_KV_BYTES = 32768;
 function ik2Fields(m, d, ch, gpus) {
+  const dspark = m.choices.draft.includes("dspark");
   return [
     {label: "Model", rows: [contextRow(m, d, ch, {vram: IK2_KV_BYTES}),
+      m.choices.drafting ? html`<${Row} label="Drafting" flag="--dspark" changed=${ch("draft")}
+        hint=${dspark ? "DSpark, the model's own drafter, drafts a few tokens at a time for the model to check: the same answers, faster on prose and code. About 3 GB of the last GPU's VRAM."
+          : "No DSpark drafter for this model on this PC: the setup downloads Thinking Machines' drafter and converts it."}>
+        <${Seg} label="Drafting" value=${d.draft} options=${[...(dspark ? [{id: "dspark", label: "DSpark"}] : []), {id: "none", label: "Off"}]}
+          onChange=${(v) => setDraft({draft: v})}/><//>` : null,
       html`<${Row} label="Images" hint="Inkling 2 Small's engines read text only for now."/>`,
-      html`<${Row} label="Answers at once" hint="Inkling 2 Small answers one request at a time for now."/>`]},
+      html`<${Row} label="Answers at once" hint="Inkling 2 Small answers one request at a time for now."/>`].filter(Boolean)},
     {label: "GPUs and memory", rows: [gpus]},
   ];
 }

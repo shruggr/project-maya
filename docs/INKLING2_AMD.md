@@ -295,8 +295,11 @@ pack and the config are made by hand.
   and says so at its start (`chat_template_path`; `MAYA_PACK_TEMPLATE=1` keeps the pack's).
 - **The command.** `Popen([exe, "--serve", *args])` with the config's args, plus `--layer-split auto` when `gpu`
   lists more than one GPU (`engine_args`; not for `maya-ik2`, which stops at that flag), in `cwd`, with
-  `HIP_VISIBLE_DEVICES` = the config's GPUs and `lib_dirs` first on the library path. The Models page changes only
-  `--max-context` and the GPUs; every other flag stays as the config has it.
+  `HIP_VISIBLE_DEVICES` = the config's GPUs and `lib_dirs` first on the library path. The Models page changes
+  `--max-context`, the GPUs and Drafting (`--dspark on|off` with `--dspark-index`, offered where the drafter's index is
+  on this PC; maya-ik2 has no drafter); every other flag stays as the config has it.
+- **The drafter's index.** The engine drafts only with the index `--dspark-index` names (the setup writes it); without
+  one it decodes without drafts and says so at its start.
 - **What the server adds for the model** beyond INKLING2.md's list: a tool result headed by its tool's name
   (`<|message_tool|>NAME`, by its place after the assistant's calls: the server's messages carry no call ids);
   `<|message_user|>` / `<|message_system|>` / `<|message_tool|>` as stops beside the end of sampling and

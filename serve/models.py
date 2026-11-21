@@ -16,7 +16,8 @@ A config's settings, as the page shows them (None: the engine's own default, or 
              opt-in faster drafting on a small card, "f16" kept where a config has it); images (the pack's mmproj
              file: --vision off when off); one answer at a time
   Inkling 2 Small (family "ik2": maya-ik2 on NVIDIA, maya-inkling2 on AMD - text only, one answer at a time): context,
-             gpus, env; either engine's other flags stay as the config has them
+             gpus, env; draft ("dspark" | "none": maya-inkling2's DSpark drafter, where its index is on this PC -
+             maya-ik2 has none); either engine's other flags stay as the config has them
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -70,7 +71,12 @@ MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_c
             "cpu_threads", "reserve_gb", "prefill_chunk", "cache_gb", "dspark_conf")
 QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb")
 HY4_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "reserve_gb", "prefill_chunk", "cpu_threads", "kv")
-IK2_KEYS = ("context", "images", "gpus", "env")           # (Inkling 2: its engines' other flags stay as the config has them)
+IK2_KEYS = ("context", "images", "gpus", "env", "draft")  # (Inkling 2: its engines' other flags stay as the config has them)
+# Inkling 2 Small's DSpark drafter on AMD (maya-inkling2 --dspark-index): tools/inkling2/convert_dspark.py's Q8_0 index,
+# in the folder the setup downloads Thinking Machines' mtp.safetensors into, beside the model's GGUF folder (maya.py's
+# IK2_MTP_DIR / IK2_DSPARK)
+IK2_MTP_DIR = "Inkling-2-Small-MTP"
+IK2_DSPARK = "maya-inkling2-dspark-q8_0"
 HY4_KV_BYTES = 13 * (2 * (512 + 64) + 128 * 4 // 4)   # (maya.py's: its cache a context token, on each GPU of a group)
 HY4_Q4_CONTEXTS = [32768, 65536, 131072, 262144]   # AngelSlim's Q4_K_M: the setup's choices for it (maya.py's HY4_Q4_CONTEXTS)
 # (... and its longer ones, up to the model's 1M, where the cache in the engine's smaller rows is at most this share of
@@ -305,6 +311,29 @@ def mm3_pack_has(cfg: dict, key: str) -> bool:
         return False
 
 
+def ik2_amd(cfg: dict) -> bool:
+    """An Inkling 2 Small config of the AMD engine, maya-inkling2 (the CUDA one, maya-ik2, has no drafter)."""
+    return Path(str(cfg.get("exe", ""))).name.startswith("maya-inkling2")
+
+
+def ik2_drafter(cfg: dict) -> Path | None:
+    """maya-inkling2's DSpark drafter (an index with its dspark.txt): the one the config drafts with (--dspark-index),
+    else the one a setup converted beside the model - in its models folder (installer.models_dir), or where the
+    setup's layout puts it beside the pack (<models>/Inkling-2-Small-GGUF/<quant>/maya-inkling2).  None for maya-ik2,
+    or when it is not on this PC."""
+    if not ik2_amd(cfg):
+        return None
+    args = cfg.get("args") or []
+    found = [Path(p) for p in [flag(args, "--dspark-index")] if p]
+    models = (cfg.get("installer") or {}).get("models_dir")
+    if models:
+        found.append(Path(models) / IK2_MTP_DIR / IK2_DSPARK)
+    pack = pack_of(cfg)
+    if pack is not None and len(pack.parents) > 3:
+        found.append(pack.parents[2] / IK2_MTP_DIR / IK2_DSPARK)
+    return next((d for d in found if (d / "dspark.txt").is_file()), None)
+
+
 # ------------------------------------------------------------------ refusal ablation (an optional direction file)
 # The engines that project a direction out per request (GEN ablate=1; loaded with --ablate FILE --ablate-default off):
 # maya-ds4, maya-mm3 and the `maya` engine's GLM models (GLM-5.3-Flash, GLM-5.3; not on the Mac engine).  Qwen
@@ -377,8 +406,9 @@ def _choices(cfg: dict) -> dict:
     if family(cfg) == "hy4":                           # (images: the pack's mmproj file)
         return {"draft": (["mtp"] if hy4_has_mtp(cfg) else []) + (["dfly2"] if hy4_has_dfly2(cfg) else []) + ["none"],
                 "images": hy4_has_vision(cfg)}
-    if family(cfg) == "ik2":                           # (Inkling 2: text only; its drafting is the engine's own flag)
-        return {"draft": ["none"], "images": False, "text_only": True}
+    if family(cfg) == "ik2":                           # (Inkling 2: text only; maya-inkling2 drafts with DSpark)
+        return {"draft": ["dspark", "none"] if ik2_drafter(cfg) is not None else ["none"], "images": False,
+                "text_only": True, "drafting": ik2_amd(cfg)}   # ("drafting": the engine has the switch)
     if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
         return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
                 "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
@@ -411,7 +441,10 @@ def settings_of(cfg: dict) -> dict:
                    cache_gb=_float(flag(args, "--cache-gb")), dspark_conf=_float(flag(args, "--dspark-conf")))
         return out
     if family(cfg) == "ik2":                           # (Inkling 2: text only)
-        out.update(images=False)
+        # (maya-inkling2 drafts unless --dspark off, from the index --dspark-index names - none named: no drafts)
+        dspark, index = flag(args, "--dspark", "on"), flag(args, "--dspark-index")
+        out.update(images=False, draft="dspark" if ik2_amd(cfg) and dspark not in ("off", "none") and index and
+                   (Path(index) / "dspark.txt").is_file() else "none")
         return out
     if family(cfg) == "hy4":                           # (maya-hy4's own defaults where the config names none)
         tp = flag(args, "--tp", "auto")
@@ -616,7 +649,15 @@ def apply(cfg: dict, settings: dict) -> dict:
         else:
             out.pop("env", None)
     elif fam == "ik2":
-        pass                                           # (Inkling 2's engines: --max-context above, the GPUs, the env)
+        # (Inkling 2's engines: --max-context above, the GPUs, the env - and maya-inkling2's DSpark drafter: --dspark on
+        #  or off with its index, which the setup wrote or ik2_drafter found.  maya-ik2 has no drafter: nothing written)
+        if s.get("draft") not in can["draft"]:
+            raise ValueError("Drafting: no DSpark drafter for this model on this PC (the setup downloads and converts "
+                             "it)" if s.get("draft") == "dspark" else "Drafting: DSpark or none")
+        drafter = ik2_drafter(cfg)
+        if drafter is not None:
+            args = set_flag(args, "--dspark", "on" if s["draft"] == "dspark" else "off")
+            args = set_flag(args, "--dspark-index", str(drafter))
     elif fam == "hy4":
         # (maya-hy4: --max-context above, the GPUs, drafting, tensor parallel, the VRAM kept free, the prompt chunk and
         #  the CPU lane's threads - empty: the engine's own.  --gpus counts the cards the config picks, in their order:
