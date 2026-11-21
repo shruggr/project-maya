@@ -92,14 +92,19 @@ Not done:
 3. Sampled requests copy every window row's logits to the host for the verdict (0.8 MB a row).
 4. Thinking text is break-even (half of 1.5 offered drafts kept): the drafter rests there, it does not gain.
 
+The experts VRAM does not hold (2026-11-21, "The experts VRAM does not hold" below): `--mmap-experts on|off|auto`,
+maya-ds4's flag - the most routed that fit copied into RAM, the others read in place from the model's files - so a
+context whose experts RAM cannot hold loads: 1M on this PC now loads with the drafter (2.7k-token prompt continued at
+47.2 tok/s), where it stopped at its start before.
+
 Engine flags (where maya-ds4 has the same setting, its name, unit, default and behaviour: `--max-context` 32768,
 `--reserve-mib` 600 - the setup writes DeepSeek's AMD figure, 3072 on a discrete card -, `--cpu-threads` 0 (a thread a
 physical core; N: at most N), `--expert-profile` (`<pack>/expert-profile.bin`, read and written back; a pack's
 `default.prof` from before is read in its place), `--profile-readonly`, `--profile-out` (this run's routing alone),
-`--no-expert-cache`, `--dspark on|off|none` (off: loaded, a request drafts when it says `spec=1`; none: not loaded;
+`--no-expert-cache`, `--mmap-experts on|off|auto` (auto here as off: "The experts VRAM does not hold"), `--dspark on|off|none` (off: loaded, a request drafts when it says `spec=1`; none: not loaded;
 `idle`, tests only, has no maya-ds4 counterpart: loaded and fed, never asked)): `--pack --max-context (--ctx)
 --layer-split --gpus --reserve-mib --vram-experts --expert-profile (none) --profile-readonly --profile-out
---cpu-threads --log-floor --prefill-chunk --try-chunks --repeat --rewind --short-prompt --no-expert-cache --eos --serve --tokens
+--cpu-threads --log-floor --prefill-chunk --try-chunks --repeat --rewind --short-prompt --no-expert-cache --mmap-experts --eos --serve --tokens
 --tokens-file --n-predict --layers --dspark --dspark-index --dspark-cum --verbose`; tests `--parity [--parity-force-picks
 --parity-force-only --parity-decode --parity-detail --parity-max] --rewind-test --short-bench --window-test
 [--window-bits] --prompts --ab --temperature --seed --dspark-rest0`. Environment: `INKLING2_PHASES` (device phase
@@ -242,8 +247,9 @@ Reference checkout: `<llama.cpp>` (master b94959a64, Inkling 2 = PR #32217 + #32
   blocks cannot split n_ff 2304 (maya-ds4 falls back the same way on this PC).
 - **Experts**: per layer, the most-routed experts (by a profile, uint32 [48][384] routings, `--expert-profile` - Hy4's `--profile`) live
   in VRAM in ds4_iq's blob layout (gate | up | down, `tr[]` offsets, the fused GGUF gate_up maps to tr[1] = tr[0] +
-  2304 * row_bytes); the rest are **copied into pinned RAM** (never paged from the GGUF on a miss - that is what made
-  llama.cpp crawl here) and computed on the CPU lane (24 threads). The engine counts routings and writes a profile
+  2304 * row_bytes); the rest are **copied into pinned RAM** (paging them from the GGUF on a miss is what made
+  llama.cpp crawl here; since 2026-11-21 those RAM cannot hold are read in place - `--mmap-experts`) and computed on
+  the CPU lane (24 threads). The engine counts routings and writes a profile
   (`--profile-out`), like Hy4. Budget: ~106 GiB of experts in VRAM (57%), ~79 GiB in RAM.
 - Expert math on ds4_iq's kernels with a new activation `kActSitu` (below).
 - Decode first (one token a step, the prompt fed token by token), then the batched prompt path, then speed (an
@@ -288,9 +294,9 @@ matches a regex.
 
 `serve/server.py --engine maya --config <file>` runs the engine like any other. The setup makes everything, on AMD
 under Linux only (`./maya.sh --setup --backend hip --gpus 0,1,2,3 --model inkling-2-small`, or Inkling 2 Small in its
-model list; the Models page lists it under the other quants on an AMD install): the PC (VRAM + RAM must hold the
-model, ~202 GB, `IK2_MEMORY_GB`; since the experts VRAM does not hold are copied into RAM, below that the engine stops
-at its start - the setup warns and goes on, as DeepSeek's does), the context (DeepSeek's: offered from 32K up to the
+model list; the Models page lists it under the other quants on an AMD install): the PC (VRAM + RAM should hold the
+model, ~202 GB, `IK2_MEMORY_GB`; below that the experts RAM does not hold are read in place from the model's files,
+slower - the setup warns and goes on, as DeepSeek's does; `--mmap-experts` given to the setup is written and kept), the context (DeepSeek's: offered from 32K up to the
 model's 1M, recommended from 64K up to 256K by what VRAM + RAM hold beyond the model), the engine
 (`build-hip/maya-inkling2`), unsloth's UD-Q2_K_XL set (`tools/inkling2/download.json`, in
 `<models>/Inkling-2-Small-GGUF/UD-Q2_K_XL`), Thinking Machines' `mtp.safetensors` and `config.json` in
@@ -333,7 +339,7 @@ By hand, the same steps:
   `HIP_VISIBLE_DEVICES` = the config's GPUs and `lib_dirs` first on the library path. The Models page changes
   `--max-context`, the GPUs and Drafting (`--dspark on|none` with `--dspark-index`, offered where the drafter's index is
   on this PC; maya-ik2 has no drafter), and for maya-inkling2 DeepSeek's rows for the settings both engines have:
-  `--reserve-mib`, `--prefill-chunk`, `--cpu-threads` and `--dspark-cum` (as DeepSeek's Draft confidence,
+  `--reserve-mib`, `--mmap-experts` (Experts VRAM does not hold), `--prefill-chunk`, `--cpu-threads` and `--dspark-cum` (as DeepSeek's Draft confidence,
   `--dspark-conf`); every other flag stays as the config has it.
 - **The drafter's index.** The engine drafts only with the index `--dspark-index` names (the setup writes it); without
   one it decodes without drafts and says so at its start.
@@ -437,7 +443,7 @@ Free VRAM after the load and after a long prompt, MiB a GPU (GPUs 0, 1, 2 / GPU 
 | 32K | R - 324 / R - 642 (R = 1500: 1176 / 858) | 606 / 608 | 606 / 608 (30,000 tokens) |
 | 256K | 310 - 340 with R = 1024 | 602 / 602 | 602 / 602 (80,000 tokens) |
 | 512K ("Long contexts": the prompt path's buffers as before) | - | 600 / 608 | 600 / 608 (307,710 tokens) |
-| 1M | - | does not load: the experts VRAM leaves would need 131 GB of RAM, 121 GB is there (see "Long contexts") | - |
+| 1M | - | did not load (the experts VRAM leaves: 131 GB, more than the RAM); with `--mmap-experts` (below): 604 / 604 | 604 / 604 (2,698 tokens) |
 
 The rest above 600 is the experts' rounding: what no further expert fits (an expert is 9.6 - 12.1 MiB) and the
 allocation's 2 MiB page. The experts in VRAM: 10,574 of 18,432 at 32K (10,565 before, when 0.3 GB a GPU was left
@@ -447,13 +453,14 @@ about as much as the runtime's share it missed. The load is about a minute longe
 
 ## Long contexts on this PC (measured, 2026-11-21)
 
-**1M does not load here.** At `--max-context 1048576` the global layers' K / V rows take 8 GiB a GPU, the decode
-step's split-attention scratch 1.5 GiB a GPU (IK2_ATTN_BYTES: 16-key tiles over every key) and the drafter 9.4 GiB of
-the last GPU, so the experts VRAM leaves would need 131 GB of RAM; this PC has 125 GB, 121 of it to be had, and the
-engine keeps 8 GiB for the rest (maya-ds4's RAM margin): it stops at its start (the plan's check, after the dense
-load and before the experts are read). Without the drafter it would still need about 121.5 GB. The largest context
-that fits with the drafter is about 630K (each position more takes 45 KB of VRAM a context: the K / V rows, the
-attention scratch, the drafter's rows - so about as much more RAM for experts); the setup recommends up to 256K (S16).
+**1M did not load here** before `--mmap-experts` ("The experts VRAM does not hold" below, which now loads it). At
+`--max-context 1048576` the global layers' K / V rows take 8 GiB a GPU, the decode step's split-attention scratch 1.5
+GiB a GPU (IK2_ATTN_BYTES: 16-key tiles over every key) and the drafter 9.6 GB of the last GPU, so the experts VRAM
+leaves (6,454 of 18,432 stay) take 131 GB; this PC has 125 GB of RAM, 109 - 121 of it to be had, and the engine keeps
+8 GiB for the rest (maya-ds4's RAM margin): it stopped at its start. Without the drafter it would still need about
+121.5 GB. The largest context whose experts all fit in RAM with the drafter is about 630K (each position more takes 45
+KB of VRAM a context: the K / V rows, the attention scratch, the drafter's rows - so about as much more RAM for
+experts); the setup recommends up to 256K (S16).
 
 **512K end to end** (`--max-context 524288`, the drafter on, the engine's defaults - the run named
 `--prefill-chunk 512`, `INKLING2_STAGE=24` and `INKLING2_S_FLOOR_MI=44`, which the defaults now are; with the larger
@@ -478,10 +485,53 @@ tool calls' requests: it read the pack's chat template as it lies - for this pac
 declarations ("Tool declarations require a function object") and is not what the server renders with; it now takes
 the server's own choice (serve/server.py's chat_template_path: thinkingmachines' template).
 
+## The experts VRAM does not hold: `--mmap-experts` (2026-11-21)
+
+maya-ds4's flag, values and default (`--mmap-experts on|off|auto`, ds4_model.cu's copy_experts): once VRAM's experts
+are placed, the others are copied into RAM or read in place from the model's files (the page cache, the SSD where it
+does not hold them). `off`: the most routed (routings a byte, the VRAM ones' order) that fit the RAM this process can
+get beside the 8 GiB margin (E51) are copied, the others read in place; `on`: none copied; `auto`, the default:
+maya-ds4's copies all of them when they fit with 8 GiB more to spare and else none (its #339: a part copied cost
+decode speed on 32 / 64 GB) - here `auto` is `off`'s rule, measured below (E95). Where all of them fit - every
+context up to the ~630K above on this PC - nothing changes: all copied, as before.
+
+In place, a layer's RAM slots are its copied experts first (`ram`, as before), then the ones in the files (the CPU
+lane's `CpuExperts::gu / dn`: the fused gate | up rows and the down rows where the GGUF has them). The CPU lane reads
+those pages as they are; the prompt path gathers a staging pass's experts from the files into a pinned buffer of its
+GPU (kStage blobs, 330 MB a GPU, allocated only where a layer has experts in the files) on up to 8 threads after an
+`madvise(WILLNEED)` of each (E96), then copies them to the staging slots - not straight from the mapping, which the
+load once saw land a stale page in VRAM (h2d's note); the expert cache's moves read an expert in through its bounce,
+and a cold expert going back to the files is only a pointer. The pages of a layer's experts copied into VRAM or RAM
+are let go of (`MADV_DONTNEED`), the in-place ones' kept. The Models page's "Experts VRAM does not hold" row (Auto /
+From the files / In RAM) and the setup's `--mmap-experts` are DeepSeek's (W3, S31); below the model's memory the setup
+now says the experts RAM does not hold are read from the SSD (S23).
+
+Measured (the drafter on, the shipped profile read-only, `INKLING2_VRAM_LOG=1`):
+
+| Run | Experts in VRAM / RAM / files | Load | 2.7k-token prompt | Its 200 tokens, drafted | CPU lane |
+|---|---|---|---|---|---|
+| 4K, `on` (parity) | 10,949 / 0 / 74.9 GiB | - | PARITY OK x4 (short, long; natural, forced) | - | 17.9 ms a token (short) |
+| 1M, none copied (maya-ds4's auto) | 6,454 / 0 / 122.0 GiB | 140 s | 51.4 tok/s (52.5 s) | 32.2 tok/s (3.32 tokens a pass) | 16.2% of the picks, 20.2 ms a token |
+| 1M, `off` (= auto here) | 6,454 / 100.0 GiB / 22.0 GiB | 392 s | 49.1 tok/s (54.9 s) | **47.2 tok/s** (3.49 a pass) | 16.3%, 8.8 ms a token |
+| 512K before (all copied) | 8,602 / 99.8 GiB / 0 | 396 s | 796 tok/s | 61.3 tok/s | 9.9%, 4.4 ms a token |
+
+The free VRAM after the 1M loads, prompts and decodes: 604 MiB on every GPU. So a part copied decodes 47% faster
+than none on this PC (the CPU lane's share of the picks the same, 16.2 / 16.3%, its time a token 8.8 ms against
+20.2), and `auto` takes `off`'s rule. Prompts are another
+matter: every 512-token chunk streams almost every expert outside VRAM (37,496 for the 2.7k tokens' six chunks), and
+with experts in the files a chunk takes about 9 s whether 22 GiB of them are there (`off`: the copies leave the page
+cache little) or 122 GiB (none copied: 113 GB of page cache during the run) - 50 tok/s against 796 at 512K with all
+of them copied and registered. That is what remains: long prompts at 1M are slow here.
+
 ## The measured values (2026-11-21)
 
 The measurement phase's list ("Values and their sources", the rows that were MEASURE), measured on this PC. Each value
 has an `INKLING2_<NAME>` override (maya-ds4's `DS4_CACHE_*` way: read at the load); `--sweep VAR=a,b,..`
+The checks against the baseline (the default, all copied at these contexts, so the old path): PARITY OK x4, the rewind
+test's five cases OK, `--ab` prose 33.9 -> 59.7, code 37.1 -> 58.1, thinking 37.4 -> 38.4 tok/s, `--serve` 37.7 tok/s
+without drafts and 59.3 with them (the 2.7k prompt continued: 65.3) - the baseline's 33.9 / 59.5, 37.1 / 58.3, 37.3 /
+38.7, 37.6 / 58.3 (65.4); the free VRAM after each decode 600 / 600 / 600 / 604 MiB.
+
 (tests, with `--prompts`) runs each prompt's drafted decode with each value in one load, after a warm run of the
 prompt, `--sweep-rounds` times in ABBA order, so the expert cache's state favours no value. Workloads: `--ab`'s three
 prompts (prose: the 2.7k-token document continued; code: the LRU-cache module; thinking: the sourdough question at
@@ -594,7 +644,7 @@ with where it comes from (2026-11-20). Sources:
 | E48 | Removed from the engine; the setup's per-position cost `ctx_bytes` (D10) | Drafter VRAM at other contexts | MEASURED | 3314 MiB at 32K and 4794 at 256K: 1400 MiB for 229,376 positions, 6400 bytes each, D10 exactly |
 | E49 | head + `8·n_embd` B | VRAM of output_norm + output_res_query (2 F32 vectors) | DERIVED | 2 x 4608 x 4 B |
 | E50 | One spare expert slot per layer | Room for the cache's moves | CHOSEN (bound) | One move at a time a layer: the hot expert lands in the spare slot, the cold one's slot is the next spare |
-| E51 | RAM experts + `ram_margin()` 8 GiB (INKLING2_RAM_MARGIN_GB) must fit in the RAM to be had | The load stops otherwise | MAYA | ds4_model.cu's ram_margin (8 GiB, DS4_RAM_MARGIN_GB); the setup's IK2_MEMORY_GB counts the same 8 GiB (IK2_RAM_MARGIN_GIB) |
+| E51 | The RAM experts' copies leave `ram_margin()` 8 GiB (INKLING2_RAM_MARGIN_GB) of the RAM to be had | The copies that fit; the others read in place (E95) | MAYA | ds4_model.cu's ram_margin (8 GiB, DS4_RAM_MARGIN_GB); the setup's IK2_MEMORY_GB counts the same 8 GiB (IK2_RAM_MARGIN_GIB). Before --mmap-experts the load stopped when they did not all fit |
 | E52 | Staging pinned buffer of at least 256 MiB | Load-time copy buffer (host memory, not VRAM) | MEASURED (insensitive) | Pinned copies to an R9700: 64 MiB pieces 56.3 GB/s, 256 MiB 56.7, 1 GiB 56.9; the load reads the files at about 1 GB/s, so the piece's size is under 1% of it |
 | E53 | 16 blobs: the movers' bounce buffer, and the most moves per poll | Expert-cache copy buffer | CHOSEN (bound) | swap_poll's most moves a round (16): the movers' bounce holds that many blobs |
 | E54 | Warm-up chunk min(Tc, 256) tokens (INKLING2_WARM_TOKENS) | The runtime's share taken before the experts are placed; the first run's seconds | MEASURED | 16, 64 and 256 tokens all take the runtime's whole share (the free VRAM never moved after the load, prompts up to 80K); with 16 the first 5K prompt read 7% slower than its repeat (946 / 1020 tok/s), with 256 2% (996 / 1013). The 256 tokens cost 0.2 s of the load |
@@ -638,6 +688,8 @@ with where it comes from (2026-11-20). Sources:
 | E92 | Window-test pass: cosine ≥ 0.9995 | Test threshold | CHOSEN (bound) | Below the 9 of 9 rows found equal to the bit (above): room for a moved expert only |
 | E93 | Rewind-test pass: cosine ≥ 0.9999 | Test threshold | CHOSEN (bound) | The exact cases resume at a chunk's start: the same chunks as the cold read, so only rounding is left |
 | E94 | Parity: mean cosine ≥ 0.999; every row ≥ 0.999 on ≤ 64 positions | Test threshold | MEASURED | INKLING2_AMD.md (llama.cpp's own noise floor: a worst cosine of 0.23 on long prompts) |
+| E95 | `--mmap-experts` auto (`Options::mmap_experts` -1); on / off | The experts VRAM does not hold: copied into RAM, or read in place from the files | MAYA (the flag, values, default, off and on); MEASURED (auto's rule) | maya-ds4's --mmap-experts (ds4_main.cpp, copy_experts). Its auto copies none unless all fit with 8 GiB to spare; here auto is off's - the most routed that fit: at 1M the 2.7k prompt continued at 47.2 tok/s with 100 GiB copied against 32.2 with none, prompts alike (49.1 / 51.4 tok/s) ("The experts VRAM does not hold") |
+| E96 | The prompt path's gather from the files: up to 8 threads, `MADV_WILLNEED` first, into a pinned buffer of kStage (E44) blobs a GPU | A staging pass's in-place experts | CHOSEN (method) | Pinned, as every copy to the device here (h2d's note: a copy straight from the mapping once landed a stale page); 8 threads: the four GPUs' gathers side by side within the 24 cores; kStage: a staging pass's experts. Not measured against other counts: the 1M prompts are bound by the SSD (E95's runs) |
 
 ### Drafter
 
@@ -696,7 +748,7 @@ with where it comes from (2026-11-20). Sources:
 | S20 | `IK2_DSPARK_GB` 3.47 | Drafter's VRAM added to the need | MEASURED | The last GPU's free VRAM after the load's warm-up with the drafter and without it: 25124 against 28438 MiB at 32K ("VRAM" above) |
 | S21 | `data/expert-profile-inkling2.bin` | Shipped expert profile | MEASURED | The path follows DS4_PROFILE (maya.py). The contents equal the pack's default.prof byte for byte: 15,139,200 routings = 39,425 tokens x 48 x 8. **The corpus is not recorded** (commit 8d4e2c7 says only "the profile the AMD runs used"). |
 | S22 | Set up on AMD under Linux only | Platform gate | CHOSEN (scope) | maya-ik2, the NVIDIA engine, has no setup |
-| S23 | VRAM + RAM < need: a warning, the setup goes on | Memory gate | MAYA | DeepSeek's check (check_pc); the warning says the engine then stops at its start |
+| S23 | VRAM + RAM < need: a warning, the setup goes on | Memory gate | MAYA | DeepSeek's check (check_pc); the warning says the experts RAM does not hold are then read from the SSD (--mmap-experts auto), slower |
 | S24 | Recommendation pool `vram + ram - need` | Context recommendation | MAYA | ds4_recommended_context |
 | S25 | 64K when RAM is unreadable or nothing fits | Fallback | MAYA | maya.py |
 | S26 | Warn when a chosen context's cache does not fit | Warning | CHOSEN (warning) | A chosen context whose cache leaves the experts too little: said, on the same pool as S24 |
@@ -704,7 +756,7 @@ with where it comes from (2026-11-20). Sources:
 | S28 | `--dspark none` until the speed calibration; `--drafting measure \| on \| off` | Setup's drafting default | MAYA | DeepSeek's setup and tools/calibrate_ds4.py (now taking maya-inkling2's --dspark-index) |
 | S29 | A setup again keeps the config's --dspark; the calibration or --drafting then sets it | Re-setup rule | MAYA | write_config_ds4's keep_args |
 | S30 | Port 8080 | Default port | MAYA | maya.py |
-| S31 | Kept flags `--reserve-mib --vram-experts --layer-split --cpu-threads --expert-profile --prefill-chunk --dspark-cum --rewind --short-prompt` | Hand-set flags a re-setup keeps | CHOSEN (list) | Every engine setting the setup does not ask, now with --dspark (DeepSeek's list keeps it too) |
+| S31 | Kept flags `--reserve-mib --vram-experts --layer-split --cpu-threads --expert-profile --prefill-chunk --dspark-cum --rewind --short-prompt --mmap-experts` | Hand-set flags a re-setup keeps | CHOSEN (list) | Every engine setting the setup does not ask, now with --dspark and --mmap-experts (DeepSeek's list keeps both; the setup's --mmap-experts is written, as DeepSeek's) |
 | S32 | Sampling and effort from `MODEL_DEFAULTS["ik2"]` | Written into the config | MODEL | = T24 |
 | S33 | "about a minute" | Conversion message | MEASURED | DSPARK.md (33 s niced, for both types) |
 | S34 | `convert_dspark.py --type q8_0` | Only the Q8_0 copy is made | MEASURED | DSPARK.md |
@@ -722,7 +774,7 @@ with where it comes from (2026-11-20). Sources:
 |---|---|---|---|---|
 | W1 | 32K .. 1M | Contexts on the Models page | MAYA | = S14 (models.py's DS4_CONTEXTS) |
 | W2 | `CONTEXT_TESTED["inkling2"]` 524288 | Where the page starts saying "untested" | MEASURED | Run end to end at --max-context 524288 with a 307,710-token prompt ("Long contexts" above); 1M does not load on this PC (its RAM) |
-| W3 | `IK2_KEYS` + reserve_mib, prefill_chunk, cpu_threads, dspark_cum (maya-inkling2 only) | Settings the page edits | MAYA | DS4_KEYS; dspark_cum is dspark_conf's counterpart, in DeepSeek's Draft confidence row |
+| W3 | `IK2_KEYS` + reserve_mib, mmap, prefill_chunk, cpu_threads, dspark_cum (maya-inkling2 only) | Settings the page edits | MAYA | DS4_KEYS; dspark_cum is dspark_conf's counterpart, in DeepSeek's Draft confidence row; mmap: DeepSeek's "Experts VRAM does not hold" row (auto: the flag dropped) |
 | W4 | VRAM kept free (--reserve-mib) for maya-inkling2 | - | MAYA | DeepSeek's row |
 | W5 | `--dspark` read as "on" when absent; off and none read as Off | Current Drafting state | MAYA | The engine's default, as maya-ds4's; the page writes none (DeepSeek's) |
 | W6 | Context fallback 32768 | Context when `--max-context` is absent | MAYA | = E1 (ds4_model.hpp) |

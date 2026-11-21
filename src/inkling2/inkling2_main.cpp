@@ -692,6 +692,9 @@ int usage() {
                  "  --parity-force-picks  (parity) each reference a second time, every layer taking the reference's\n"
                  "                      picks (what is left is not the router's near-ties)\n"
                  "  --no-expert-cache   the experts stay where the load put them (no cache moves)\n"
+                 "  --mmap-experts on|off|auto  the CPU lane's experts (maya-ds4's): read in place from the model's files\n"
+                 "                      (on), or the most routed that fit copied into RAM and the rest in place (off;\n"
+                 "                      auto, the default, the same here: maya-ds4's copies none unless all fit)\n"
                  "  --tokens-file F     (tests) a prompt a line; with --profile-out: a corpus' routings\n"
                  "  --serve             the server's line protocol on stdin / stdout (docs/INKLING2_AMD.md, \"Serving\")\n"
                  "  --rewind N          positions a rewind may go back without reading the prompt again (default 4096)\n"
@@ -775,6 +778,14 @@ int main(int argc, char** argv) {
         else if (a == "--verbose") o.verbose = true;
         else if (a == "--serve") serving = true;
         else if (a == "--no-expert-cache") o.expert_cache = false;
+        else if (a == "--mmap-experts") {
+            const std::string v = val();
+            if (v != "on" && v != "off" && v != "auto") {
+                std::fprintf(stderr, "--mmap-experts: on, off or auto, not %s\n", v.c_str());
+                return 2;
+            }
+            o.mmap_experts = v == "on" ? 1 : v == "off" ? 0 : -1;
+        }
         else if (a == "--tokens-file") tokens_file = val();
         else if (a == "--rewind") o.rewind = std::atoi(val().c_str());
         else if (a == "--short-prompt") short_n = std::atoi(val().c_str());

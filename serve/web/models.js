@@ -621,7 +621,11 @@ function ik2Fields(m, d, ch, gpus, reserve) {
       html`<${Row} label="Images" hint="Inkling 2 Small's engines read text only for now."/>`,
       html`<${Row} label="Answers at once" hint="Inkling 2 Small answers one request at a time for now."/>`].filter(Boolean)},
     // (maya-inkling2: DeepSeek's rows for the settings it shares with maya-ds4; maya-ik2 has none of them)
-    {label: "GPUs and memory", rows: amd ? [gpus, reserve] : [gpus]},
+    {label: "GPUs and memory", rows: amd ? [gpus, reserve,
+      html`<${Row} label="Experts VRAM does not hold" flag="--mmap-experts" changed=${ch("mmap")}
+        hint="Auto (as In RAM here) copies the most used into RAM as far as it holds them and reads the others from the SSD in place.">
+        <${Seg} label="Experts VRAM does not hold" value=${d.mmap} options=${[{id: "auto", label: "Auto"}, {id: "on", label: "From the files"}, {id: "off", label: "In RAM"}]}
+          onChange=${(v) => setDraft({mmap: v})}/><//>`] : [gpus]},
     ...(amd ? [{label: "Speed", rows: [
       html`<${Row} label="Prompt chunk" flag="--prefill-chunk" changed=${ch("prefill_chunk")} hint="Empty: the engine picks."
         warn=${whole(d.prefill_chunk) ? null : "A whole number, or empty."}>

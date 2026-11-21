@@ -17,8 +17,9 @@ A config's settings, as the page shows them (None: the engine's own default, or 
              file: --vision off when off); one answer at a time
   Inkling 2 Small (family "ik2": maya-ik2 on NVIDIA, maya-inkling2 on AMD - text only, one answer at a time): context,
              gpus, env; draft ("dspark" | "none": maya-inkling2's DSpark drafter, where its index is on this PC -
-             maya-ik2 has none); maya-inkling2's DeepSeek settings: reserve_mib, prefill_chunk, cpu_threads and
-             dspark_cum (its counterpart of DeepSeek's dspark_conf); maya-ik2's other flags stay as the config has them
+             maya-ik2 has none); maya-inkling2's DeepSeek settings: reserve_mib, mmap, prefill_chunk, cpu_threads
+             and dspark_cum (its counterpart of DeepSeek's dspark_conf); maya-ik2's other flags stay as the config
+             has them
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -75,10 +76,11 @@ MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_c
             "cpu_threads", "reserve_gb", "prefill_chunk", "cache_gb", "dspark_conf")
 QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb")
 HY4_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "reserve_gb", "prefill_chunk", "cpu_threads", "kv")
-# (Inkling 2: maya-inkling2's DeepSeek settings beside them - DS4_KEYS' reserve_mib, prefill_chunk, cpu_threads, and
-#  dspark_cum, its counterpart of dspark_conf; maya-ik2's other flags stay as the config has them)
-IK2_KEYS = ("context", "images", "gpus", "env", "draft", "reserve_mib", "prefill_chunk", "cpu_threads", "dspark_cum")
-IK2_AMD_ONLY = ("reserve_mib", "prefill_chunk", "cpu_threads", "dspark_cum")   # (maya-ik2 has none of them)
+# (Inkling 2: maya-inkling2's DeepSeek settings beside them - DS4_KEYS' reserve_mib, mmap, prefill_chunk, cpu_threads,
+#  and dspark_cum, its counterpart of dspark_conf; maya-ik2's other flags stay as the config has them)
+IK2_KEYS = ("context", "images", "gpus", "env", "draft", "reserve_mib", "mmap", "prefill_chunk", "cpu_threads",
+            "dspark_cum")
+IK2_AMD_ONLY = ("reserve_mib", "mmap", "prefill_chunk", "cpu_threads", "dspark_cum")   # (maya-ik2 has none of them)
 # Inkling 2 Small's DSpark drafter on AMD (maya-inkling2 --dspark-index): tools/inkling2/convert_dspark.py's Q8_0 index,
 # in the folder the setup downloads Thinking Machines' mtp.safetensors into, beside the model's GGUF folder (maya.py's
 # IK2_MTP_DIR / IK2_DSPARK)
@@ -474,7 +476,10 @@ def settings_of(cfg: dict) -> dict:
                    (Path(index) / "dspark.txt").is_file() else "none")
         if ik2_amd(cfg):                               # (empty: the engine's own default)
             out.update(reserve_mib=_int(flag(args, "--reserve-mib")), prefill_chunk=_int(flag(args, "--prefill-chunk")),
-                       cpu_threads=_int(flag(args, "--cpu-threads")), dspark_cum=_float(flag(args, "--dspark-cum")))
+                       cpu_threads=_int(flag(args, "--cpu-threads")), dspark_cum=_float(flag(args, "--dspark-cum")),
+                       mmap=flag(args, "--mmap-experts", "auto"))   # (DeepSeek's: auto, the engine's own)
+            if out["mmap"] not in ("auto", "on", "off"):
+                out["mmap"] = "auto"
         return out
     if family(cfg) == "hy4":                           # (maya-hy4's own defaults where the config names none)
         tp = flag(args, "--tp", "auto")
@@ -695,6 +700,9 @@ def apply(cfg: dict, settings: dict) -> dict:
                 raise ValueError(f"not a setting of maya-ik2: {', '.join(given)}")
         else:
             args = set_flag(args, "--reserve-mib", reserve) if reserve is not None else drop_flag(args, "--reserve-mib")
+            if s.get("mmap") not in ("auto", "on", "off"):   # (DeepSeek's row: auto is the engine's own, not written)
+                raise ValueError("Experts VRAM does not hold: auto, on or off")
+            args = drop_flag(args, "--mmap-experts") if s["mmap"] == "auto" else set_flag(args, "--mmap-experts", s["mmap"])
             for key, name, lo, hi, what in (("prefill_chunk", "--prefill-chunk", 16, 65536, "Prompt chunk"),
                                             ("cpu_threads", "--cpu-threads", 1, 512, "CPU threads")):
                 v = _num(s, key, lo, hi, what)
