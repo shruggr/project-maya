@@ -23,8 +23,8 @@ namespace inkling2 {
 struct Options {
     std::string pack;
     std::vector<int> gpus;        // empty: every visible GPU
-    int64_t max_ctx = 16384;      // positions the global layers' caches hold
-    double reserve_gb = 1.0;      // VRAM each GPU keeps free beyond the plan
+    int64_t max_ctx = 32768;      // positions the global layers' caches hold (maya-ds4's default)
+    int64_t reserve_mib = 600;    // VRAM each GPU keeps free beyond the plan, MiB (maya-ds4's --reserve-mib and default)
     double vram_experts = 1.0;    // the share of each layer's routed experts kept in VRAM at most
     int cpu_threads = -1;         // the CPU lane's workers besides the caller (-1: one a physical core but the first)
     std::string profile;          // an expert profile (uint32 [layers][experts] routings): the most routed in VRAM
@@ -38,7 +38,7 @@ struct Options {
     std::string dspark_index;     // the drafter's index folder (inkling2_dspark.hpp; empty: no drafter): loaded on the
                                   // last GPU, fed every position's taps by the steps and the prompt path
     float dspark_cum = 0.5f;      // its cut on the running product of the drafts' probabilities (Model::set_draft_cum)
-    double dspark_reserve_gb = 3.4;   // VRAM the last GPU keeps for it beyond reserve_gb (fewer experts there), at a
+    double dspark_reserve_gb = 3.4;   // VRAM the last GPU keeps for it beyond reserve_mib (fewer experts there), at a
                                       // context of 32768: a longer one adds the drafter's rows a position
     bool swap = true;             // the expert cache: the experts routed to lately move into VRAM, colder ones out
     bool verbose = false;

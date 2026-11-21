@@ -32,7 +32,7 @@ AMD = [{"index": i, "name": "Radeon AI PRO R9700", "arch": "gfx1201", "vram_gb":
 def args(**kw):
     base = dict(model=None, model_dir=None, models_dir=None, gguf_dir=None, draft=None, backend="hip", yes=True,
                 port=None, host=None, api_key=None, env=[], no_vision=False, parallel=None, gpus=None, gpu=None,
-                context=None, drafting=None, force_fit=False, repack=False, download_model=False, llama_dir=None,
+                context=None, drafting=None, vram_reserve_mib=None, force_fit=False, repack=False, download_model=False, llama_dir=None,
                 rebuild=False, qwen_quant=None, hy4_quant=None, ds4_quant=None, mm3_quant=None, no_start=True)
     base.update(kw)
     return SimpleNamespace(**base)
@@ -366,7 +366,8 @@ class Config(unittest.TestCase):
         cfg = self.write()
         self.assertEqual(Path(cfg["exe"]), maya.INK_EXE)
         self.assertEqual(cfg["args"], ["--pack", str(self.lay.d / maya.IK2_PACK), "--max-context", "262144",
-                                       "--dspark", "on", "--dspark-index", str(self.lay.mtp / maya.IK2_DSPARK)])
+                                       "--dspark", "on", "--dspark-index", str(self.lay.mtp / maya.IK2_DSPARK),
+                                       "--reserve-mib", str(maya.hip_reserve_mib(AMD))])   # (as DeepSeek's on AMD)
         self.assertEqual(cfg["gpu"], [0, 1, 2, 3])
         self.assertEqual(cfg["backend"], "hip")
         self.assertEqual(cfg["tokenizer"], str(self.lay.d / maya.IK2_PACK / "tokenizer"))
@@ -394,16 +395,29 @@ class Config(unittest.TestCase):
         self.assertNotIn("--dspark-index", none["args"])
 
     def test_again_keeps_what_it_does_not_ask(self):
-        old = {"exe": "/x/maya-inkling2", "args": ["--pack", "/old", "--max-context", "32768", "--reserve-gb", "2",
-                                                   "--threads", "16", "--dspark-cum", "0.4"],
+        old = {"exe": "/x/maya-inkling2", "args": ["--pack", "/old", "--max-context", "32768", "--reserve-mib", "900",
+                                                   "--cpu-threads", "16", "--expert-profile", "/p.prof",
+                                                   "--dspark-cum", "0.4"],
                "host": "0.0.0.0", "api_key": "k", "env": {"A": "1"}, "port": 9000, "reasoning_effort": "high"}
         (self.root / "maya-inkling2-hip.json").write_text(json.dumps(old), encoding="utf-8")
         cfg = self.write(args(env=["B=2"]))
-        for f, v in (("--reserve-gb", "2"), ("--threads", "16"), ("--dspark-cum", "0.4"), ("--max-context", "262144"),
+        for f, v in (("--reserve-mib", "900"), ("--cpu-threads", "16"), ("--expert-profile", "/p.prof"),
+                     ("--dspark-cum", "0.4"), ("--max-context", "262144"),
                      ("--pack", str(self.lay.d / maya.IK2_PACK))):
             self.assertEqual(maya.flag_value(cfg["args"], f), v)
         self.assertEqual((cfg["host"], cfg["api_key"], cfg["env"]), ("0.0.0.0", "k", {"A": "1", "B": "2"}))
         self.assertEqual(cfg["reasoning_effort"], Q.MODEL_DEFAULTS["ik2"][1])   # (the model's own, every setup)
+
+    def test_the_vram_kept_free(self):
+        """--reserve-mib (maya-ds4's flag): what DeepSeek's setup writes on AMD - --vram-reserve-mib, else
+        hip_reserve_mib."""
+        self.assertEqual(maya.flag_value(self.write(args(vram_reserve_mib=900))["args"], "--reserve-mib"), "900")
+        self.assertEqual(maya.flag_value(self.write()["args"], "--reserve-mib"), "900")   # (a setup again keeps it)
+        (self.root / "maya-inkling2-hip.json").unlink()
+        apu = [dict(AMD[0], unified_memory=True)]
+        with patch.object(maya, "hip_unified_memory", lambda g: bool(g.get("unified_memory"))), \
+                patch.dict(PC, gpus=apu):
+            self.assertEqual(maya.flag_value(self.write()["args"], "--reserve-mib"), str(maya.hip_reserve_mib(apu)))
 
 
 class SetUp(unittest.TestCase):

@@ -659,12 +659,13 @@ int usage() {
     std::fprintf(stderr,
                  "maya-inkling2 --pack <dir> (--tokens <ids> [--n-predict N] | --parity <reference dir> [--parity <dir> ...])\n"
                  "  --gpus 0,1,2,3      the GPUs (default: all)\n"
-                 "  --max-context N     positions the global layers' caches hold (default 16384)\n"
-                 "  --reserve-gb X      VRAM each GPU keeps free (default 1.0)\n"
+                 "  --max-context N     positions the global layers' caches hold (default 32768)\n"
+                 "  --reserve-mib N     VRAM each GPU keeps free, MiB (default 600)\n"
                  "  --vram-experts X    the share of a layer's experts in VRAM at most (default 1.0)\n"
                  "  --layer-split a,b,c the first layer of each GPU after the first (auto: by the layers' bytes, the default)\n"
-                 "  --profile F / --profile-out F   an expert profile read (the most routed in VRAM) / written\n"
-                 "  --threads N         the CPU lane's workers (default: one a physical core)\n"
+                 "  --expert-profile F / --profile-out F   an expert profile read (the most routed in VRAM; none: no\n"
+                 "                      profile, default: the pack's default.prof) / written\n"
+                 "  --cpu-threads N     the CPU lane's workers (default: one a physical core)\n"
                  "  --log-floor N       log_scaling_n_floor in place of the pack's\n"
                  "  --layers N          (tests) the first N layers only\n"
                  "  --parity-max N      (parity) the first N positions only\n"
@@ -725,15 +726,15 @@ int main(int argc, char** argv) {
         if (a == "--pack") o.pack = val();
         else if (a == "--gpus") o.gpus = int_list(val());
         else if (a == "--max-context" || a == "--ctx") o.max_ctx = std::atoll(val().c_str());
-        else if (a == "--reserve-gb") o.reserve_gb = std::atof(val().c_str());
+        else if (a == "--reserve-mib") o.reserve_mib = std::atoll(val().c_str());
         else if (a == "--vram-experts") o.vram_experts = std::atof(val().c_str());
         else if (a == "--layer-split") {   // (auto: the plan's own split, by the layers' bytes)
             const std::string v = val();
             if (v != "auto") o.layer_split = int_list(v);
         }
-        else if (a == "--profile") o.profile = val();
+        else if (a == "--expert-profile") o.profile = val();
         else if (a == "--profile-out") o.profile_out = val();
-        else if (a == "--threads") o.cpu_threads = std::atoi(val().c_str());
+        else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val().c_str());
         else if (a == "--log-floor") o.log_floor = std::atof(val().c_str());
         else if (a == "--layers") o.layers = std::atoi(val().c_str());
         else if (a == "--parity") parities.push_back(val());

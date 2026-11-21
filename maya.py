@@ -10233,7 +10233,8 @@ def write_config_ik2(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     (--dspark-index: the engine drafts with it, --dspark off without - the Models page switches it), the model's own
     sampling and thinking level at every setup; a setup again keeps what the config before says that this one does
     not ask - where the server listens, its key, the env, and the engine settings set by hand (the VRAM kept free, the
-    layer split, the CPU lane's threads, an expert profile, the prompt chunk, the drafts' floor).  The GPUs: the
+    layer split, the CPU lane's threads, an expert profile, the prompt chunk, the drafts' floor).  The VRAM kept free
+    (--reserve-mib, maya-ds4's flag): DeepSeek's on AMD (--vram-reserve-mib, else hip_reserve_mib).  The GPUs: the
     server shows the engine the config's "gpu" cards and splits the layers over them (--layer-split auto)."""
     step(8, "the configuration and the start script")
     port = a.port or 8080
@@ -10243,8 +10244,17 @@ def write_config_ik2(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     if index is not None:
         args += ["--dspark", "on" if drafting else "off", "--dspark-index", str(index)]
     kept = keep_args([str(x) for x in old.get("args") or []], args,
-                     ("--reserve-gb", "--vram-experts", "--layer-split", "--threads", "--profile", "--prefill-chunk",
-                      "--dspark-cum", "--rewind", "--short-prompt"))
+                     ("--reserve-mib", "--vram-experts", "--layer-split", "--cpu-threads", "--expert-profile",
+                      "--prefill-chunk", "--dspark-cum", "--rewind", "--short-prompt"))
+    # (the VRAM kept free on each GPU: as DeepSeek's setup writes it on AMD - --vram-reserve-mib, else hip_reserve_mib)
+    if getattr(a, "vram_reserve_mib", None) is not None:   # given now: written, and a later setup keeps it
+        set_arg(args, "--reserve-mib", a.vram_reserve_mib)
+        ok(f"VRAM kept free on each GPU: {a.vram_reserve_mib} MiB (--vram-reserve-mib)")
+    elif "--reserve-mib" not in args[:-1]:
+        mib = hip_reserve_mib(pc["gpus"])
+        set_arg(args, "--reserve-mib", mib)
+        ok(f"VRAM kept free on each GPU: {mib} MiB (the desktop and other programs on an AMD GPU allocate beside the "
+           "engine; --vram-reserve-mib changes it)")
     inst = {"family": "ik2", "ik2_quant": quant, "quant": Q.OTHERS[("ik2", quant)], "drafting": "on" if drafting else "off"}
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
     cfg = {"exe": str(INK_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),

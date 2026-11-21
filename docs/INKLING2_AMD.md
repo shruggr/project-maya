@@ -84,8 +84,10 @@ Not done:
 3. Sampled requests copy every window row's logits to the host for the verdict (0.8 MB a row).
 4. Thinking text is break-even (half of 1.5 offered drafts kept): the drafter rests there, it does not gain.
 
-Engine flags: `--pack --max-context (--ctx) --layer-split --gpus --reserve-gb --vram-experts --profile (none) --profile-out
---threads --log-floor --prefill-chunk --try-chunks --repeat --rewind --short-prompt --no-swap --eos --serve --tokens
+Engine flags (where maya-ds4 has the same setting, its name, unit and default: `--max-context` 32768, `--reserve-mib`
+600 - the setup writes DeepSeek's AMD figure, 3072 on a discrete card -, `--cpu-threads`, `--expert-profile`,
+`--profile-out`): `--pack --max-context (--ctx) --layer-split --gpus --reserve-mib --vram-experts
+--expert-profile (none) --profile-out --cpu-threads --log-floor --prefill-chunk --try-chunks --repeat --rewind --short-prompt --no-swap --eos --serve --tokens
 --tokens-file --n-predict --layers --dspark --dspark-index --dspark-cum --verbose`; tests `--parity [--parity-force-picks
 --parity-force-only --parity-decode --parity-detail --parity-max] --rewind-test --short-bench --window-test
 [--window-bits] --prompts --ab --temperature --seed --dspark-rest0`. Environment: `INKLING2_PHASES` (device phase
@@ -221,7 +223,7 @@ Reference checkout: `/home/shruggr/build/llama.cpp-inkling2` (master b94959a64, 
   experts).
 - **Layer split** over the GPUs (hidden-state hand-off between cards). Tensor parallel is out: the experts' 256-value
   blocks cannot split n_ff 2304 (maya-ds4 falls back the same way on this PC).
-- **Experts**: per layer, the most-routed experts (by a profile, uint32 [48][384] routings, Hy4's `--profile`) live
+- **Experts**: per layer, the most-routed experts (by a profile, uint32 [48][384] routings, `--expert-profile` - Hy4's `--profile`) live
   in VRAM in ds4_iq's blob layout (gate | up | down, `tr[]` offsets, the fused GGUF gate_up maps to tr[1] = tr[0] +
   2304 * row_bytes); the rest are **copied into pinned RAM** (never paged from the GGUF on a miss - that is what made
   llama.cpp crawl here) and computed on the CPU lane (24 threads). The engine counts routings and writes a profile

@@ -592,7 +592,7 @@ struct Model::Impl {
             gp.l1 = first[(size_t) gi + 1];
             gp.blob_max = 1;
             for (int il = gp.l0; il < gp.l1; ++il) gp.blob_max = std::max(gp.blob_max, L[(size_t) il].blob);
-            size_t fixed = scratch_bytes() + chunk_bytes(gp.blob_max) + (gi == ng - 1 ? head_bytes : 0) + (size_t) (o.reserve_gb * 1e9) +
+            size_t fixed = scratch_bytes() + chunk_bytes(gp.blob_max) + (gi == ng - 1 ? head_bytes : 0) + ((size_t) o.reserve_mib << 20) +
                            (gi == ng - 1 && !o.dspark_index.empty() ? dspark_bytes() : 0);
             for (int il = gp.l0; il < gp.l1; ++il) fixed += L[(size_t) il].dense;
             if (fixed > gp.free0) {
