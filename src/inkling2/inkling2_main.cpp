@@ -111,6 +111,29 @@ struct Lines {
     std::deque<std::string> q;
     bool eof = false;
     std::atomic<bool> stop{false}, wrap{false};
+    // (--parallel, maya-ds4's: `STOP <rid>` ends that request alone - stop_rids; a bare STOP every one)
+    bool multi = false;
+    std::vector<long long> stop_rids;
+    bool stopped(long long rid) {
+        if (stop.load() || wrap.load()) return true;
+        std::lock_guard<std::mutex> lk(mu);
+        return std::find(stop_rids.begin(), stop_rids.end(), rid) != stop_rids.end();
+    }
+    void forget(long long rid) {   // (the request is over: a late STOP of it changes nothing)
+        std::lock_guard<std::mutex> lk(mu);
+        stop_rids.erase(std::remove(stop_rids.begin(), stop_rids.end(), rid), stop_rids.end());
+    }
+    bool try_next(std::string& out) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (q.empty()) return false;
+        out = std::move(q.front());
+        q.pop_front();
+        return true;
+    }
+    bool ended() {
+        std::lock_guard<std::mutex> lk(mu);
+        return eof && q.empty();
+    }
     void start() {
         std::thread([this] {
             std::string buf;
@@ -124,7 +147,12 @@ struct Lines {
                     buf.erase(0, nl + 1);
                     if (!l.empty() && l.back() == '\r') l.pop_back();
                     if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
-                        stop.store(true);
+                        if (multi && l.size() > 5) {
+                            std::lock_guard<std::mutex> lk(mu);
+                            stop_rids.push_back(std::atoll(l.c_str() + 5));
+                        } else {
+                            stop.store(true);
+                        }
                         continue;
                     }
                     if (l == "WRAP") {
@@ -670,6 +698,351 @@ int serve(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool s
     return 0;
 }
 
+// ---- SEVERAL CONVERSATIONS AT ONCE (--parallel <n>: READY ... multi=<n>, maya-ds4's protocol).  GEN lines carry
+// rid=<id>, and every line a request causes carries it after its keyword (T <rid> <id>, PP <rid> ..., DONE <rid> ...,
+// ERR <rid> ...); STOP <rid> ends that request, a bare STOP every one.  Each request runs in one of the n conversations
+// the model holds (Model::bind): the idle one whose tokens its prompt shares the most of, else the least recently used.
+// A prompt is read whole when its turn comes (the others' answers wait for it); between two prompts every running
+// request writes: one alone in its rounds as with one conversation (the drafter's windows), two or more a token each
+// in one step through the layers (Model::step_multi: the weights read once), each request's logit bias and sampler
+// on its own row.  STAT lines are the engine's (untagged).
+long long gen_rid(const std::string& line) {
+    std::istringstream is(line.substr(4));
+    for (std::string tok; is >> tok;)
+        if (tok.rfind("rid=", 0) == 0) return std::atoll(tok.c_str() + 4);
+    return -1;
+}
+int serve_multi(inkling2::Model& m, const std::vector<int>& stops, int short_n, bool spec_default, bool drafting,
+                float cum_default, int rest0) {
+    for (const std::string& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
+    const inkling2::Stats& st = m.stats();
+    const int N = m.seq_count(), V = m.vocab();
+    std::printf("INFO engine=inkling2 engine_kind=inkling2 model=Inkling-2-Small ctx=%lld vram_gb=%.2f dspark=%d mtp=0 "
+                "experts=%d experts_vram=%d\n", (long long) m.max_ctx(), st.vram_gb + m.dspark_vram_gb(),
+                m.dspark() && drafting && spec_default ? 1 : 0, st.experts_all, st.experts_vram);
+    std::printf("INFO logit_bias=1\n");
+    std::printf("READY %lld stop multi=%d\n", (long long) m.max_ctx(), N);
+    std::fflush(stdout);
+    std::fprintf(stderr, "maya inkling2 serve: %d conversations at once (--parallel): GEN needs rid=<id>; STOP <rid>\n", N);
+    Lines lines;
+    lines.multi = true;
+    lines.start();
+    auto is_stop = [&](int t) { return std::find(stops.begin(), stops.end(), t) != stops.end(); };
+    struct Act {
+        long long rid = -1;
+        mm3::sample::Req r;
+        float cum = 0.5f;
+        std::vector<std::pair<int, float>> bias;
+        int seq = 0;
+        bool read = false, done = false;
+        size_t from = 0;
+        double t0 = 0, t1 = 0;
+        long long produced = 0;
+        const char* finish = "length";
+        int tok = -1;
+        bool spec = false, want_lg = false;
+        std::mt19937_64 rng;
+        Drafting d0;
+        int64_t cpu0 = 0, ex0 = 0;
+    };
+    std::vector<std::vector<int>> held((size_t) N);
+    std::vector<long long> seq_rid((size_t) N, -1);
+    std::vector<uint64_t> seq_used((size_t) N, 0);
+    std::vector<Drafting> dr((size_t) N);
+    for (Drafting& d : dr) {
+        d.on = m.dspark() && drafting;
+        if (rest0 >= 0) d.rest0 = rest0;
+    }
+    uint64_t clock = 0;
+    unsigned long long counter = 0;
+    std::vector<std::unique_ptr<Act>> acts;
+    std::deque<std::string> waiting;
+    std::vector<float> lg((size_t) V), rows, lgw;
+    std::vector<int> out;
+    std::string err;
+    bool quit = false;
+    auto done_line = [&](Act& a) {
+        const double t2 = now_s();
+        const Drafting& d = dr[(size_t) a.seq];
+        std::printf("DONE %lld %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", a.rid, a.produced, a.r.ids.size(),
+                    (a.t1 - a.t0) * 1e3, a.read ? (t2 - a.t1) * 1e3 : 0.0, a.finish, d.accepted - a.d0.accepted,
+                    d.offered - a.d0.offered, a.from);
+        std::fflush(stdout);
+        std::fprintf(stderr, "maya inkling2 serve: rid %lld in conversation %d: prompt %zu tokens (%zu reused), %lld "
+                             "generated in %.0f ms (%.1f tok/s), %s\n", a.rid, a.seq, a.r.ids.size(), a.from, a.produced,
+                     (t2 - a.t1) * 1e3, t2 > a.t1 && a.read ? (double) a.produced / (t2 - a.t1) : 0.0, a.finish);
+        held[(size_t) a.seq].resize((size_t) std::min<int64_t>((int64_t) held[(size_t) a.seq].size(), m.end_of(a.seq)));
+        seq_rid[(size_t) a.seq] = -1;
+        lines.forget(a.rid);
+        a.done = true;
+        if (!m.save_profile(err)) std::fprintf(stderr, "inkling2: the expert profile: %s\n", err.c_str());
+    };
+    auto emit = [&](Act& a, int t) {   // false: the answer ends with it
+        std::printf("T %lld %d\n", a.rid, t);
+        ++a.produced;
+        if (is_stop(t)) {
+            a.finish = "stop";
+            std::fflush(stdout);
+            return false;
+        }
+        if (a.produced % 8 == 0) {
+            const double ms = (now_s() - a.t1) * 1e3;
+            const double share = (double) (st.cpu_experts - a.cpu0) / (double) std::max<int64_t>(1, st.experts - a.ex0);
+            std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f cpu_share=%.4f swaps=%lld\n",
+                        1e3 * (double) a.produced / ms, ms / (double) a.produced, 1.0 - share, 0.0, share,
+                        (long long) st.swaps);
+        }
+        std::fflush(stdout);
+        return true;
+    };
+    // a GEN line into a free conversation (false: none is free - it waits)
+    auto place = [&](const std::string& line) -> bool {
+        auto a = std::make_unique<Act>();
+        a->rid = gen_rid(line);
+        a->cum = cum_default;
+        if (a->rid < 0) {
+            std::printf("ERR this engine runs several conversations: GEN needs rid=<id>\n");
+            std::fflush(stdout);
+            return true;
+        }
+        if (!parse_gen(line, a->r, a->cum, a->bias)) {
+            std::printf("ERR %lld expected: GEN <max_new> [keys] <id,id,...>\n", a->rid);
+            std::printf("DONE %lld 0 0 0.0 0.0 cancel 0 0 0 0 0\n", a->rid);
+            std::fflush(stdout);
+            return true;
+        }
+        const size_t n = a->r.ids.size();
+        bool bad = false;
+        for (int t : a->r.ids) bad = bad || t < 0 || t >= V;
+        if (bad || (long long) n + std::max(0ll, a->r.max_new) > m.max_ctx()) {
+            if (bad) std::printf("ERR %lld a prompt token is outside the vocabulary (%d)\n", a->rid, V);
+            else
+                std::printf("ERR %lld the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", a->rid, n,
+                            a->r.max_new, (long long) m.max_ctx());
+            std::printf("DONE %lld 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", a->rid, n);
+            std::fflush(stdout);
+            return true;
+        }
+        int best = -1;
+        size_t best_l = 0;
+        for (int s2 = 0; s2 < N; ++s2) {   // (the idle one sharing the most; ties: the least recently used)
+            if (seq_rid[(size_t) s2] >= 0) continue;
+            size_t l2 = 0;
+            const std::vector<int>& h = held[(size_t) s2];
+            while (l2 < h.size() && l2 < n - 1 && h[l2] == a->r.ids[l2]) ++l2;
+            if (best < 0 || l2 > best_l || (l2 == best_l && seq_used[(size_t) s2] < seq_used[(size_t) best])) {
+                best = s2;
+                best_l = l2;
+            }
+        }
+        if (best < 0) return false;
+        a->seq = best;
+        seq_rid[(size_t) best] = a->rid;
+        seq_used[(size_t) best] = ++clock;
+        ++counter;
+        a->rng.seed(a->r.seed != 0 ? a->r.seed : 0x9E3779B97F4A7C15ull * counter);
+        acts.push_back(std::move(a));
+        return true;
+    };
+    // a request's prompt read in its conversation, its first token given out
+    auto read_prompt = [&](Act& a) {
+        a.read = true;
+        a.t0 = now_s();
+        std::vector<int>& h = held[(size_t) a.seq];
+        const size_t n = a.r.ids.size();
+        bool ok = m.bind(a.seq, err) && m.set_logit_bias(a.bias, err);
+        size_t lcp = 0;
+        if (ok) {
+            while (lcp < h.size() && lcp < n - 1 && h[lcp] == a.r.ids[lcp]) ++lcp;
+            a.from = (size_t) m.rewind((int64_t) lcp);
+            h.resize(a.from);
+        }
+        auto pp = [&](size_t read) {
+            const double ms = (now_s() - a.t0) * 1e3;
+            std::printf("PP %lld %zu %zu %.1f %.1f %zu\n", a.rid, read, n, ms,
+                        ms > 0 ? 1e3 * (double) (read - a.from) / ms : 0.0, a.from);
+            std::fflush(stdout);
+        };
+        a.want_lg = a.r.temperature > 0.0f || mm3::sample::penalised(a.r);
+        bool cancel = false;
+        if (ok) {
+            pp(a.from);
+            if (n - a.from <= (size_t) short_n) {
+                for (size_t i = a.from; i < n && ok && !cancel; ++i) {
+                    ok = m.forward(&a.r.ids[i], 1, (int64_t) i, i + 1 == n && a.want_lg ? lg.data() : nullptr, err);
+                    cancel = lines.stopped(a.rid);
+                }
+                if (ok && cancel && (size_t) m.end() == n) cancel = false;
+            } else {
+                const long long rid = a.rid;
+                m.set_progress([&, rid](int64_t done) {
+                    pp(a.from + (size_t) done);
+                    return !lines.stopped(rid);
+                });
+                ok = m.forward(&a.r.ids[a.from], (int) (n - a.from), (int64_t) a.from, a.want_lg ? lg.data() : nullptr, err);
+                m.set_progress(nullptr);
+                cancel = ok && m.cancelled();
+            }
+        }
+        a.t1 = now_s();
+        h.assign(a.r.ids.begin(), a.r.ids.begin() + (long) m.end());
+        if (!ok) {
+            std::printf("ERR %lld %s\n", a.rid, err.c_str());
+            std::fprintf(stderr, "inkling2: %s\n", err.c_str());
+            m.reset();
+            h.clear();
+        }
+        if (!ok || cancel) {
+            a.finish = "cancel";
+            a.produced = 0;
+            done_line(a);
+            return;
+        }
+        pp(n);
+        Drafting& d = dr[(size_t) a.seq];
+        d.start();
+        a.d0 = d;
+        a.spec = d.on && (a.r.spec < 0 ? spec_default : a.r.spec != 0);
+        a.cpu0 = st.cpu_experts;
+        a.ex0 = st.experts;
+        a.tok = a.want_lg ? sample(lg.data(), V, a.r, h, a.rng) : m.top();
+        if (a.r.max_new <= 0 || !emit(a, a.tok)) done_line(a);
+    };
+    // the end of an answer before its token in hand is read: the context holds it as given out
+    auto room_left = [&](Act& a) {
+        if (lines.stopped(a.rid)) {
+            held[(size_t) a.seq].push_back(a.tok);
+            a.finish = "cancel";
+            done_line(a);
+            return false;
+        }
+        if (a.produced >= a.r.max_new || m.end_of(a.seq) + 1 > m.max_ctx()) {
+            held[(size_t) a.seq].push_back(a.tok);
+            done_line(a);
+            return false;
+        }
+        return true;
+    };
+    while (!quit) {
+        // the lines that came (a wait for one when nothing runs)
+        for (std::string line;;) {
+            bool idle = waiting.empty();
+            for (const auto& a : acts) idle = idle && a->done;
+            if (idle && !lines.next(line)) {
+                quit = true;
+                break;
+            }
+            if (!idle && !lines.try_next(line)) {
+                if (lines.ended()) quit = true;
+                break;
+            }
+            if (line == "QUIT") {
+                quit = true;
+                break;
+            }
+            if (line.empty()) continue;
+            if (line.rfind("GEN ", 0) != 0) {
+                std::printf("ERR unsupported command '%s' (GEN, STOP, WRAP and QUIT)\n", line.substr(0, 40).c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            waiting.push_back(line);
+            if (idle) break;
+        }
+        if (quit) break;
+        if (lines.stop.exchange(false) | lines.wrap.exchange(false))   // (a bare STOP: every request running now)
+            for (auto& a : acts)
+                if (!a->done) {
+                    if (a->read) held[(size_t) a->seq].push_back(a->tok);
+                    a->finish = "cancel";
+                    done_line(*a);
+                }
+        acts.erase(std::remove_if(acts.begin(), acts.end(), [](const std::unique_ptr<Act>& a) { return a->done; }),
+                   acts.end());
+        while (!waiting.empty() && place(waiting.front())) waiting.pop_front();
+        // a prompt whose turn it is (the first placed)
+        for (auto& a : acts)
+            if (!a->done && !a->read) {
+                read_prompt(*a);
+                break;
+            }
+        // a round of the answers
+        std::vector<Act*> run;
+        for (auto& a : acts)
+            if (!a->done && a->read && room_left(*a)) run.push_back(a.get());
+        if (run.empty()) continue;
+        if (run.size() == 1) {   // (alone: as one conversation - its rounds with drafts)
+            Act& a = *run[0];
+            Drafting& d = dr[(size_t) a.seq];
+            std::vector<int>& h = held[(size_t) a.seq];
+            if (!m.bind(a.seq, err) || !m.set_logit_bias(a.bias, err)) {
+                std::printf("ERR %lld %s\n", a.rid, err.c_str());
+                a.finish = "cancel";
+                done_line(a);
+                continue;
+            }
+            if (d.on) m.set_draft_cum(a.cum);
+            h.push_back(a.tok);
+            if (!draft_round(m, d, a.tok, a.r, h, a.rng, a.r.max_new - a.produced, a.spec, out, lgw, err)) {
+                std::printf("ERR %lld %s\n", a.rid, err.c_str());
+                std::fprintf(stderr, "inkling2: %s\n", err.c_str());
+                m.reset();
+                h.clear();
+                a.finish = "cancel";
+                done_line(a);
+                continue;
+            }
+            bool more = true;
+            for (size_t i = 0; i < out.size() && more; ++i) {
+                more = emit(a, out[i]);
+                if (i + 1 < out.size()) {
+                    if (more) h.push_back(out[i]);
+                    else if (!m.keep((int) i + 1, err)) {
+                        std::fprintf(stderr, "inkling2: %s\n", err.c_str());
+                        m.reset();
+                        h.clear();
+                    }
+                }
+            }
+            a.tok = out.back();
+            if (!more) done_line(a);
+            continue;
+        }
+        // two or more: a token of each through the layers at once
+        const int n = (int) run.size();
+        std::vector<int> sq((size_t) n), ids((size_t) n);
+        for (int i = 0; i < n; ++i) {
+            sq[(size_t) i] = run[(size_t) i]->seq;
+            ids[(size_t) i] = run[(size_t) i]->tok;
+            held[(size_t) run[(size_t) i]->seq].push_back(run[(size_t) i]->tok);
+        }
+        rows.resize((size_t) n * V);
+        if (!m.step_multi(sq.data(), ids.data(), n, rows.data(), err)) {
+            std::fprintf(stderr, "inkling2: %s\n", err.c_str());
+            for (Act* a : run) {
+                std::printf("ERR %lld %s\n", a->rid, err.c_str());
+                a->finish = "cancel";
+                done_line(*a);
+            }
+            continue;
+        }
+        for (int i = 0; i < n; ++i) {
+            Act& a = *run[(size_t) i];
+            float* row = rows.data() + (size_t) i * V;
+            for (const auto& [id, b] : a.bias)
+                if (id >= 0 && id < V) row[id] += b;
+            a.tok = sample(row, V, a.r, held[(size_t) a.seq], a.rng);
+            if (!emit(a, a.tok)) done_line(a);
+        }
+    }
+    for (auto& a : acts)
+        if (!a->done) {
+            a->finish = "cancel";
+            done_line(*a);
+        }
+    return 0;
+}
+
 int usage() {
     std::fprintf(stderr,
                  "maya-inkling2 --pack <dir> (--tokens <ids> [--n-predict N] | --parity <reference dir> [--parity <dir> ...])\n"
@@ -692,6 +1065,10 @@ int usage() {
                  "  --parity-force-picks  (parity) each reference a second time, every layer taking the reference's\n"
                  "                      picks (what is left is not the router's near-ties)\n"
                  "  --no-expert-cache   the experts stay where the load put them (no cache moves)\n"
+                 "  --parallel N        (serve) N conversations at once (1 .. 8, maya-ds4's): each its own caches and\n"
+                 "                      drafter state in VRAM; GEN rid=<id>, STOP <rid>\n"
+                 "  --multi-check DIR   (tests, with --parallel N) N conversations of a reference's prompt decoded a token\n"
+                 "                      each alone and through multi steps: each row the same bits, the step times\n"
                  "  --mmap-experts on|off|auto  the CPU lane's experts (maya-ds4's): read in place from the model's files\n"
                  "                      (on), or the most routed that fit copied into RAM and the rest in place (off;\n"
                  "                      auto, the default, the same here: maya-ds4's copies none unless all fit)\n"
@@ -738,7 +1115,7 @@ int main(int argc, char** argv) {
     // the ids that end an answer: 200006, <|content_model_end_sampling|> - the model's end of sequence (the GGUF's
     // tokenizer.ggml.eos_token_id, config.json's eos_token_id), which ends its turn - and 199999, <|endoftext|>
     std::vector<int> stops = {200006, 199999};
-    std::string rewind_test, tokens_file, window_test, prompts_file;
+    std::string rewind_test, tokens_file, window_test, prompts_file, multi_check;
     bool ab = false;
     // (tests) --sweep VAR=v1,v2,..: the drafted decode of each prompt with each value of the INKLING2_* override VAR,
     // --sweep-rounds times (ABBA order); several --sweep: one after the other, each VAR unset after its own
@@ -778,6 +1155,14 @@ int main(int argc, char** argv) {
         else if (a == "--verbose") o.verbose = true;
         else if (a == "--serve") serving = true;
         else if (a == "--no-expert-cache") o.expert_cache = false;
+        else if (a == "--parallel") {   // (maya-ds4's: --serve, 1 .. 8 conversations at once)
+            o.seqs = std::atoi(val().c_str());
+            if (o.seqs < 1 || o.seqs > 8) {
+                std::fprintf(stderr, "--parallel: 1 .. 8 conversations\n");
+                return 2;
+            }
+        }
+        else if (a == "--multi-check") multi_check = val();
         else if (a == "--mmap-experts") {
             const std::string v = val();
             if (v != "on" && v != "off" && v != "auto") {
@@ -822,7 +1207,7 @@ int main(int argc, char** argv) {
         else return usage();
     }
     if (o.pack.empty() || (parities.empty() && tokens.empty() && !serving && rewind_test.empty() && tokens_file.empty() &&
-                           window_test.empty() && prompts_file.empty()))
+                           window_test.empty() && prompts_file.empty() && multi_check.empty()))
         return usage();
     std::string err;
     // (--tokens-file, a corpus' routings - maya-ds4's --profile-run: the pack's profile only read, the run's counts
@@ -856,6 +1241,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     const bool swap_opt = o.expert_cache;
+    if (serving && model.seq_count() > 1)
+        return serve_multi(model, stops, short_n, dspark == "on", drafting && dspark != "idle", dspark_cum,
+                           rest0_list.empty() ? -1 : rest0_list[0]);
     if (serving)
         return serve(model, stops, short_n, dspark == "on", drafting && dspark != "idle", dspark_cum,
                      rest0_list.empty() ? -1 : rest0_list[0]);
@@ -1015,6 +1403,83 @@ int main(int argc, char** argv) {
         }
         std::printf("\n%s\n", bad ? "WINDOW DIFFERENT" : "WINDOW OK");
         return bad ? 3 : 0;
+    }
+    if (!multi_check.empty()) {
+        // --multi-check <reference dir> (with --parallel N): conversation i reads the reference prompt's first
+        // len - 37 i tokens, then K greedy tokens are decoded - first each conversation alone (a token's step), then
+        // all of them through multi steps.  The expert cache off: each multi row's logits must be its own step's bits
+        const int N = model.seq_count(), K = n_predict > 0 ? n_predict : 32, V = model.vocab();
+        Ref rf;
+        if (!rf.load(multi_check, err)) return 1;
+        if (N < 2) {
+            std::fprintf(stderr, "maya-inkling2: --multi-check needs --parallel 2 or more\n");
+            return 2;
+        }
+        model.set_swap(false);
+        std::vector<std::vector<float>> alone((size_t) N * K);
+        std::vector<std::vector<int>> toks_a((size_t) N), toks_m((size_t) N);
+        std::vector<int> first((size_t) N);
+        auto read = [&](int i) {
+            const size_t len = rf.prompt.size() - 37 * (size_t) i;
+            return model.bind(i, err) && (model.reset(), true) && model.forward(rf.prompt.data(), (int) len, 0, nullptr, err);
+        };
+        double t_alone = 0, t_multi = 0;
+        std::vector<float> lw((size_t) V);
+        for (int i = 0; i < N; ++i) {
+            if (!read(i)) break;
+            first[(size_t) i] = model.top();
+            int t = first[(size_t) i];
+            for (int k2 = 0; k2 < K && err.empty(); ++k2) {
+                const double t0 = now_s();
+                if (!model.forward(&t, 1, model.end(), lw.data(), err)) break;
+                t_alone += now_s() - t0;
+                alone[(size_t) i * K + k2] = lw;
+                toks_a[(size_t) i].push_back(t);
+                t = model.top();
+            }
+        }
+        for (int i = 0; i < N && err.empty(); ++i) read(i);
+        std::vector<int> sq((size_t) N), ids = first;
+        for (int i = 0; i < N; ++i) sq[(size_t) i] = i;
+        std::vector<float> rows((size_t) N * V);
+        long bad_rows = 0;
+        double worst = 1.0;
+        for (int k2 = 0; k2 < K && err.empty(); ++k2) {
+            const double t0 = now_s();
+            if (!model.step_multi(sq.data(), ids.data(), N, rows.data(), err)) break;
+            t_multi += now_s() - t0;
+            for (int i = 0; i < N; ++i) {
+                const float* a = alone[(size_t) i * K + k2].data();
+                const float* b = rows.data() + (size_t) i * V;
+                double dot = 0, a2 = 0, b2 = 0;
+                bool same = true;
+                int top = 0;
+                for (int v = 0; v < V; ++v) {
+                    same = same && a[v] == b[v];
+                    dot += (double) a[v] * b[v];
+                    a2 += (double) a[v] * a[v];
+                    b2 += (double) b[v] * b[v];
+                    if (b[v] > b[top]) top = v;
+                }
+                worst = std::min(worst, dot / std::sqrt(a2 * b2));
+                bad_rows += !same;
+                toks_m[(size_t) i].push_back(ids[(size_t) i]);
+                ids[(size_t) i] = top;
+            }
+        }
+        if (!err.empty()) {
+            std::fprintf(stderr, "maya-inkling2: %s\n", err.c_str());
+            return 1;
+        }
+        int same_toks = 0;
+        for (int i = 0; i < N; ++i) same_toks += toks_a[(size_t) i] == toks_m[(size_t) i];
+        std::printf("multi check: %d conversations x %d tokens: %ld of %d rows differ from their own step's bits (worst "
+                    "logits cosine %.7f), %d of %d conversations the same tokens; alone %.1f ms a token (%.1f tok/s), "
+                    "multi %.1f ms a step (%.1f tok/s in all)\n",
+                    N, K, bad_rows, N * K, worst, same_toks, N, 1e3 * t_alone / (N * K), N * K / t_alone,
+                    1e3 * t_multi / K, N * K / t_multi);
+        std::printf("%s\n", bad_rows == 0 ? "MULTI OK" : "MULTI DIFFERENT");
+        return bad_rows == 0 ? 0 : 3;
     }
     if (!rewind_test.empty()) {
         // --rewind-test <reference dir>: its prompt as A; B = A's first part and other tokens after it.  B read after

@@ -15,11 +15,11 @@ A config's settings, as the page shows them (None: the engine's own default, or 
              prefill_chunk, cpu_threads, kv ("auto" | "q8": the latent cache's rows, --kv - 8-bit rows are the setup's
              opt-in faster drafting on a small card, "f16" kept where a config has it); images (the pack's mmproj
              file: --vision off when off); one answer at a time
-  Inkling 2 Small (family "ik2": maya-ik2 on NVIDIA, maya-inkling2 on AMD - text only, one answer at a time): context,
-             gpus, env; draft ("dspark" | "none": maya-inkling2's DSpark drafter, where its index is on this PC -
-             maya-ik2 has none); maya-inkling2's DeepSeek settings: reserve_mib, mmap, prefill_chunk, cpu_threads
-             and dspark_cum (its counterpart of DeepSeek's dspark_conf); maya-ik2's other flags stay as the config
-             has them
+  Inkling 2 Small (family "ik2": maya-ik2 on NVIDIA, maya-inkling2 on AMD - text only): context, gpus, env; draft
+             ("dspark" | "none": maya-inkling2's DSpark drafter, where its index is on this PC - maya-ik2 has none);
+             maya-inkling2's DeepSeek settings: parallel, reserve_mib, mmap, prefill_chunk, cpu_threads and
+             dspark_cum (its counterpart of DeepSeek's dspark_conf); maya-ik2 (one answer at a time): its other
+             flags stay as the config has them
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -78,8 +78,8 @@ QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert
 HY4_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "reserve_gb", "prefill_chunk", "cpu_threads", "kv")
 # (Inkling 2: maya-inkling2's DeepSeek settings beside them - DS4_KEYS' reserve_mib, mmap, prefill_chunk, cpu_threads,
 #  and dspark_cum, its counterpart of dspark_conf; maya-ik2's other flags stay as the config has them)
-IK2_KEYS = ("context", "images", "gpus", "env", "draft", "reserve_mib", "mmap", "prefill_chunk", "cpu_threads",
-            "dspark_cum")
+IK2_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "reserve_mib", "mmap", "prefill_chunk",
+            "cpu_threads", "dspark_cum")
 IK2_AMD_ONLY = ("reserve_mib", "mmap", "prefill_chunk", "cpu_threads", "dspark_cum")   # (maya-ik2 has none of them)
 # Inkling 2 Small's DSpark drafter on AMD (maya-inkling2 --dspark-index): tools/inkling2/convert_dspark.py's Q8_0 index,
 # in the folder the setup downloads Thinking Machines' mtp.safetensors into, beside the model's GGUF folder (maya.py's
@@ -477,7 +477,8 @@ def settings_of(cfg: dict) -> dict:
         if ik2_amd(cfg):                               # (empty: the engine's own default)
             out.update(reserve_mib=_int(flag(args, "--reserve-mib")), prefill_chunk=_int(flag(args, "--prefill-chunk")),
                        cpu_threads=_int(flag(args, "--cpu-threads")), dspark_cum=_float(flag(args, "--dspark-cum")),
-                       mmap=flag(args, "--mmap-experts", "auto"))   # (DeepSeek's: auto, the engine's own)
+                       mmap=flag(args, "--mmap-experts", "auto"),   # (DeepSeek's: auto, the engine's own)
+                       parallel=_int(flag(args, "--parallel"), 1))  # (DeepSeek's: n conversations at once)
             if out["mmap"] not in ("auto", "on", "off"):
                 out["mmap"] = "auto"
         return out
@@ -695,11 +696,15 @@ def apply(cfg: dict, settings: dict) -> dict:
             args = set_flag(args, "--dspark", "on" if s["draft"] == "dspark" else "none")
             args = set_flag(args, "--dspark-index", str(drafter))
         if not ik2_amd(cfg):
-            given = [k for k in IK2_AMD_ONLY if s.get(k) not in (None, "")]
+            given = [k for k in IK2_AMD_ONLY if s.get(k) not in (None, "")] + \
+                (["parallel"] if s.get("parallel") not in (None, "", 1) else [])
             if given:
                 raise ValueError(f"not a setting of maya-ik2: {', '.join(given)}")
         else:
             args = set_flag(args, "--reserve-mib", reserve) if reserve is not None else drop_flag(args, "--reserve-mib")
+            # (maya-inkling2 --parallel, as maya-ds4's: n conversations at once - each its own caches in VRAM)
+            par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
+            args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
             if s.get("mmap") not in ("auto", "on", "off"):   # (DeepSeek's row: auto is the engine's own, not written)
                 raise ValueError("Experts VRAM does not hold: auto, on or off")
             args = drop_flag(args, "--mmap-experts") if s["mmap"] == "auto" else set_flag(args, "--mmap-experts", s["mmap"])

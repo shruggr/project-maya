@@ -509,6 +509,14 @@ class Config(unittest.TestCase):
         self.assertEqual(maya.flag_value(self.write(args(mmap_experts="off"))["args"], "--mmap-experts"), "off")
         self.assertEqual(maya.flag_value(self.write()["args"], "--mmap-experts"), "off")
 
+    def test_parallel_as_deepseeks(self):
+        """--parallel (maya-ds4's flag): given to the setup, written - and a setup again keeps it; not given, not
+        written (one conversation, the engine's default)."""
+        self.assertIsNone(maya.flag_value(self.write()["args"], "--parallel"))
+        self.assertEqual(maya.flag_value(self.write(args(parallel=4))["args"], "--parallel"), "4")
+        self.assertEqual(maya.flag_value(self.write()["args"], "--parallel"), "4")
+        self.assertIn("ik2", maya.PARALLEL_FAMILIES)
+
     def test_the_vram_kept_free(self):
         """--reserve-mib (maya-ds4's flag): what DeepSeek's setup writes on AMD - --vram-reserve-mib, else
         hip_reserve_mib."""
