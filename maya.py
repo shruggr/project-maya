@@ -92,6 +92,7 @@ import calibrate_ds4 as CDS  # noqa: E402  DeepSeek's: the DSpark drafter or non
 import calibrate_mm3_prefill as CPF  # noqa: E402  MiniMax's: how this PC reads prompts fastest (chunk, GEMMs)
 from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa)
 from serve import glm_link as GL  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
+from serve import models as SM  # noqa: E402  the Models page's: maya-inkling2's memory figures (IK2_KV_BYTES ...)
 from strata import maya_sync  # noqa: E402  (tools/strata/) a glm-dsa pack's expert profile and drafting
 
 WIN = S.WIN
@@ -882,7 +883,6 @@ IK2_QUANT = "ud-q2_k_xl"                           # (the files maya-inkling2 ru
 IK2_GGUF_DIR = "Inkling-2-Small-GGUF"
 IK2_MTP_DIR = "Inkling-2-Small-MTP"                # (serve/models.py's IK2_MTP_DIR / IK2_DSPARK: the page finds it there)
 IK2_DSPARK = "maya-inkling2-dspark-q8_0"           # (the drafter's index the engine loads: the Q8_0 copy's)
-IK2_DSPARK_GGUF = "Inkling-2-Small-DSpark-Q8_0.gguf"
 IK2_CONFIG = "maya-inkling2-hip.json"
 IK2_MODEL_NAME = "inkling-2-small"
 # the contexts offered: DeepSeek's (DS4_CONTEXTS: from 32K), up to the model's trained 1M (the pack's inkling2.txt
@@ -891,21 +891,21 @@ IK2_MODEL_NAME = "inkling-2-small"
 IK2_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]
 IK2_DEFAULT_CONTEXT = 65536                         # (DS4_DEFAULT_CONTEXT)
 IK2_RECOMMENDED_CONTEXT = 262144                    # (DS4_RECOMMENDED_CONTEXT)
-# its cache a context token: the 8 global layers keep every position, K and V of 8 heads x 128 in F16 (the 40
-# sliding-window layers keep 1024 positions whatever the context), in VRAM - the experts give it up to RAM
-IK2_KV_BYTES = 8 * 2 * 8 * 128 * 2
-IK2_DSPARK_KV_BYTES = 2 * 8 * 128 * 2 + 8 * 48 * (4 + 2)   # (... and the drafter's, on the last GPU: Dspark::ctx_bytes)
+# its VRAM a context position, from the engine's allocations - the Models page's figures (serve/models.py says where
+# each comes from): the global layers' caches (all the GPUs together), the attention's scratch (each GPU) and the
+# drafter's (the last GPU, while it drafts); the experts give it up to RAM
+IK2_KV_BYTES, IK2_ATTN_BYTES, IK2_DSPARK_KV_BYTES = SM.IK2_KV_BYTES, SM.IK2_ATTN_BYTES, SM.IK2_DSPARK_KV_BYTES
 # VRAM + RAM that hold the whole model, the context aside (as DS4_MEMORY_GB: GiB, the unit of mem_gb and the GPUs'
 # vram_gb), tools/inkling2/download.json's "memory_gb": ceil(files + margin + drafter) = ceil(190.9 + 8 + 2.9) = 202 -
 #   files    204,969,055,296 bytes = 190.9 GiB, the six shards' sizes in download.json: every tensor, each once (in VRAM,
 #            or the experts VRAM does not hold copied into RAM - the engine never reads them from the SSD);
 #   margin   8 GiB, IK2_RAM_MARGIN_GIB: the RAM the engine leaves the rest beyond its RAM experts (it stops at its
 #            start when the RAM cannot hold both);
-#   drafter  3.09 GB = 2.9 GiB of the last GPU at a 32K context, measured (docs/INKLING2_DSPARK.md, "In the engine"): the
-#            calibration may turn drafting on, so it is counted (its experts then go to RAM)
+#   drafter  IK2_DSPARK_GB, 3.09 GB = 2.9 GiB of the last GPU at a 32K context, measured (docs/INKLING2_DSPARK.md, "In
+#            the engine"): the calibration may turn drafting on, so it is counted (its experts then go to RAM)
 IK2_MEMORY_GB = 202
 IK2_RAM_MARGIN_GIB = 8                              # (the engine's ram_margin(), maya-ds4's: INKLING2_RAM_MARGIN_GB)
-IK2_DSPARK_GB = 3.4
+IK2_DSPARK_GB = SM.IK2_DSPARK_GB                    # (the engine's Options::dspark_reserve_gb)
 # its expert profile (uint32 [48][384] routings, the most routed in VRAM at the load): the pack's expert-profile.bin
 # (maya-ds4's name), copied from here where the pack has none - the engine reads it by itself and writes back to it
 IK2_PROFILE = ROOT / "data" / "expert-profile-inkling2.bin"
@@ -10054,13 +10054,14 @@ def ik2_memory_gb() -> float:
     return ik2_entry()["memory_gb"]
 
 
-def ik2_kv_gb(ctx: int, drafting: bool = False) -> float:
-    """Its cache for a context of `ctx` tokens, in GB of VRAM on all the GPUs together (each holds its layers'), with
-    the drafter's own (its global layer's rows) when it drafts."""
-    return ctx * (IK2_KV_BYTES + (IK2_DSPARK_KV_BYTES if drafting else 0)) / 2**30
+def ik2_kv_gb(ctx: int, gpus: int = 1, drafting: bool = False) -> float:
+    """What a context of `ctx` tokens costs in VRAM, GB on all the GPUs together: the global layers' caches (each GPU
+    holds its layers'), the attention's scratch on each of the `gpus` GPUs, and the drafter's own when it drafts - the
+    Models page's figures (serve/models.py)."""
+    return ctx * (IK2_KV_BYTES + max(1, gpus) * IK2_ATTN_BYTES + (IK2_DSPARK_KV_BYTES if drafting else 0)) / 2**30
 
 
-def ik2_recommended_context(vram: float, ram: float, need: float, drafting: bool = False) -> int:
+def ik2_recommended_context(vram: float, ram: float, need: float, gpus: int = 1, drafting: bool = False) -> int:
     """The context the setup recommends on this PC, as DeepSeek's (ds4_recommended_context): the largest of
     IK2_CONTEXTS from IK2_DEFAULT_CONTEXT (64K) up to IK2_RECOMMENDED_CONTEXT (256K) whose cache fits in what VRAM +
     RAM hold beyond the model (need: ik2_memory_gb) - its cache sits in VRAM, the experts it displaces go to RAM.  Else
@@ -10069,7 +10070,8 @@ def ik2_recommended_context(vram: float, ram: float, need: float, drafting: bool
     if ram <= 0:
         return IK2_DEFAULT_CONTEXT
     spare = vram + ram - need
-    fits = [c for c in IK2_CONTEXTS if IK2_DEFAULT_CONTEXT <= c <= IK2_RECOMMENDED_CONTEXT and ik2_kv_gb(c, drafting) <= spare]
+    fits = [c for c in IK2_CONTEXTS if IK2_DEFAULT_CONTEXT <= c <= IK2_RECOMMENDED_CONTEXT and
+            ik2_kv_gb(c, gpus, drafting) <= spare]
     return max(fits) if fits else IK2_DEFAULT_CONTEXT
 
 
@@ -10325,11 +10327,12 @@ def set_up_ik2(a, prev: dict) -> Path | None:
            "VRAM does not hold in RAM")
     step(2, "your choices")                            # 2
     ok(f"files: {name} (unsloth's GGUF; on this engine the one set of files)")
-    rec = ik2_recommended_context(vram, total, need, True)   # (the drafter's cache counted: the calibration may draft)
+    n = len(pc["gpus"])
+    rec = ik2_recommended_context(vram, total, need, n, True)   # (the drafter's cache counted: the calibration may draft)
     ctx = choose_context(a, prev_ctx, IK2_CONTEXTS, rec)
     ok(f"context: {ctx} tokens" + (" (recommended for this PC's memory)" if ctx == rec else "") +
-       f"; its cache: {ik2_kv_gb(ctx, True):.1f} GB of VRAM across the GPUs, whose experts then live in RAM")
-    if ctx > rec and total > 0 and ik2_kv_gb(ctx, True) > vram + total - need:
+       f"; its cache: {ik2_kv_gb(ctx, n, True):.1f} GB of VRAM across the GPUs, whose experts then live in RAM")
+    if ctx > rec and total > 0 and ik2_kv_gb(ctx, n, True) > vram + total - need:
         warn(f"a {context_label(ctx)} context's cache leaves too little of this PC's memory for the model's experts: "
              f"{context_label(rec)} fits (the engine may stop at its start)")
     models = ik2_models_dir(a, prev)

@@ -84,6 +84,23 @@ IK2_AMD_ONLY = ("reserve_mib", "prefill_chunk", "cpu_threads", "dspark_cum")   #
 # IK2_MTP_DIR / IK2_DSPARK)
 IK2_MTP_DIR = "Inkling-2-Small-MTP"
 IK2_DSPARK = "maya-inkling2-dspark-q8_0"
+# maya-inkling2's VRAM a context position, from its allocations (src/inkling2/inkling2_model.cu) - the setup's
+# (maya.py's ik2_kv_gb) and the Models page's Context size line (models.js' ik2Fields) both count these:
+#   IK2_KV_BYTES       all the GPUs together: the 8 global layers' K and V rows, 8 kv heads x 128 in F16 (dense_bytes'
+#                      cache_rows = max_ctx for a global layer) - the 40 sliding-window layers' rings are 5632 rows
+#                      whatever the context (n_swa 1024 + --rewind 4096 + the 512-token prompt chunk);
+#   IK2_ATTN_BYTES     each GPU: the decode step's attention scratch, S_need's attention_split_floats - n_head (48) x
+#                      (head_dim + 2) floats a 16-key tile (inkling2_kernels.cu), 48 x 130 x 4 / 16 bytes a position
+#                      once it outgrows its floor, the window's 9 rows over 4,096 keys (58 MB, past 37,152 positions);
+#                      the prompt path's scores add 48 x 6 bytes a position only past 961K (S_n's floor), left out;
+#   IK2_DSPARK_KV_BYTES  the drafter's, on the last GPU while it drafts: Dspark::ctx_bytes (its one global layer's K
+#                      and V rows, F16, and its GEMM attention's scores, F32 + F16 for 8 block rows x 48 heads)
+IK2_KV_BYTES = 8 * 2 * 8 * 128 * 2
+IK2_ATTN_BYTES = 48 * (128 + 2) * 4 // 16
+IK2_DSPARK_KV_BYTES = 2 * 8 * 128 * 2 + 8 * 48 * (4 + 2)
+# the drafter's VRAM on the last GPU at a context of 32768, GB: the engine's Options::dspark_reserve_gb - the drafter
+# reports 3.09 GB there (docs/INKLING2_DSPARK.md, "In the engine"); the setup and the page say this one figure
+IK2_DSPARK_GB = 3.09
 HY4_KV_BYTES = 13 * (2 * (512 + 64) + 128 * 4 // 4)   # (maya.py's: its cache a context token, on each GPU of a group)
 HY4_Q4_CONTEXTS = [32768, 65536, 131072, 262144]   # AngelSlim's Q4_K_M: the setup's choices for it (maya.py's HY4_Q4_CONTEXTS)
 # (... and its longer ones, up to the model's 1M, where the cache in the engine's smaller rows is at most this share of
@@ -963,6 +980,11 @@ def describe(path: Path, running: str | None) -> dict:
     # GLM-5.3 (744B): its name on screen beside the quant, and its cache's bytes a context token for the Context size's
     # line (the page's GLM_KV_BYTES is GLM-5.3-Flash's) - keys only its configs have
     own = {"shown": G53.LABEL, "kv_bytes": glm53_kv_bytes(cfg)} if G53.config_is_glm_dsa(cfg) else {}
+    if family(cfg) == "ik2" and ik2_amd(cfg):
+        # (maya-inkling2: its VRAM a context position - all the GPUs' caches, each GPU's attention scratch, the
+        #  drafter's while it drafts - and the drafter's own VRAM, for the Context size line and the Drafting hint)
+        own = {"kv_bytes": IK2_KV_BYTES, "kv_gpu_bytes": IK2_ATTN_BYTES, "dspark_kv_bytes": IK2_DSPARK_KV_BYTES,
+               "dspark_gb": IK2_DSPARK_GB}
     if family(cfg) == "hy4":
         # (never said on the page: from which context the engine keeps its cache in the smaller rows - the Context
         #  size's GB figure counts them; and whether a context above the largest offered needs more VRAM - one line)

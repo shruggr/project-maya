@@ -991,6 +991,26 @@ struct Dspark::Impl {
                 CK(cudaStreamSynchronize(s));
             }
         }
+        {   // the tiled attention past kMaxTiles tiles takes larger tiles (draft()'s TK doubles: the same sums, slower);
+            // its shared memory caps them - with the GEMM form (the default: from attn_gemm_min keys on, sized from
+            // max_ctx) it sees fewer keys than that, without it a context past what the largest tile covers is refused
+            // here, not left to a launch that cannot run
+            const int64_t keys = blas != nullptr ? std::min<int64_t>(o.max_ctx + B, std::max(0, o.attn_gemm_min - 1))
+                                                 : o.max_ctx + B;
+            int TK = tile;
+            while ((keys + TK - 1) / TK > max_tiles) TK *= 2;
+            const size_t shm = ((size_t) TK * D + (size_t) B * (H / Hkv) * TK + (size_t) B * (H / Hkv)) * sizeof(float);
+            cudaDeviceProp prop{};
+            CK(cudaGetDeviceProperties(&prop, dev));
+            const size_t lim = prop.sharedMemPerBlock;
+            if (shm > lim) {
+                err = "dspark: " + std::to_string(keys) + " keys need tiles of " + std::to_string(TK) + " (" +
+                      std::to_string(shm >> 10) + " KB of shared memory, " + std::to_string(lim >> 10) +
+                      " KB on GPU " + std::to_string(dev) + "): the GEMM form of the attention (attn_gemm_min >= 0) "
+                      "takes a context this long";
+                return false;
+            }
+        }
         FR = (int) std::min<int64_t>(o.max_ctx, (int64_t) std::max(0, o.rewind) + 2 * kFeed);
         if (!alloc(fring, (size_t) FR * E, err)) return false;
 

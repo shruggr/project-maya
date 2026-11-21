@@ -139,6 +139,21 @@ class Settings(unittest.TestCase):
         with self.assertRaises(ValueError):
             models.apply(cuda, {"reserve_mib": 3072})
 
+    def test_the_pages_figures(self):
+        """maya-inkling2's entry carries its VRAM a position and the drafter's - the setup's figures (maya.py takes
+        them from here); maya-ik2's carries none."""
+        cfg = amd(self.pack, "--dspark-index", str(self.index))
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / "maya-inkling2-hip.json"
+            path.write_text(json.dumps(cfg), encoding="utf-8")
+            e = models.describe(path, None)
+            path.write_text(json.dumps(CUDA), encoding="utf-8")
+            c = models.describe(path, None)
+        self.assertEqual((e["kv_bytes"], e["kv_gpu_bytes"], e["dspark_kv_bytes"], e["dspark_gb"]),
+                         (models.IK2_KV_BYTES, models.IK2_ATTN_BYTES, models.IK2_DSPARK_KV_BYTES, models.IK2_DSPARK_GB))
+        self.assertEqual(e["context_range"]["tested"], 131072)            # (CONTEXT_TESTED["inkling2"])
+        self.assertNotIn("kv_bytes", c)
+
     def test_contexts_and_tested(self):
         """DeepSeek's contexts (from 32K); maya-inkling2's end-to-end runs reach 128K so far (CONTEXT_TESTED)."""
         self.assertEqual(models.IK2_CONTEXTS, models.DS4_CONTEXTS)
@@ -181,9 +196,10 @@ const s = {context: 262144, gpus: [0, 1, 2, 3], env: {}, images: false, draft: "
            prefill_chunk: null, cpu_threads: null, dspark_cum: null};
 const base = {file: "maya-inkling2-hip.json", running: false, backend: "hip", family: "ik2", model: "inkling-2-small",
               quant: "UD-Q2_K_XL", settings: s, context_range: {min: 4096, max: 1048576, tested: 262144}};
+const own = {kv_bytes: 32768, kv_gpu_bytes: 1560, dspark_kv_bytes: 6400, dspark_gb: 3.09};   // (models.py's entry)
 const cases = {
-  amd: {...base, choices: {draft: ["dspark", "none"], images: false, text_only: true, drafting: true}},
-  amd_none: {...base, settings: {...s, draft: "none"}, choices: {draft: ["none"], images: false, text_only: true, drafting: true}},
+  amd: {...base, ...own, choices: {draft: ["dspark", "none"], images: false, text_only: true, drafting: true}},
+  amd_none: {...base, ...own, settings: {...s, draft: "none"}, choices: {draft: ["none"], images: false, text_only: true, drafting: true}},
   cuda: {...base, backend: "cuda", settings: {...s, draft: "none"}, choices: {draft: ["none"], images: false, text_only: true, drafting: false}},
 };
 M.MS.data = {gpus: [0, 1, 2, 3].map((i) => ({index: i, name: "GPU", vram_gb: 32}))};
@@ -219,6 +235,13 @@ class PageJs(unittest.TestCase):
                             ("CPU threads", "--cpu-threads"), ("Draft confidence", "--dspark-cum")):
             self.assertEqual(f[label]["flag"], flag)
         self.assertIn("running product", f["Draft confidence"]["hint"])
+        self.assertIn("About 3.09 GB", f["Drafting"]["hint"])             # (models.py's IK2_DSPARK_GB, the engine's)
+        # (the Context size line: the caches, the 4 GPUs' attention scratch and the drafter's rows - the setup's figure)
+        gb = 262144 * (32768 + 4 * 1560 + 6400) / 2**30
+        self.assertIn(f"≈ {gb:.1f} GB of GPU memory", f["Context size"]["below"]["p"]["hint"])
+        n = rows_of(self.got["amd_none"])
+        gb = 262144 * (32768 + 4 * 1560) / 2**30                          # (not drafting: not the drafter's)
+        self.assertIn(f"≈ {gb:.1f} GB of GPU memory", n["Context size"]["below"]["p"]["hint"])
         self.assertEqual(f["Drafting"]["flag"], "--dspark")
         self.assertIn("DSpark", f["Drafting"]["hint"])
         self.assertIn('"dspark"', json.dumps(f["Drafting"]))
@@ -228,7 +251,9 @@ class PageJs(unittest.TestCase):
         self.assertNotIn('"dspark"', json.dumps(n["Drafting"]))           # (Off alone)
 
     def test_cuda_has_none(self):
-        self.assertEqual(list(rows_of(self.got["cuda"])), ["Context size", "Images", "Answers at once", "GPUs"])
+        f = rows_of(self.got["cuda"])
+        self.assertEqual(list(f), ["Context size", "Images", "Answers at once", "GPUs"])
+        self.assertIn("≈ 8.0 GB of GPU memory", f["Context size"]["below"]["p"]["hint"])   # (the global layers' rows)
 
 
 if __name__ == "__main__":

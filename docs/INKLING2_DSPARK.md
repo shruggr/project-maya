@@ -461,8 +461,9 @@ tokens of ours, which is why the fold and a device-side head loop matter. Inject
 
 `maya-inkling2` drafts by default (`--dspark on|off|none`, maya-ds4's, and `idle` for tests; `--dspark-index DIR`, `--dspark-cum F`; a request's
 `spec=0|1` and `dspark_cum=F` keys). The module loads on the last GPU with the engine's own output matrix
-(`DsparkOptions::output_dev`); the engine keeps 3.4 GB of that GPU for it (`Options::dspark_reserve_gb`: the drafter
-reports 3.09 GB at a 32k context), so about 250 of its experts go to RAM.
+(`DsparkOptions::output_dev`); the engine keeps 3.09 GB of that GPU for it (`Options::dspark_reserve_gb`: what the
+drafter reports at a 32k context - the setup's and the Models page's figure too, serve/models.py's `IK2_DSPARK_GB`),
+so about 250 of its experts go to RAM.
 
 **Taps.** Every row of every step leaves its 8 taps on the last GPU as F32 [rows][8][4608]: a layer whose output is
 a tap (4, 10, ..., 40) publishes its rows to host memory the last GPU maps (the last GPU's own tap layer: a copy), the

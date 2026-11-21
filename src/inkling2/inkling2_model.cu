@@ -425,10 +425,15 @@ struct Model::Impl {
         const size_t fl = T * ((1 + n_states() + 3 + 3 + 2 + 1 + 2) * E + 5 * HD + (size_t) g.n_head * (g.d_rel + 1) +
                                4 * (size_t) g.n_head_kv * g.head_dim + 64 + (size_t) g.n_expert + 4 * nu + 2 * nu * E +
                                4 * k::kMaxStates);
-        return fl * 4 + T * HD * 2 + HD * E * 2 + T * nu * (size_t) g.n_ff_exp * 2 + kS_n * 6 +
+        return fl * 4 + T * HD * 2 + HD * E * 2 + T * nu * (size_t) g.n_ff_exp * 2 + S_n() * 6 +
                (size_t) kTsMax * g.n_head * g.rel_extent * 4 + 2 * (size_t) kStage * blob_max + ((size_t) 32 << 20);
     }
-    static constexpr size_t kS_n = (size_t) 44 << 20;   // the attention's scores: floats
+    // the attention's scores (F32, and their F16 copy beside): floats.  A pass of ts tokens over nk keys takes
+    // n_head x ts x nk of them (attention_rows halves ts until it fits), so they must hold one token over every key
+    // the context has, n_head x max_keys (48 x 1M = 50.3M at the model's 1M) - 44 Mi floats alone stop a prompt at
+    // about 961K keys; kS_n, the floor, is a 512-token pass over 1,877 keys
+    static constexpr size_t kS_n = (size_t) 44 << 20;
+    size_t S_n() const { return std::max(kS_n, (size_t) g.n_head * max_keys); }
     static constexpr int kTsMax = 512;                  // ... and its tokens a pass at most
     bool chunk_scratch(Gpu& gp, std::string& err) {
         if (Tc <= 0) return true;
@@ -436,7 +441,7 @@ struct Model::Impl {
         const size_t T = (size_t) Tc, E = (size_t) g.n_embd, HD = (size_t) g.n_head * g.head_dim, nu = (size_t) g.n_used;
         const size_t kvd = (size_t) g.n_head_kv * g.head_dim, H = (size_t) g.n_head;
         gp.wband_n = HD * E;
-        gp.S_n = kS_n;
+        gp.S_n = S_n();
         gp.ts_max = kTsMax;
         if (cublasCreate(&gp.blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(gp.blas, gp.s) != CUBLAS_STATUS_SUCCESS) {
             err = "GPU " + std::to_string(gp.dev) + ": the BLAS did not start";

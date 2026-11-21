@@ -29,6 +29,7 @@ import maya_quants as Q  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 TABLE = json.loads((ROOT / "tools" / "inkling2" / "download.json").read_text(encoding="utf-8"))   # (as committed)
 AMD = [{"index": i, "name": "Radeon AI PRO R9700", "arch": "gfx1201", "vram_gb": 32.0} for i in range(4)]
+DSPARK_GGUF = "Inkling-2-Small-DSpark-Q8_0.gguf"                    # (tools/inkling2/convert_dspark.py's Q8_0 copy)
 
 
 def args(**kw):
@@ -91,8 +92,8 @@ class Layout:
         ix = self.mtp / maya.IK2_DSPARK
         ix.mkdir(exist_ok=True)
         (ix / "dspark.txt").write_text("format maya-inkling2-dspark 1\nmodel_dir ..\n", encoding="utf-8")
-        (ix / "tensors.txt").write_text(f"file 0 {maya.IK2_DSPARK_GGUF}\nt x F32 0 0 4 1\n", encoding="utf-8")
-        (self.mtp / maya.IK2_DSPARK_GGUF).write_bytes(b"GGUF")
+        (ix / "tensors.txt").write_text(f"file 0 {DSPARK_GGUF}\nt x F32 0 0 4 1\n", encoding="utf-8")
+        (self.mtp / DSPARK_GGUF).write_bytes(b"GGUF")
         return ix
 
     def files(self) -> set:
@@ -135,6 +136,42 @@ class Manifest(unittest.TestCase):
                          f"https://huggingface.co/thinkingmachines/Inkling-2-Small/resolve/{m['revision']}/mtp.safetensors")
         for n in m["files"]:
             self.assertRegex(m["sha256"][n], r"^[0-9a-f]{64}$")
+
+
+class PackKeys(unittest.TestCase):
+    """The keys the model's files always give are required, as the pack's other ones: no fallback (pack_gguf.py's
+    expert_weights_scale and final_logit_softcapping, the engine's inkling2.txt reader's five)."""
+
+    KV = {"inkling2." + k: v for k, v in {
+        "block_count": 2, "attention.sliding_window_pattern": [1, 0], "attention.log_scale_floor": 128000,
+        "embedding_length": 4608, "vocab_size": 201024, "vocab_size_unpadded": 200058, "context_length": 1048576,
+        "attention.head_count": 48, "attention.head_count_kv": 8, "attention.key_length": 128,
+        "attention.value_length": 128, "attention.layer_norm_rms_epsilon": 1e-6, "expert_count": 384,
+        "expert_used_count": 8, "expert_feed_forward_length": 2304, "expert_weights_scale": 8.0,
+        "final_logit_softcapping": 30.0, "attention.sliding_window": 1024, "attention.relative_length": 16,
+        "attention.relative_extent": 1024, "shortconv.l_cache": 4, "attention.log_scale_alpha": 0.1,
+        "attention.qk_clip": 22.6, "attention.relative_clip": 8.0, "attn_res.block_size": 6,
+        "activation.situ_beta": 4.0, "activation.situ_linear_beta": 25.0}.items()}
+    KV.update({"tokenizer.ggml.bos_token_id": 200006, "tokenizer.ggml.eos_token_id": 200006})
+
+    def test_required(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ik2_pack_gguf", ROOT / "tools" / "inkling2" / "pack_gguf.py")
+        pg = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pg)
+        geo = pg.geometry(dict(self.KV), None)
+        self.assertEqual((geo["expert_weights_scale"], geo["final_logit_softcapping"], geo["log_scaling_n_floor"]),
+                         (8.0, 30.0, 8192))
+        for key in ("expert_weights_scale", "final_logit_softcapping"):
+            kv = {k: v for k, v in self.KV.items() if k != "inkling2." + key}
+            with self.subTest(key=key), self.assertRaises(SystemExit) as e:
+                pg.geometry(kv, None)
+            self.assertIn(key, str(e.exception))
+        hpp = (ROOT / "src" / "inkling2" / "inkling2_pack.hpp").read_text(encoding="utf-8")
+        self.assertIn('{"expert_weights_scale", "final_logit_softcapping", "log_scaling_n_floor", "bos", "eos"}', hpp)
+        for fallback in ('num("expert_weights_scale", 1.0)', 'num("final_logit_softcapping", 0.0)',
+                         'num("log_scaling_n_floor", 1)', 'num("bos", -1)', 'num("eos", -1)'):
+            self.assertNotIn(fallback, hpp)
 
 
 class Names(unittest.TestCase):
@@ -192,17 +229,46 @@ class Context(unittest.TestCase):
         self.assertEqual(maya.IK2_CONTEXTS, maya.DS4_CONTEXTS)          # (DeepSeek's: from 32K)
         self.assertEqual(maya.IK2_CONTEXTS[-1], 1048576)                # (inkling2.txt's context_length)
         self.assertEqual(maya.IK2_KV_BYTES, 32768)                      # (8 global layers x K, V x 8 heads x 128 x F16)
-        self.assertAlmostEqual(maya.ik2_kv_gb(262144), 8.0)
+        self.assertAlmostEqual(maya.ik2_kv_gb(262144, 0), 8.0 + 262144 * 1560 / 2**30)   # (one GPU at least)
+        self.assertAlmostEqual(maya.ik2_kv_gb(262144, 4, True), 262144 * (32768 + 4 * 1560 + 6400) / 2**30)
+
+    def test_the_bytes_from_the_engines_allocations(self):
+        """A position's VRAM as the engine allocates it - the Models page's figures (serve/models.py), the setup's
+        too: the global layers' K / V rows (dense_bytes' cache_rows), each GPU's attention scratch (S_need's
+        attention_split_floats: n_head x (head_dim + 2) floats a 16-key tile) and the drafter's (Dspark::ctx_bytes)."""
+        from serve import models
+        src = ROOT / "src" / "inkling2"
+        model = (src / "inkling2_model.cu").read_text(encoding="utf-8")
+        kern = (src / "inkling2_kernels.cu").read_text(encoding="utf-8")
+        self.assertIn("? (size_t) (g.n_swa + o.rewind + Tc) : (size_t) o.max_ctx;", model)   # (a global layer: max_ctx)
+        self.assertIn("cache_rows(il) * kvd * 2 * 2", model)            # (K and V, F16)
+        self.assertIn("k::attention_split_floats(g.n_head, g.head_dim, (int64_t) max_keys)", model)
+        self.assertIn("(nk + 15) / 16);\n    return (size_t) H * (size_t) tiles * (size_t) (D + 2);", kern)
+        self.assertEqual(models.IK2_ATTN_BYTES, 1560)
+        self.assertEqual(models.IK2_DSPARK_KV_BYTES, 6400)
+        self.assertIn("return 2 * 8 * 128 * 2 + (size_t) kBlock * 48 * (4 + 2);",
+                      (src / "inkling2_dspark.hpp").read_text(encoding="utf-8"))
+        self.assertEqual((maya.IK2_KV_BYTES, maya.IK2_ATTN_BYTES, maya.IK2_DSPARK_KV_BYTES),
+                         (models.IK2_KV_BYTES, models.IK2_ATTN_BYTES, models.IK2_DSPARK_KV_BYTES))
+
+    def test_the_drafters_vram_one_figure(self):
+        """The engine's reserve, the setup's and the page's figure: one, the measured 3.09 GB."""
+        from serve import models
+        hpp = (ROOT / "src" / "inkling2" / "inkling2_model.hpp").read_text(encoding="utf-8")
+        self.assertEqual(float(re.search(r"double dspark_reserve_gb = ([0-9.]+);", hpp).group(1)), models.IK2_DSPARK_GB)
+        self.assertEqual(maya.IK2_DSPARK_GB, models.IK2_DSPARK_GB)
+        self.assertEqual(models.IK2_DSPARK_GB, 3.09)
 
     def test_recommended_by_this_pcs_memory(self):
         """As DeepSeek's (ds4_recommended_context): the largest context from 64K up to 256K whose cache fits in VRAM +
         RAM beyond the model, else 64K - by the PC's memory alone, nothing of one PC's."""
-        rec = lambda vram, ram: maya.ik2_recommended_context(vram, ram, maya.ik2_memory_gb(), True)   # noqa: E731
+        rec = lambda vram, ram: maya.ik2_recommended_context(   # noqa: E731
+            vram, ram, maya.ik2_memory_gb(), round(vram / 32), True)
         need = maya.ik2_memory_gb()
         for vram, ram, want in ((128, 125, 262144),                     # (51 GB beyond the model: 256K, the most)
-                                (128, need - 128 + maya.ik2_kv_gb(262144, True), 262144),   # (256K's cache, just)
-                                (128, need - 128 + maya.ik2_kv_gb(131072, True), 131072),
-                                (96, need - 96 + maya.ik2_kv_gb(65536, True), 65536),
+                                (128, need - 128 + maya.ik2_kv_gb(262144, 4, True), 262144),   # (256K's cache, just)
+                                (128, need - 128 + maya.ik2_kv_gb(131072, 4, True), 131072),
+                                (96, need - 96 + maya.ik2_kv_gb(65536, 3, True), 65536),
                                 (128, need - 128, maya.IK2_DEFAULT_CONTEXT),   # (nothing beyond it: the default)
                                 (128, 0, maya.IK2_DEFAULT_CONTEXT)):    # (the RAM not read)
             with self.subTest(vram=vram, ram=ram):
@@ -305,7 +371,7 @@ class Files(unittest.TestCase):
 
     def test_a_half_index_is_not_one(self):
         lay = self.lay()
-        (lay.mtp / maya.IK2_DSPARK_GGUF).unlink()                       # (the copy it names is gone)
+        (lay.mtp / DSPARK_GGUF).unlink()                       # (the copy it names is gone)
         self.assertIsNone(maya.ik2_drafter_index(lay.mtp))
 
     def test_a_pack_built_by_hand_is_used_as_it_is(self):

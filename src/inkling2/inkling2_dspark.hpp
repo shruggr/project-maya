@@ -29,7 +29,7 @@ struct DsparkOptions {
     std::string joint_index;   // (optional) another index of the same drafter to take joint_proj.weight from (the
                                // BF16 one: Q8_0 rounds its small weights coarsely); empty: the index's own
     int gpu = 0;               // the device (the engine's: the GPU that holds the target's head)
-    int64_t max_ctx = 16384;   // positions the global layer's cache holds
+    int64_t max_ctx = 32768;   // positions the global layer's cache holds (the engine's Options::max_ctx, its default)
     int rewind = 4096;         // rows the sliding-window rings and the context ring keep beyond the window
     float cum_min = 0.5f;      // draft() keeps a draft while the product of the drafts' top probabilities so far is
                                // at least this (0: every draft)

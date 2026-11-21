@@ -43,8 +43,10 @@ struct Options {
     std::string dspark_index;     // the drafter's index folder (inkling2_dspark.hpp; empty: no drafter): loaded on the
                                   // last GPU, fed every position's taps by the steps and the prompt path
     float dspark_cum = 0.5f;      // its cut on the running product of the drafts' probabilities (Model::set_draft_cum)
-    double dspark_reserve_gb = 3.4;   // VRAM the last GPU keeps for it beyond reserve_mib (fewer experts there), at a
-                                      // context of 32768: a longer one adds the drafter's rows a position
+    // VRAM the last GPU keeps for it beyond reserve_mib (fewer experts there), at a context of 32768 - what the drafter
+    // reports there, measured (docs/INKLING2_DSPARK.md); a longer one adds Dspark::ctx_bytes a position.  serve/
+    // models.py's IK2_DSPARK_GB is the same figure (the setup's and the Models page's)
+    double dspark_reserve_gb = 3.09;
     bool expert_cache = true;     // experts move between VRAM and the CPU lane as they are used (maya-ds4's)
     bool verbose = false;
 };

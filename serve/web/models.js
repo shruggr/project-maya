@@ -601,16 +601,20 @@ function hy4Fields(m, d, s, ch, images, gpus) {
 }
 
 // Inkling 2 Small's (family "ik2": maya-ik2 on NVIDIA, maya-inkling2 on AMD - text only, one answer at a time; either
-// engine's other flags stay as the config has them).  Its cache's VRAM a context token: the 8 global layers keep every
-// position, K and V of 8 heads x 128 in F16 (the 40 sliding-window layers keep 1024 positions whatever the context).
-// Drafting: maya-inkling2's DSpark drafter (choices.drafting: the engine has the switch; maya-ik2 has no drafter)
+// engine's other flags stay as the config has them).  Its VRAM a context position: maya-inkling2's figures from the
+// server (serve/models.py, the setup's too: m.kv_bytes for all the GPUs' caches, m.kv_gpu_bytes on each GPU, the
+// drafter's m.dspark_kv_bytes while it drafts); maya-ik2's the 8 global layers' K and V rows alone (8 heads x 128 in
+// F16 - the sliding-window layers' rings do not grow with the context).  Drafting: maya-inkling2's DSpark drafter
+// (choices.drafting: the engine has the switch; maya-ik2 has no drafter), m.dspark_gb of the last GPU's VRAM
 const IK2_KV_BYTES = 32768;
 function ik2Fields(m, d, ch, gpus, reserve) {
   const dspark = m.choices.draft.includes("dspark"), amd = m.choices.drafting;
+  const kvb = (m.kv_bytes || IK2_KV_BYTES) + (m.kv_gpu_bytes || 0) * Math.max(1, d.gpus.length) +
+    (d.draft === "dspark" ? m.dspark_kv_bytes || 0 : 0);
   return [
-    {label: "Model", rows: [contextRow(m, d, ch, {vram: IK2_KV_BYTES}),
+    {label: "Model", rows: [contextRow(m, d, ch, {vram: kvb}, ["gpus", "draft"]),
       m.choices.drafting ? html`<${Row} label="Drafting" flag="--dspark" changed=${ch("draft")}
-        hint=${dspark ? "DSpark, the model's own drafter, drafts a few tokens at a time for the model to check: the same answers, faster on prose and code. About 3 GB of the last GPU's VRAM."
+        hint=${dspark ? `DSpark, the model's own drafter, drafts a few tokens at a time for the model to check: the same answers, faster on prose and code.${m.dspark_gb ? ` About ${m.dspark_gb} GB of the last GPU's VRAM.` : ""}`
           : "No DSpark drafter for this model on this PC: the setup downloads Thinking Machines' drafter and converts it."}>
         <${Seg} label="Drafting" value=${d.draft} options=${[...(dspark ? [{id: "dspark", label: "DSpark"}] : []), {id: "none", label: "Off"}]}
           onChange=${(v) => setDraft({draft: v})}/><//>` : null,

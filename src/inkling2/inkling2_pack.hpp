@@ -32,12 +32,12 @@ struct Geo {
     int n_head = 0, n_head_kv = 0, head_dim = 0;
     float eps = 1e-6f;
     int n_expert = 0, n_used = 0, n_ff_exp = 0;
-    float w_scale = 1.0f, softcap = 0.0f;
+    float w_scale = 0.0f, softcap = 0.0f;
     int n_swa = 0, d_rel = 0, rel_extent = 0, conv = 4, res_block = 6;
     std::vector<int> swa;
-    double log_floor = 1.0;
+    double log_floor = 0.0;
     float log_alpha = 0.0f, qk_clip = 0.0f, rel_clip = 0.0f, situ_beta = 0.0f, situ_lb = 0.0f;
-    int bos = -1, eos = -1;
+    int bos = 0, eos = 0;
 };
 
 struct Pack {
@@ -115,6 +115,12 @@ struct Pack {
     }
 
     bool geo(std::string& err) {
+        // (keys the model's files always give - pack_gguf.py refuses a GGUF without them: no fallback here either)
+        for (const char* k : {"expert_weights_scale", "final_logit_softcapping", "log_scaling_n_floor", "bos", "eos"})
+            if (!kv.count(k)) {
+                err = dir + "/inkling2.txt: no " + k + " (tools/inkling2/pack_gguf.py writes it)";
+                return false;
+            }
         g.n_layer = (int) num("n_layer");
         g.n_embd = (int) num("n_embd");
         g.n_vocab = (int) num("n_vocab");
@@ -126,22 +132,22 @@ struct Pack {
         g.n_expert = (int) num("n_expert");
         g.n_used = (int) num("n_expert_used");
         g.n_ff_exp = (int) num("n_ff_exp");
-        g.w_scale = (float) num("expert_weights_scale", 1.0);
-        g.softcap = (float) num("final_logit_softcapping", 0.0);
+        g.w_scale = (float) num("expert_weights_scale");
+        g.softcap = (float) num("final_logit_softcapping");
         g.n_swa = (int) num("n_swa");
         g.swa = ints("swa");
         g.d_rel = (int) num("d_rel");
         g.rel_extent = (int) num("rel_extent");
         g.conv = (int) num("shortconv_kernel", 4);
-        g.log_floor = num("log_scaling_n_floor", 1);
+        g.log_floor = num("log_scaling_n_floor");
         g.log_alpha = (float) num("log_scaling_alpha");
         g.qk_clip = (float) num("qk_clip");
         g.rel_clip = (float) num("rel_clip");
         g.res_block = (int) num("attn_res_block", 6);
         g.situ_beta = (float) num("situ_beta");
         g.situ_lb = (float) num("situ_linear_beta");
-        g.bos = (int) num("bos", -1);
-        g.eos = (int) num("eos", -1);
+        g.bos = (int) num("bos");
+        g.eos = (int) num("eos");
         if (g.n_layer < 1 || g.n_embd < 256 || g.n_embd % 256 || g.n_ff_exp % 256 || (int) g.swa.size() != g.n_layer ||
             g.n_head_kv < 1 || g.n_head % g.n_head_kv || g.head_dim < 1 || g.head_dim > 256 || g.d_rel < 1 ||
             g.d_rel > 256 || g.conv != 4 || g.n_used < 1 || g.n_used > 16 || g.n_expert > 1024 || g.res_block < 1 ||

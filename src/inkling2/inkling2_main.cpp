@@ -715,7 +715,9 @@ int main(int argc, char** argv) {
     std::string dspark = "on", dspark_index;   // (the drafter's index: the config names it, the setup writes it)
     float dspark_cum = 0.5f, temperature = 0.0f;
     unsigned long long seed = 0;
-    std::vector<int> stops = {200006, 199999};   // the model's end of sequence and <|content_model_end_sampling|>
+    // the ids that end an answer: 200006, <|content_model_end_sampling|> - the model's end of sequence (the GGUF's
+    // tokenizer.ggml.eos_token_id, config.json's eos_token_id), which ends its turn - and 199999, <|endoftext|>
+    std::vector<int> stops = {200006, 199999};
     std::string rewind_test, tokens_file, window_test, prompts_file;
     bool ab = false;
     std::vector<int> rest0_list;   // (tests: prompt i's Drafting::rest0)
