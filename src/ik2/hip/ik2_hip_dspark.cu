@@ -483,7 +483,9 @@ struct Index {
             const size_t sp = line.find(' ');
             if (sp != std::string::npos) kv[line.substr(0, sp)] = line.substr(sp + 1);
         }
-        if (str("format").rfind("maya-ik2-dspark", 0) != 0) {
+        // (maya-inkling2-dspark: the format's name in an index converted before the AMD build was maya-ik2's - the
+        //  same files)
+        if (str("format").rfind("maya-ik2-dspark", 0) != 0 && str("format").rfind("maya-inkling2-dspark", 0) != 0) {
             err = dir + "/dspark.txt: not a maya-ik2-dspark index";
             return false;
         }
