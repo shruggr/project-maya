@@ -94,6 +94,10 @@ public:
     /// The context ends at pos (<= end()): the rows past it are dead and written again when those positions are fed
     void rollback(int64_t pos);
     void reset();
+    /// (--parallel) states for n conversations in all (each its layers' K / V rows and its context ring, as the load's
+    /// one; the weights shared), and the one feed / draft / rollback / reset / end work on from here on (0 at the load)
+    bool add_states(int n, std::string& err);
+    void bind(int i);
     int64_t end() const;
 
     void set_cum_min(float c);

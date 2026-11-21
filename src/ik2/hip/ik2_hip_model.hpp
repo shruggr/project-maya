@@ -59,6 +59,9 @@ struct Options {
     // routed that fit the RAM beside ram_margin, the rest in place; -1 auto: as off here (maya-ds4's copies none
     // unless all fit with 8 GiB to spare - measured slower on this engine: Impl::place_ram)
     int mmap_experts = -1;
+    // --parallel (maya-ds4's o.seqs, 1 .. 8): conversations held at once, each its own caches, histories, saved
+    // histories and drafter state in VRAM (allocated before the experts are placed: they take what is left)
+    int seqs = 1;
     bool verbose = false;
 };
 
@@ -96,6 +99,16 @@ public:
     bool window(const int* ids, int T, int64_t pos0, int* tops, float* logits_rows, std::string& err);
     bool keep(int rows, std::string& err);
     int window_max() const;
+    /// (--parallel) Options::seqs conversations: bind(s) makes s the one every call above and below works on (0 at the
+    /// load); step_multi reads the next token of each of n distinct conversations (each at its own end_of) through the
+    /// layers at once - the weights read once for all the rows - with rows [n][vocab()] its rows' logits (soft-capped,
+    /// without the logit bias: the caller adds each request's); each conversation then ends a position later, its
+    /// drafter fed the row
+    int seq_count() const;
+    int bound() const;
+    bool bind(int s, std::string& err);
+    int64_t end_of(int s) const;
+    bool step_multi(const int* seqs, const int* ids, int n, float* rows, std::string& err);
     /// (tests) a window's rows through a token's launches, a part at a time: 1 the block types' GEMVs, 2 the experts,
     /// 4 the CPU lane, 8 the F32 GEMVs
     void set_debug(int mask);

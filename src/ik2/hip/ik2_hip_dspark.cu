@@ -617,6 +617,62 @@ struct Dspark::Impl {
     std::vector<float> h_x;
     int64_t end = 0, hi = -1;   // the context's end; the furthest position ever fed (what the rings have overwritten)
     float cum_min = 0.5f;
+    // (--parallel) a conversation's state each: every layer's K / V rows, the context ring, end and hi - the bound
+    // one's in the fields above, the others' here (state 0's too while another is bound)
+    struct State {
+        std::vector<uint16_t*> K, V;
+        uint16_t* fring = nullptr;
+        int64_t end = 0, hi = -1;
+    };
+    std::vector<State> states;
+    int bound = 0;
+    void save_state(State& x) {
+        x.K.resize(L.size());
+        x.V.resize(L.size());
+        for (size_t i = 0; i < L.size(); ++i) {
+            x.K[i] = L[i].K;
+            x.V[i] = L[i].V;
+        }
+        x.fring = fring;
+        x.end = end;
+        x.hi = hi;
+    }
+    void load_state(const State& x) {
+        for (size_t i = 0; i < L.size(); ++i) {
+            L[i].K = x.K[i];
+            L[i].V = x.V[i];
+        }
+        fring = x.fring;
+        end = x.end;
+        hi = x.hi;
+    }
+    bool add_states(int n, std::string& err) {
+        if (states.empty()) {
+            states.resize(1);
+            save_state(states[0]);
+        }
+        CK(cudaSetDevice(dev));
+        while ((int) states.size() < n) {
+            State x;
+            for (const DLayer& l : L) {
+                const size_t rows = l.swa ? (size_t) l.ring : (size_t) o.max_ctx, kd = (size_t) Hkv * D;
+                uint16_t *k = nullptr, *v = nullptr;
+                if (!alloc(k, rows * kd, err) || !alloc(v, rows * kd, err)) return false;
+                x.K.push_back(k);
+                x.V.push_back(v);
+            }
+            if (!alloc(x.fring, (size_t) FR * E, err)) return false;
+            states.push_back(x);
+        }
+        st.vram_gb = (double) used / 1e9;
+        return true;
+    }
+    void bind(int i) {
+        if (i == bound || i < 0 || i >= (int) states.size()) return;
+        save_state(states[(size_t) bound]);
+        load_state(states[(size_t) i]);
+        bound = i;
+    }
 
     ~Impl() {
         if (s != nullptr || !allocs.empty()) {
@@ -1268,6 +1324,8 @@ bool Dspark::draft(int anchor, int max_n, std::vector<int>& toks, std::vector<fl
     return m->draft(anchor, max_n, toks, probs, err);
 }
 void Dspark::rollback(int64_t pos) { m->end = std::max<int64_t>(0, std::min(m->end, pos)); }
+bool Dspark::add_states(int n, std::string& err) { return m->add_states(n, err); }
+void Dspark::bind(int i) { m->bind(i); }
 void Dspark::reset() {
     m->end = 0;
     m->hi = -1;

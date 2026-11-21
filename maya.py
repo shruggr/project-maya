@@ -2000,16 +2000,17 @@ def setup_title(cfg: dict) -> str:
 
 # the models whose engine answers several requests at once (--parallel): GLM-5.3-Flash's, DeepSeek-V4.1-Flash's
 # (maya-ds4 --parallel: a conversation's state each, their tokens decoded together), MiniMax-M3.1-Flash's (maya-mm3
-# --parallel: a KV cache each in VRAM - no KV streaming, no DSpark)
-PARALLEL_FAMILIES = ("glm", "deepseek", "minimax")
+# --parallel: a KV cache each in VRAM - no KV streaming, no DSpark), Inkling 2 Small's on AMD (maya-ik2
+# --parallel, as maya-ds4's: a conversation's caches and drafter state each, their tokens decoded together)
+PARALLEL_FAMILIES = ("glm", "deepseek", "minimax", "ik2")
 
 
 def check_parallel(a, family: str) -> None:
     if getattr(a, "parallel", None) is not None and family not in PARALLEL_FAMILIES:
         model = DS4 if family == "deepseek" else MM3 if family == "minimax" else HY4 if family == "hy4" else \
             Q.SHOWN["ik2"] if family == "ik2" else QWEN_SHOWN
-        fail(f"--parallel is supported by GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash; {model} serves "
-             "one request at a time",
+        fail(f"--parallel is supported by GLM-5.3-Flash, DeepSeek-V4.1-Flash, MiniMax-M3.1-Flash and Inkling 2 Small "
+             f"(AMD); {model} serves one request at a time",
              "remove --parallel; saved conversations do not enable simultaneous decoding")
 
 
@@ -10260,12 +10261,16 @@ def write_config_ik2(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         args += ["--dspark-index", str(index)]
     kept = keep_args([str(x) for x in old.get("args") or []], args,
                      ("--reserve-mib", "--vram-experts", "--layer-split", "--cpu-threads", "--expert-profile",
-                      "--prefill-chunk", "--dspark", "--dspark-cum", "--rewind", "--short-prompt", "--mmap-experts"))
+                      "--prefill-chunk", "--dspark", "--dspark-cum", "--rewind", "--short-prompt", "--mmap-experts",
+                      "--parallel"))
     if "--dspark" not in args[:-1] and index is not None:
         args += ["--dspark", "none"]                   # (until the speed calibration finds that drafting pays here)
     if getattr(a, "mmap_experts", None):   # given now: written, and a later setup keeps it (DeepSeek's, issue #422)
         set_arg(args, "--mmap-experts", a.mmap_experts)
         ok(f"the CPU lane's experts: --mmap-experts {a.mmap_experts}")
+    if getattr(a, "parallel", None):   # given now: written, and a later setup keeps it (DeepSeek's)
+        set_arg(args, "--parallel", a.parallel)
+        ok(f"answers at once: {a.parallel} (--parallel; each its own context's caches in VRAM)")
     # (the VRAM kept free on each GPU: as DeepSeek's setup writes it on AMD - --vram-reserve-mib, else hip_reserve_mib)
     if getattr(a, "vram_reserve_mib", None) is not None:   # given now: written, and a later setup keeps it
         set_arg(args, "--reserve-mib", a.vram_reserve_mib)

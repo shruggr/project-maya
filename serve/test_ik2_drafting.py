@@ -156,6 +156,21 @@ class Settings(unittest.TestCase):
         with self.assertRaises(ValueError):
             models.apply(dict(CUDA), {"mmap": "on"})
 
+    def test_parallel_as_deepseeks(self):
+        """parallel (DS4_KEYS'): --parallel written above 1 (or where the config has it), 1 .. 8; maya-ik2 has none."""
+        cfg = amd(self.pack, "--dspark-index", str(self.index))
+        self.assertEqual(models.settings_of(cfg)["parallel"], 1)
+        out = models.apply(cfg, {"parallel": 4})
+        self.assertEqual(models.flag(out["args"], "--parallel"), "4")
+        self.assertEqual(models.settings_of(out)["parallel"], 4)
+        self.assertEqual(models.flag(models.apply(out, {"parallel": 1})["args"], "--parallel"), "1")
+        self.assertNotIn("--parallel", models.apply(cfg, {"parallel": 1})["args"])
+        for bad in (0, 9):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                models.apply(cfg, {"parallel": bad})
+        with self.assertRaises(ValueError):
+            models.apply(dict(CUDA), {"parallel": 2})
+
     def test_the_pages_figures(self):
         """maya-ik2's entry carries its VRAM a position and the drafter's - the setup's figures (maya.py takes
         them from here); maya-ik2's carries none."""
@@ -248,7 +263,8 @@ class PageJs(unittest.TestCase):
         f = rows_of(self.got["amd"])
         self.assertEqual(list(f), ["Context size", "Drafting", "Images", "Answers at once", "GPUs", "VRAM kept free",
                                    "Experts VRAM does not hold", "Prompt chunk", "CPU threads", "Draft confidence"])
-        for label, flag in (("VRAM kept free", "--reserve-mib"), ("Experts VRAM does not hold", "--mmap-experts"),
+        for label, flag in (("Answers at once", "--parallel"), ("VRAM kept free", "--reserve-mib"),
+                            ("Experts VRAM does not hold", "--mmap-experts"),
                             ("Prompt chunk", "--prefill-chunk"),
                             ("CPU threads", "--cpu-threads"), ("Draft confidence", "--dspark-cum")):
             self.assertEqual(f[label]["flag"], flag)

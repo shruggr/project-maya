@@ -1248,6 +1248,23 @@ struct Model::Impl {
         lane.reset(new hy4::Lane(o.cpu_threads > 0 ? o.cpu_threads - 1 : -1));   // (workers besides the caller)
         if (!fast_init(err)) return false;
         notes("after the host-free step's buffers");
+        seqs.assign((size_t) std::max(1, o.seqs), Seq{});
+        for (Seq& q : seqs) {
+            q.L.resize(L.size());
+            for (int64_t& x : q.snap_pos) x = -1;
+        }
+        if (seqs.size() > 1) {   // (--parallel: the other conversations' state, before the experts take the room)
+            if (!fast_ready) {
+                err = "--parallel needs the host-free step (IK2_HIP_OLD_STEP is set)";
+                return false;
+            }
+            for (Gpu& gp : G) {
+                CK(cudaSetDevice(gp.dev));
+                if (!seq_alloc(gp, err)) return false;
+            }
+            seq_save(seqs[0]);
+            notes("after the other conversations' state");
+        }
         if (Tc > 0) {
             for (size_t gi = 0; gi < G.size(); ++gi) {
                 slots.emplace_back(new Slot);
@@ -1258,6 +1275,7 @@ struct Model::Impl {
             std::string e;
             if (!dspark_init(e)) std::fprintf(stderr, "maya-ik2: no drafter (%s): decoding without drafts\n", e.c_str());
         }
+        if (ds && seqs.size() > 1 && !ds->add_states((int) seqs.size(), err)) return false;
         notes("after the drafter");
         if (!warm_up(err)) return false;
         notes("after the warm-up");
@@ -1747,6 +1765,15 @@ struct Model::Impl {
     int64_t job_p = 0;
     int job_slot = -1;
     int job_T = 1;                  // (1: a token's step; more: a window's rows)
+    // (--parallel) a multi step's rows: each its own conversation's next token, at that conversation's end - its
+    // state in seqs[seq] (the bound one parked there too), its snapshot slot (-1: none)
+    struct MRow {
+        int seq = 0;
+        int64_t p = 0;
+        int slot = -1;
+    };
+    bool job_multi = false;
+    MRow mrows[16];
     const int* job_ids = nullptr;
     float* job_rows = nullptr;      // (a window's logits out, [T][vocab], or null)
     int win_tops[16];
@@ -2213,16 +2240,40 @@ struct Model::Impl {
         ok = ok && mmw(gp, l.sink, xq, T, gp.w_sink);
         ph(l, gp, 2);
         float tau[16];
-        for (int t = 0; t < T; ++t)
-            tau[t] = l.swa ? 1.0f
-                           : 1.0f + g.log_alpha * std::log(std::max(1.0f, (float) ((double) (p0 + t + 1) / g.log_floor)));
-        k::kv_finish_rows(in_k, in_v, T, l.hist_k, l.hist_v, l.alt_k, l.alt_v, l.k_conv, l.v_conv, l.swa ? nullptr : gp.w_dk,
-                          l.swa ? nullptr : gp.w_dv, Hkv, D, g.qk_clip, g.eps, l.K, l.V, l.ring, p0, s);
+        for (int t = 0; t < T; ++t) {
+            const int64_t pt = job_multi ? mrows[t].p : p0 + t;
+            tau[t] = l.swa ? 1.0f : 1.0f + g.log_alpha * std::log(std::max(1.0f, (float) ((double) (pt + 1) / g.log_floor)));
+        }
+        if (job_multi) {   // (each row its own conversation's: its histories, its caches, its position)
+            for (int t = 0; t < T; ++t) {
+                SeqLayer& q = seqs[(size_t) mrows[t].seq].L[(size_t) l.il];
+                k::kv_finish_rows(in_k + (size_t) t * kvd, in_v + (size_t) t * kvd, 1, q.hist_k, q.hist_v, q.alt_k, q.alt_v,
+                                  l.k_conv, l.v_conv, l.swa ? nullptr : gp.w_dk + (size_t) t * 4 * Hkv,
+                                  l.swa ? nullptr : gp.w_dv + (size_t) t * 4 * Hkv, Hkv, D, g.qk_clip, g.eps, q.K, q.V,
+                                  l.ring, mrows[t].p, s);
+            }
+        } else {
+            k::kv_finish_rows(in_k, in_v, T, l.hist_k, l.hist_v, l.alt_k, l.alt_v, l.k_conv, l.v_conv, l.swa ? nullptr : gp.w_dk,
+                              l.swa ? nullptr : gp.w_dv, Hkv, D, g.qk_clip, g.eps, l.K, l.V, l.ring, p0, s);
+        }
         k::clip2_rows(gp.w_q, T, H, D, l.q_clip, g.qk_clip, gp.w_rel, g.d_rel, l.rel_clip, g.rel_clip, tau, s);
         ph(l, gp, 3);
+        if (job_multi)
+            for (int t = 0; t < T; ++t) {
+                const SeqLayer& q = seqs[(size_t) mrows[t].seq].L[(size_t) l.il];
+                const int64_t pf = mrows[t].p, lo = l.swa ? std::max<int64_t>(0, pf - (g.n_swa - 1)) : 0;
+                if (!k::attention_split_rows(gp.w_q + (size_t) t * HD, gp.w_rel + (size_t) t * H * g.d_rel,
+                                             gp.w_sink + (size_t) t * H, 1, H, Hkv, D, g.d_rel, l.rel_bias,
+                                             l.swa ? g.n_swa : g.rel_extent, q.K, q.V, l.ring, pf, lo, l.swa ? g.n_swa : 0,
+                                             1.0f / std::sqrt((float) D), gp.S, gp.S_floats, gp.w_gate + (size_t) t * HD,
+                                             gp.w_ao + (size_t) t * HD, s)) {
+                    err = "layer " + std::to_string(l.il) + ": the attention's scratch does not hold a row's tiles";
+                    return false;
+                }
+            }
         // the rows in one pair of launches (the K / V tiles read once) - or, when the scratch does not hold that many
         // rows' parts over this many keys, a few rows a pair
-        {
+        if (!job_multi) {
             const int64_t keys = l.swa ? std::min<int64_t>(p0 + T, (int64_t) g.n_swa + T) : p0 + T;
             const int fit = std::max(1, std::min(T, k::attention_rows_fit(H, D, keys, gp.S_floats)));
             for (int t0 = 0; t0 < T; t0 += fit) {
@@ -2240,7 +2291,14 @@ struct Model::Impl {
         }
         ph(l, gp, 4);
         ok = ok && mmw(gp, l.wo, gp.w_ao, T, in_a);
-        if (l.il % g.res_block == 0) {   // (a block's first layer: the stream saved, the attention's output a new one)
+        if (job_multi) {
+            for (int t = 0; t < T; ++t) {
+                SeqLayer& q = seqs[(size_t) mrows[t].seq].L[(size_t) l.il];
+                k::conv_add_rows(in_a + (size_t) t * E, 1, q.hist_a, q.alt_a, l.a_conv, E, cur + (size_t) t * E,
+                                 l.il % g.res_block == 0 ? blocks + (size_t) nb * ldb + (size_t) t * E : nullptr, s);
+            }
+            if (l.il % g.res_block == 0) ++nb;
+        } else if (l.il % g.res_block == 0) {   // (a block's first layer: the stream saved, the attention's output a new one)
             k::conv_add_rows(in_a, T, l.hist_a, l.alt_a, l.a_conv, E, cur, blocks + (size_t) nb * ldb, s);
             ++nb;
         } else {
@@ -2302,12 +2360,25 @@ struct Model::Impl {
         ph(l, gp, 7);
         k::lane_add_rows(f_cpu + (size_t) l.il * kLine, v, gp.w_ids, l.slot_d, nu, l.m_cpu, in_f, E, T, s);
         ph(l, gp, 8);
-        k::conv_add_rows(in_f, T, l.hist_f, l.alt_f, l.f_conv, E, cur, nullptr, s);
+        if (job_multi) {
+            for (int t = 0; t < T; ++t) {
+                SeqLayer& q = seqs[(size_t) mrows[t].seq].L[(size_t) l.il];
+                k::conv_add_rows(in_f + (size_t) t * E, 1, q.hist_f, q.alt_f, l.f_conv, E, cur + (size_t) t * E, nullptr, s);
+                std::swap(q.hist_k, q.alt_k);
+                std::swap(q.hist_v, q.alt_v);
+                std::swap(q.hist_a, q.alt_a);
+                std::swap(q.hist_f, q.alt_f);
+            }
+        } else {
+            k::conv_add_rows(in_f, T, l.hist_f, l.alt_f, l.f_conv, E, cur, nullptr, s);
+        }
         ph(l, gp, 9);
-        std::swap(l.hist_k, l.alt_k);
-        std::swap(l.hist_v, l.alt_v);
-        std::swap(l.hist_a, l.alt_a);
-        std::swap(l.hist_f, l.alt_f);
+        if (!job_multi) {
+            std::swap(l.hist_k, l.alt_k);
+            std::swap(l.hist_v, l.alt_v);
+            std::swap(l.hist_a, l.alt_a);
+            std::swap(l.hist_f, l.alt_f);
+        }
         // the drafter's tap: the stream after this layer, for the last GPU (its own: a copy; another's: through host
         // memory both map, there before this GPU's hand-off is)
         if (taps_on && tap_of[(size_t) l.il] >= 0) {
@@ -2328,6 +2399,9 @@ struct Model::Impl {
         int nb = 0;
         for (int il = 0; il < gp.l0; ++il) nb += il % g.res_block == 0;
         if (job_slot >= 0 && !snap_copy(gp, job_slot, true, err)) return false;
+        if (job_multi)
+            for (int t = 0; t < T; ++t)
+                if (mrows[t].slot >= 0 && !snap_copy_seq(gp, seqs[(size_t) mrows[t].seq], mrows[t].slot, err)) return false;
         if (gi == 0) {
             CK(cudaMemcpyAsync(gp.w_xn, h_xw, sizeof(float) * T * E, cudaMemcpyHostToDevice, gp.s));
             k::rms(gp.w_xn, E, T, (int) E, tok_norm, g.eps, gp.w_cb, E, gp.s);
@@ -2364,7 +2438,7 @@ struct Model::Impl {
             return false;
         }
         if (g.softcap > 0.0f) k::softcap(gp.w_logits, (size_t) T * g.n_vocab, g.softcap, gp.s);
-        if (bias_n > 0) k::bias_rows(gp.w_logits, (size_t) g.n_vocab, T, d_bias_ids, d_bias_vals, bias_n, gp.s);
+        if (bias_n > 0 && !job_multi) k::bias_rows(gp.w_logits, (size_t) g.n_vocab, T, d_bias_ids, d_bias_vals, bias_n, gp.s);
         k::argmax_rows(gp.w_logits, (size_t) g.n_vocab, T, g.n_vocab_unpadded, gp.w_top, gp.s);
         CK(cudaMemcpyAsync(h_wtop, gp.w_top, sizeof(float) * 2 * T, cudaMemcpyDeviceToHost, gp.s));
         if (job_rows) CK(cudaMemcpyAsync(h_wlog, gp.w_logits, sizeof(float) * T * g.n_vocab, cudaMemcpyDeviceToHost, gp.s));
@@ -3125,6 +3199,197 @@ struct Model::Impl {
         }
         return true;
     }
+    // ---- (--parallel, Options::seqs) several conversations: each its own caches, histories, saved histories and
+    // drafter state.  The bound one's are in the layers and the fields above (every single-conversation path - a
+    // prompt, a step, a window, keep, rewind, reset - works on it); the others' wait in seqs.  A multi step (step_multi)
+    // parks the bound one too and takes each row's from its own -------------------------------------------------------
+    struct SeqLayer {
+        uint16_t *K = nullptr, *V = nullptr;
+        float *hist_k = nullptr, *hist_v = nullptr, *hist_a = nullptr, *hist_f = nullptr;
+        float *alt_k = nullptr, *alt_v = nullptr, *alt_a = nullptr, *alt_f = nullptr;
+        float* snap = nullptr;
+    };
+    struct Seq {
+        std::vector<SeqLayer> L;
+        int64_t n_end = 0, hw = 0;
+        int64_t snap_pos[kSnaps];
+        int snap_head = 0;
+        bool snap_next = true;
+    };
+    std::vector<Seq> seqs;
+    int bound_seq = 0;
+    void seq_save(Seq& q) {
+        q.L.resize(L.size());
+        for (size_t i = 0; i < L.size(); ++i) {
+            const Layer& l = L[i];
+            q.L[i] = {l.K, l.V, l.hist_k, l.hist_v, l.hist_a, l.hist_f, l.alt_k, l.alt_v, l.alt_a, l.alt_f, l.snap};
+        }
+        q.n_end = n_end;
+        q.hw = hw;
+        std::memcpy(q.snap_pos, snap_pos, sizeof snap_pos);
+        q.snap_head = snap_head;
+        q.snap_next = snap_next;
+    }
+    void seq_load(const Seq& q) {
+        for (size_t i = 0; i < L.size(); ++i) {
+            Layer& l = L[i];
+            const SeqLayer& x = q.L[i];
+            l.K = x.K;
+            l.V = x.V;
+            l.hist_k = x.hist_k;
+            l.hist_v = x.hist_v;
+            l.hist_a = x.hist_a;
+            l.hist_f = x.hist_f;
+            l.alt_k = x.alt_k;
+            l.alt_v = x.alt_v;
+            l.alt_a = x.alt_a;
+            l.alt_f = x.alt_f;
+            l.snap = x.snap;
+        }
+        n_end = q.n_end;
+        hw = q.hw;
+        std::memcpy(snap_pos, q.snap_pos, sizeof snap_pos);
+        snap_head = q.snap_head;
+        snap_next = q.snap_next;
+    }
+    // the other conversations' state on GPU gp (before the experts are placed: they take what is left), zeros - as
+    // load_dense and win_scratch allocate the first one's
+    bool seq_alloc(Gpu& gp, std::string& err) {
+        const size_t E = (size_t) g.n_embd, kvd = (size_t) g.n_head_kv * g.head_dim;
+        for (size_t si = 1; si < seqs.size(); ++si)
+            for (int il = gp.l0; il < gp.l1; ++il) {
+                SeqLayer& q = seqs[si].L[(size_t) il];
+                const size_t rows = cache_rows(il);
+                float* h = nullptr;
+                if (!zeros(gp, h, 2 * 3 * (2 * kvd + 2 * E), err) || !zeros(gp, q.K, rows * kvd, err) ||
+                    !zeros(gp, q.V, rows * kvd, err) || !gp.alloc(q.snap, (size_t) kSnaps * hist_n(), err))
+                    return false;
+                q.hist_k = h;
+                q.hist_v = q.hist_k + 3 * kvd;
+                q.hist_a = q.hist_v + 3 * kvd;
+                q.hist_f = q.hist_a + 3 * E;
+                q.alt_k = q.hist_f + 3 * E;
+                q.alt_v = q.alt_k + 3 * kvd;
+                q.alt_a = q.alt_v + 3 * kvd;
+                q.alt_f = q.alt_a + 3 * E;
+            }
+        return true;
+    }
+    // conversation s's state from here on (the bound one's pending rows fed to its drafter, its counts kept first)
+    bool bind(int s, std::string& err) {
+        if (s < 0 || s >= (int) seqs.size()) {
+            err = "no conversation " + std::to_string(s) + " (--parallel " + std::to_string(seqs.size()) + ")";
+            return false;
+        }
+        if (s == bound_seq) return true;
+        if (!taps_flush(err)) return false;
+        seq_save(seqs[(size_t) bound_seq]);
+        seq_load(seqs[(size_t) s]);
+        bound_seq = s;
+        win_p0 = -1;
+        if (ds) ds->bind(s);
+        return true;
+    }
+    // GPU gp's layers' histories of conversation q -> its snapshot slot (queued on its stream)
+    bool snap_copy_seq(Gpu& gp, const Seq& q, int slot, std::string& err) {
+        const size_t kvd = (size_t) g.n_head_kv * g.head_dim, E = (size_t) g.n_embd;
+        for (int il = gp.l0; il < gp.l1; ++il) {
+            const SeqLayer& x = q.L[(size_t) il];
+            float* b = x.snap + (size_t) slot * hist_n();
+            const float* h[4] = {x.hist_k, x.hist_v, x.hist_a, x.hist_f};
+            const size_t n[4] = {3 * kvd, 3 * kvd, 3 * E, 3 * E};
+            for (int k2 = 0; k2 < 4; ++k2) {
+                CK(cudaMemcpyAsync(b, h[k2], n[k2] * 4, cudaMemcpyDeviceToDevice, gp.s));
+                b += n[k2];
+            }
+        }
+        return true;
+    }
+    static int seq_snap_alloc(Seq& q, int64_t pos) {
+        for (int i = 0; i < kSnaps; ++i)
+            if (q.snap_pos[i] == pos) return i;
+        const int i = q.snap_head;
+        q.snap_head = (q.snap_head + 1) % kSnaps;
+        q.snap_pos[i] = pos;
+        return i;
+    }
+    // A token of each of n conversations (distinct, each read to its end) through every layer at once: the weights
+    // read once for all the rows, each row's attention, short convolutions and histories its own conversation's.
+    // rows [n][vocab]: each row's logits (soft-capped, no logit bias: the caller's per request); each conversation's
+    // context then ends a position later and its drafter is fed the row.  The bound conversation stays bound
+    bool step_multi(const int* sq, const int* ids, int n, float* rows, std::string& err) {
+        if (!fast_ready || n < 1 || n > std::min(kWin, 16)) {
+            err = "a multi step takes 1 .. " + std::to_string(kWin) + " rows (and the host-free step)";
+            return false;
+        }
+        for (int i = 0; i < n; ++i) {
+            bool bad = sq[i] < 0 || sq[i] >= (int) seqs.size();
+            for (int j = 0; j < i; ++j) bad = bad || sq[i] == sq[j];
+            if (bad) {
+                err = "a multi step's rows: distinct conversations of the " + std::to_string(seqs.size());
+                return false;
+            }
+        }
+        const int E = g.n_embd;
+        const double t0 = now_s();
+        if (!taps_flush(err)) return false;
+        seq_save(seqs[(size_t) bound_seq]);
+        for (int i = 0; i < n; ++i) {
+            Seq& q = seqs[(size_t) sq[i]];
+            if (q.n_end + 1 > o.max_ctx) {
+                err = "conversation " + std::to_string(sq[i]) + " is at the context's end";
+                return false;
+            }
+            if (ids[i] < 0 || ids[i] >= g.n_vocab) {
+                err = "token " + std::to_string(ids[i]) + " is outside the vocabulary";
+                return false;
+            }
+            const uint8_t* row = tok_embd.data() + (size_t) ids[i] * tok_row;
+            float* dst = h_xw + (size_t) i * E;
+            if (tok_type == 13) dequantize_row_q5_K(row, dst, E);
+            else if (tok_type == 14) dequantize_row_q6_K(row, dst, E);
+            else std::memcpy(dst, row, (size_t) E * 4);
+            mrows[i].seq = sq[i];
+            mrows[i].p = q.n_end;
+            mrows[i].slot = q.snap_next || q.n_end % tn.snap_every == 0 ? seq_snap_alloc(q, q.n_end) : -1;
+            q.snap_next = false;
+            q.hw = std::max(q.hw, q.n_end + 1);
+        }
+        use_decay(std::pow(tn.tok_decay, (float) n));
+        if (!swap_poll(err, std::min(16, swap_batch * std::min(n, tn.win_rows)))) return false;
+        job_multi = true;
+        job_slot = -1;
+        job_p = mrows[0].p;
+        job_T = n;
+        job_ids = ids;
+        job_rows = rows;
+        tap_buf ^= 1;
+        const bool ok = fast_run(t0, err);
+        job_multi = false;
+        if (!ok) {
+            seq_load(seqs[(size_t) bound_seq]);
+            return false;
+        }
+        for (int i = 0; i < n; ++i) ++seqs[(size_t) sq[i]].n_end;
+        seq_load(seqs[(size_t) bound_seq]);
+        win_p0 = -1;
+        cnt_pending = n;
+        if (taps_on) {   // (each row to its own conversation's drafter, the last feed's read marked for the next step)
+            const size_t ld = tap_layers.size() * (size_t) E;
+            for (int i = 0; i < n; ++i) {
+                ds->bind(sq[i]);
+                if (ds->end() != mrows[i].p) continue;   // (it rests until a rewind)
+                const double tf = now_s();
+                if (!ds->feed_dev(G.back().d_taps[tap_buf] + (size_t) i * ld, ld, 1, mrows[i].p, err,
+                                  tn.tap_event ? (void*) G.back().ev_tap[tap_buf] : nullptr))
+                    return false;
+                ds_feed_s += now_s() - tf;
+            }
+            ds->bind(bound_seq);
+        }
+        return true;
+    }
+
     // the context back at the latest saved position <= pos the rings still cover (force: even when it is the end)
     bool rewind(int64_t pos, bool force, int64_t& at, std::string& err) {
         at = n_end;
@@ -3320,6 +3585,25 @@ bool Model::forward(const int* ids, int n, int64_t pos0, float* logits_out, std:
         if (!m->step(ids[i], pos0 + i, i == n - 1 ? logits_out : nullptr, err)) return false;
         ++m->n_end;
     }
+    return true;
+}
+int Model::seq_count() const { return (int) std::max<size_t>(1, m->seqs.size()); }
+int Model::bound() const { return m->bound_seq; }
+bool Model::bind(int s, std::string& err) {
+    if (m->seqs.empty()) {
+        if (s == 0) return true;
+        err = "one conversation (no --parallel)";
+        return false;
+    }
+    return m->bind(s, err);
+}
+int64_t Model::end_of(int s) const {
+    if (s == m->bound_seq || m->seqs.empty()) return m->n_end;
+    return s >= 0 && s < (int) m->seqs.size() ? m->seqs[(size_t) s].n_end : -1;
+}
+bool Model::step_multi(const int* seqs, const int* ids, int n, float* rows, std::string& err) {
+    std::vector<float> lg((size_t) n * m->g.n_vocab_unpadded);
+    if (!m->step_multi(seqs, ids, n, rows ? rows : lg.data(), err)) return false;
     return true;
 }
 void Model::reset() {

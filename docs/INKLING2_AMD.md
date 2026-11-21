@@ -103,12 +103,13 @@ Engine flags (where maya-ds4 has the same setting, its name, unit, default and b
 `--reserve-mib` 600 - the setup writes DeepSeek's AMD figure, 3072 on a discrete card -, `--cpu-threads` 0 (a thread a
 physical core; N: at most N), `--expert-profile` (`<pack>/expert-profile.bin`, read and written back; a pack's
 `default.prof` from before is read in its place), `--profile-readonly`, `--profile-out` (this run's routing alone),
-`--no-expert-cache`, `--mmap-experts on|off|auto` (auto here as off: "The experts VRAM does not hold"), `--dspark on|off|none` (off: loaded, a request drafts when it says `spec=1`; none: not loaded;
+`--no-expert-cache`, `--mmap-experts on|off|auto` (auto here as off: "The experts VRAM does not hold"), `--parallel N`
+(1 .. 8, "Several conversations at once"), `--dspark on|off|none` (off: loaded, a request drafts when it says `spec=1`; none: not loaded;
 `idle`, tests only, has no maya-ds4 counterpart: loaded and fed, never asked)): `--pack --max-context (--ctx)
 --layer-split --gpus --reserve-mib --vram-experts --expert-profile (none) --profile-readonly --profile-out
---cpu-threads --log-floor --prefill-chunk --try-chunks --repeat --rewind --short-prompt --no-expert-cache --mmap-experts --eos --serve --tokens
+--cpu-threads --log-floor --prefill-chunk --try-chunks --repeat --rewind --short-prompt --no-expert-cache --mmap-experts --parallel --eos --serve --tokens
 --tokens-file --n-predict --layers --dspark --dspark-index --dspark-cum --verbose`; tests `--parity [--parity-force-picks
---parity-force-only --parity-decode --parity-detail --parity-max] --rewind-test --short-bench --window-test
+--parity-force-only --parity-decode --parity-detail --parity-max] --rewind-test --multi-check --short-bench --window-test
 [--window-bits] --prompts --ab --temperature --seed --dspark-rest0`. Environment: `IK2_HIP_PHASES` (device phase
 table, a line a window size), `IK2_HIP_ROUND_LOG` (a line a drafting round), `IK2_HIP_TIMELINE`, `IK2_HIP_PROF`,
 `IK2_HIP_OLD_STEP`, `IK2_HIP_SWAP_BATCH`, `IK2_HIP_SWAP_BURST_MS`, `IK2_HIP_VERIFY_LOAD`, `IK2_HIP_EXPERT_CHECK`,
@@ -342,7 +343,7 @@ By hand, the same steps:
   `HIP_VISIBLE_DEVICES` = the config's GPUs and `lib_dirs` first on the library path. The Models page changes
   `--max-context`, the GPUs and Drafting (`--dspark on|none` with `--dspark-index`, offered where the drafter's index is
   on this PC; the CUDA build drafts in its CLI only), and DeepSeek's rows for the settings the AMD build shares with maya-ds4:
-  `--reserve-mib`, `--mmap-experts` (Experts VRAM does not hold), `--prefill-chunk`, `--cpu-threads` and `--dspark-cum` (as DeepSeek's Draft confidence,
+  `--parallel` (Answers at once), `--reserve-mib`, `--mmap-experts` (Experts VRAM does not hold), `--prefill-chunk`, `--cpu-threads` and `--dspark-cum` (as DeepSeek's Draft confidence,
   `--dspark-conf`); every other flag stays as the config has it.
 - **The drafter's index.** The engine drafts only with the index `--dspark-index` names (the setup writes it); without
   one it decodes without drafts and says so at its start.
@@ -366,6 +367,9 @@ The line protocol (maya-hy4's, `src/hy4/hy4_main.cpp`'s `serve`):
   drafts= draft_acc= draft_off=`, maya-ds4's names), and ends with `DONE <generated> <prompt_tokens> <prompt_ms>
   <decode_ms> <finish> <drafts_acc> <drafts_off> <reused> 0 0` (finish `stop` | `length` | `cancel`) or `ERR
   <message>`. It stops at 200006 and 199999 (`--eos`); ids past 200057, the padded rows, are never sampled.
+- `--parallel N` (N > 1, maya-ds4's): `READY <max_context> stop multi=N`; a GEN needs `rid=<id>` and every line of it
+  carries the id after its keyword (`T <rid> <id>`, `PP <rid> ...`, `DONE <rid> ...`, `ERR <rid> ...`); `STOP <rid>`
+  ends that request alone, a bare `STOP` every one ("Several conversations at once" below).
 
 ## Build and run
 
@@ -526,15 +530,60 @@ with experts in the files a chunk takes about 9 s whether 22 GiB of them are the
 cache little) or 122 GiB (none copied: 113 GB of page cache during the run) - 50 tok/s against 796 at 512K with all
 of them copied and registered. That is what remains: long prompts at 1M are slow here.
 
-## The measured values (2026-11-21)
-
-The measurement phase's list ("Values and their sources", the rows that were MEASURE), measured on this PC. Each value
-has an `IK2_HIP_<NAME>` override (maya-ds4's `DS4_CACHE_*` way: read at the load); `--sweep VAR=a,b,..`
 The checks against the baseline (the default, all copied at these contexts, so the old path): PARITY OK x4, the rewind
 test's five cases OK, `--ab` prose 33.9 -> 59.7, code 37.1 -> 58.1, thinking 37.4 -> 38.4 tok/s, `--serve` 37.7 tok/s
 without drafts and 59.3 with them (the 2.7k prompt continued: 65.3) - the baseline's 33.9 / 59.5, 37.1 / 58.3, 37.3 /
 38.7, 37.6 / 58.3 (65.4); the free VRAM after each decode 600 / 600 / 600 / 604 MiB.
 
+## Several conversations at once: `--parallel N` (2026-11-21)
+
+maya-ds4's flag and protocol (`--parallel N`, 1 .. 8, with `--serve`): the engine holds N conversations, each with its
+own state - every layer's K / V caches (the global layers' `max_ctx` rows, the sliding-window rings), the short
+convolutions' histories (and the other buffer a step writes them to), the saved histories a rewind goes back to, the
+drafter's caches and context ring (`Dspark::add_states` / `bind`: the weights shared) - all of it allocated before the
+experts are placed, so the experts take what is left (E2's rule). `READY <ctx> stop multi=N`; a GEN carries
+`rid=<id>`, every line of a request carries it after its keyword (`T <rid> <id>`, `PP <rid> ...`, `DONE <rid> ...`,
+`ERR <rid> ...`), `STOP <rid>` ends that request alone and a bare `STOP` every one - serve/server.py's `--parallel`
+handling for maya-ds4 (`_generate_multi`, `_route`), unchanged.
+
+- A request goes to the idle conversation whose tokens its prompt shares the most of (ties: the least recently used),
+  else it waits for one (maya-ds4's rule, without its MAYA_DS4_SLOT_KEEP).
+- Its prompt is read whole when its turn comes, in its own conversation (`Model::bind`: every single-conversation path
+  - the prompt path, rewinds, the window, keep - works on the bound one).
+- Between two prompts every running request writes. Alone, it decodes in rounds as with one conversation (the
+  drafter's windows). Two or more: a token of each in one step through every layer (`Model::step_multi`): the
+  projections, the router and the experts take the rows together - the weights read once, the CPU lane's expert read
+  once for every row that picked it - and each row's short convolutions, K / V rows, attention and histories are its
+  own conversation's (the T = 1 launches of the window's kernels, at the row's position). Each request's logit bias
+  and sampler run on its own row's logits on the host. Each conversation's drafter is fed its row.
+- `--multi-check DIR` (tests, with `--parallel N`): N conversations of a reference's prompt (37 tokens shorter each),
+  K greedy tokens each alone, then the same through multi steps - each row's logits must be its own step's bits (the
+  expert cache off).
+
+Measured (`--parallel 8`, `--max-context 32768`, the drafter loaded, the shipped profile read-only): the other seven
+conversations' state takes 4,940 MiB on each of GPUs 0 - 2 and 3,868 on GPU 3, their drafter states 1,940 MiB more
+on GPU 3 - 2.9 GiB a conversation, so 8,630 of the 18,432 experts stay in VRAM (10,604 with one conversation); the
+free VRAM after the load 604 / 604 / 604 / 602 MiB. Eight chat prompts (20 - 26 tokens, "Explain ... in detail.",
+effort 0), 128 greedy tokens each, without drafts (`spec=0`):
+
+| Requests at once | Tokens a second in all | Each request's | Against one request without --parallel (37.6) |
+|---|---|---|---|
+| 1 (each prompt alone) | 30.0 - 39.5 | - | - |
+| 2 | 52.6 | 26.4 - 27.7 | 1.40x |
+| 4 | 67.0 | 17.0 - 18.6 | 1.78x |
+| 8 | 80.6 | 10.4 - 11.8 | 2.14x |
+
+The answers next to their alone runs: the same for 2 - 128 of the 128 tokens - they part where the expert cache moved
+an expert between the runs (as two loads of one prompt part: "Status"). `--multi-check` (each row's logits against its
+own step's bits, the expert cache off) has not been run yet.
+
+What remains against maya-ds4's: it reads a long prompt a piece a turn while the others write, and drafts beside
+several requests (its multi windows); here a prompt is read whole when its turn comes, and only a request alone drafts.
+
+## The measured values (2026-11-21)
+
+The measurement phase's list ("Values and their sources", the rows that were MEASURE), measured on this PC. Each value
+has an `IK2_HIP_<NAME>` override (maya-ds4's `DS4_CACHE_*` way: read at the load); `--sweep VAR=a,b,..`
 (tests, with `--prompts`) runs each prompt's drafted decode with each value in one load, after a warm run of the
 prompt, `--sweep-rounds` times in ABBA order, so the expert cache's state favours no value. Workloads: `--ab`'s three
 prompts (prose: the 2.7k-token document continued; code: the LRU-cache module; thinking: the sourdough question at
@@ -692,6 +741,9 @@ with where it comes from (2026-11-20). Sources:
 | E93 | Rewind-test pass: cosine ≥ 0.9999 | Test threshold | CHOSEN (bound) | The exact cases resume at a chunk's start: the same chunks as the cold read, so only rounding is left |
 | E94 | Parity: mean cosine ≥ 0.999; every row ≥ 0.999 on ≤ 64 positions | Test threshold | MEASURED | INKLING2_AMD.md (llama.cpp's own noise floor: a worst cosine of 0.23 on long prompts) |
 | E95 | `--mmap-experts` auto (`Options::mmap_experts` -1); on / off | The experts VRAM does not hold: copied into RAM, or read in place from the files | MAYA (the flag, values, default, off and on); MEASURED (auto's rule) | maya-ds4's --mmap-experts (ds4_main.cpp, copy_experts). Its auto copies none unless all fit with 8 GiB to spare; here auto is off's - the most routed that fit: at 1M the 2.7k prompt continued at 47.2 tok/s with 100 GiB copied against 32.2 with none, prompts alike (49.1 / 51.4 tok/s) ("The experts VRAM does not hold") |
+| E97 | `--parallel` 1 (`Options::seqs`), 1 .. 8 | Conversations held at once | MAYA | maya-ds4's --parallel (o.seqs, 1 .. 8, --serve), its protocol (READY multi=N, rid=, STOP <rid>) and its rule for a request's conversation (the idle one its prompt shares the most with, else the least recently used) |
+| E98 | A multi step's rows: one a running request, at most 8 (<= kWin 9) | The step through every layer | CHOSEN (bound) | The window's buffers hold kWin rows; --parallel's 8 at most |
+| E99 | A prompt read whole when its turn comes; a request alone drafts, several at once a token each | Scheduling of several requests | CHOSEN (trade) | maya-ds4 reads prompts a piece a turn and drafts beside several requests (its multi windows); neither is here yet ("Several conversations at once": what remains) |
 | E96 | The prompt path's gather from the files: up to 8 threads, `MADV_WILLNEED` first, into a pinned buffer of kStage (E44) blobs a GPU | A staging pass's in-place experts | CHOSEN (method) | Pinned, as every copy to the device here (h2d's note: a copy straight from the mapping once landed a stale page); 8 threads: the four GPUs' gathers side by side within the 24 cores; kStage: a staging pass's experts. Not measured against other counts: the 1M prompts are bound by the SSD (E95's runs) |
 
 ### Drafter
@@ -759,7 +811,7 @@ with where it comes from (2026-11-20). Sources:
 | S28 | `--dspark none` until the speed calibration; `--drafting measure \| on \| off` | Setup's drafting default | MAYA | DeepSeek's setup and tools/calibrate_ds4.py (now taking maya-ik2's --dspark-index) |
 | S29 | A setup again keeps the config's --dspark; the calibration or --drafting then sets it | Re-setup rule | MAYA | write_config_ds4's keep_args |
 | S30 | Port 8080 | Default port | MAYA | maya.py |
-| S31 | Kept flags `--reserve-mib --vram-experts --layer-split --cpu-threads --expert-profile --prefill-chunk --dspark-cum --rewind --short-prompt --mmap-experts` | Hand-set flags a re-setup keeps | CHOSEN (list) | Every engine setting the setup does not ask, now with --dspark and --mmap-experts (DeepSeek's list keeps both; the setup's --mmap-experts is written, as DeepSeek's) |
+| S31 | Kept flags `--reserve-mib --vram-experts --layer-split --cpu-threads --expert-profile --prefill-chunk --dspark-cum --rewind --short-prompt --mmap-experts --parallel` | Hand-set flags a re-setup keeps | CHOSEN (list) | Every engine setting the setup does not ask, now with --dspark, --mmap-experts and --parallel (DeepSeek's list keeps them; the setup's --mmap-experts and --parallel are written, as DeepSeek's; PARALLEL_FAMILIES has ik2) |
 | S32 | Sampling and effort from `MODEL_DEFAULTS["ik2"]` | Written into the config | MODEL | = T24 |
 | S33 | "about a minute" | Conversion message | MEASURED | DSPARK.md (33 s niced, for both types) |
 | S34 | `convert_dspark.py --type q8_0` | Only the Q8_0 copy is made | MEASURED | DSPARK.md |
@@ -777,7 +829,7 @@ with where it comes from (2026-11-20). Sources:
 |---|---|---|---|---|
 | W1 | 32K .. 1M | Contexts on the Models page | MAYA | = S14 (models.py's DS4_CONTEXTS) |
 | W2 | `CONTEXT_TESTED["inkling2"]` 524288 | Where the page starts saying "untested" | MEASURED | Run end to end at --max-context 524288 with a 307,710-token prompt ("Long contexts" above); 1M does not load on this PC (its RAM) |
-| W3 | `IK2_KEYS` + reserve_mib, mmap, prefill_chunk, cpu_threads, dspark_cum (maya-ik2 only) | Settings the page edits | MAYA | DS4_KEYS; dspark_cum is dspark_conf's counterpart, in DeepSeek's Draft confidence row; mmap: DeepSeek's "Experts VRAM does not hold" row (auto: the flag dropped) |
+| W3 | `IK2_KEYS` + parallel, reserve_mib, mmap, prefill_chunk, cpu_threads, dspark_cum (maya-ik2 only) | Settings the page edits | MAYA | DS4_KEYS; dspark_cum is dspark_conf's counterpart, in DeepSeek's Draft confidence row; mmap: DeepSeek's "Experts VRAM does not hold" row (auto: the flag dropped); parallel: DeepSeek's "Answers at once" row (1 .. 8, written above 1; the context's cost times it) |
 | W4 | VRAM kept free (--reserve-mib) for maya-ik2 | - | MAYA | DeepSeek's row |
 | W5 | `--dspark` read as "on" when absent; off and none read as Off | Current Drafting state | MAYA | The engine's default, as maya-ds4's; the page writes none (DeepSeek's) |
 | W6 | Context fallback 32768 | Context when `--max-context` is absent | MAYA | = E1 (ds4_model.hpp) |

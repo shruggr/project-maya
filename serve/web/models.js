@@ -611,15 +611,21 @@ function ik2Fields(m, d, ch, gpus, reserve) {
   const dspark = m.choices.draft.includes("dspark"), amd = m.choices.drafting;
   const kvb = (m.kv_bytes || IK2_KV_BYTES) + (m.kv_gpu_bytes || 0) * Math.max(1, d.gpus.length) +
     (d.draft === "dspark" ? m.dspark_kv_bytes || 0 : 0);
+  const per = amd ? Math.max(1, Number(d.parallel) || 1) : 1;   // (maya-ik2 --parallel on AMD: a cache each, as DeepSeek's)
   return [
-    {label: "Model", rows: [contextRow(m, d, ch, {vram: kvb}, ["gpus", "draft"]),
+    {label: "Model", rows: [contextRow(m, d, ch, {vram: per * kvb}, ["gpus", "draft", "parallel"],
+        per > 1 ? `${per} answers at once: each keeps a whole cache of this size in VRAM, which the experts give up.` : null),
       m.choices.drafting ? html`<${Row} label="Drafting" flag="--dspark" changed=${ch("draft")}
         hint=${dspark ? `DSpark, the model's own drafter, drafts a few tokens at a time for the model to check: the same answers, faster on prose and code.${m.dspark_gb ? ` About ${m.dspark_gb} GB of the last GPU's VRAM.` : ""}`
           : "No DSpark drafter for this model on this PC: the setup downloads Thinking Machines' drafter and converts it."}>
         <${Seg} label="Drafting" value=${d.draft} options=${[...(dspark ? [{id: "dspark", label: "DSpark"}] : []), {id: "none", label: "Off"}]}
           onChange=${(v) => setDraft({draft: v})}/><//>` : null,
       html`<${Row} label="Images" hint="Inkling 2 Small's engine reads text only for now."/>`,
-      html`<${Row} label="Answers at once" hint="Inkling 2 Small answers one request at a time for now."/>`].filter(Boolean)},
+      amd ? html`<${Row} label="Answers at once" flag="--parallel" changed=${ch("parallel")}
+        hint="Up to 8. Each extra conversation keeps its own context's caches in VRAM, which the experts give up. An answer written alone still drafts; several at once are decoded together."
+        warn=${d.parallel > 1 && d.context * d.parallel > 1048576 ? `${d.parallel} conversations of ${ctxfmt(d.context)} each: a smaller context leaves the experts more VRAM.` : null}>
+        <${Stepper} label="Answers at once" value=${d.parallel} min=${1} max=${8} on=${(v) => setDraft({parallel: v})}/><//>`
+        : html`<${Row} label="Answers at once" hint="On NVIDIA maya-ik2 answers one request at a time."/>`].filter(Boolean)},
     // (maya-ik2 on AMD: DeepSeek's rows for the settings it shares with maya-ds4; on NVIDIA it has none of them)
     {label: "GPUs and memory", rows: amd ? [gpus, reserve,
       html`<${Row} label="Experts VRAM does not hold" flag="--mmap-experts" changed=${ch("mmap")}
