@@ -79,8 +79,10 @@ public:
     /// the host, tap k of a position in target_layers()' order.  Their K / V rows go into every layer's cache and the
     /// markov head's context row is kept; end() is then pos0 + n.
     bool feed(const float* taps, int n, int64_t pos0, std::string& err);
-    /// The same from the device (this GPU), rows ld floats apart
-    bool feed_dev(const float* d_taps, size_t ld, int n, int64_t pos0, std::string& err);
+    /// The same from the device (this GPU), rows ld floats apart.  It queues the reads on the drafter's own stream and
+    /// returns: read_done (a cudaEvent_t / hipEvent_t of this GPU, or null) is recorded there after the last of them,
+    /// so the caller's stream waits on it before it writes d_taps again
+    bool feed_dev(const float* d_taps, size_t ld, int n, int64_t pos0, std::string& err, void* read_done = nullptr);
 
     /// A block after `anchor`, the token at position end() (sampled, not read by the target yet): up to max_n (<= 7)
     /// drafts for positions end() + 1 .., each the head's argmax (ties: the lowest id) with its probability under the

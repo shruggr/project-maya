@@ -179,6 +179,8 @@ struct Gpu {
     //  last step's while the next writes the other - this GPU's own tap rows, the other GPUs' as copied from the host;
     //  a prompt chunk's the same, [Tc] rows)
     float *d_taps[2] = {nullptr, nullptr}, *d_tapl = nullptr, *d_tapr = nullptr;
+    // (recorded on the drafter's stream after its reads of d_taps[b]: the step that writes d_taps[b] again waits on it)
+    cudaEvent_t ev_tap[2] = {nullptr, nullptr};
     float *c_taps = nullptr, *c_tapl = nullptr, *c_tapr = nullptr;
     int8_t *w_xq = nullptr, *w_x2q = nullptr, *w_ehq = nullptr;
     int *w_ids = nullptr, *w_gstart = nullptr, *w_gent = nullptr, *w_ng = nullptr;
@@ -1589,7 +1591,8 @@ struct Model::Impl {
         tap_pending = 0;
         if (!taps_on || ds->end() != tap_p0) return true;   // (the drafter is not at these rows: it rests until a rewind)
         const double t0 = now_s();
-        const bool ok = ds->feed_dev(G.back().d_taps[tap_buf], tap_layers.size() * (size_t) g.n_embd, n, tap_p0, err);
+        const bool ok = ds->feed_dev(G.back().d_taps[tap_buf], tap_layers.size() * (size_t) g.n_embd, n, tap_p0, err,
+                                     (void*) G.back().ev_tap[tap_buf]);
         ds_feed_s += now_s() - t0;
         return ok;
     }
@@ -1640,6 +1643,7 @@ struct Model::Impl {
         }
         tap_layers.push_back(NL);
         CK(cudaHostAlloc((void**) &m_taps, sizeof(float) * (nt - 1) * kWin * E, cudaHostAllocMapped | cudaHostAllocPortable));
+        for (cudaEvent_t& e : gp.ev_tap) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         if (!gp.alloc(gp.d_taps[0], (size_t) kWin * nt * E, err) || !gp.alloc(gp.d_taps[1], (size_t) kWin * nt * E, err) ||
             !gp.alloc(gp.d_tapl, (nt - 1) * kWin * E, err) || !gp.alloc(gp.d_tapr, (nt - 1) * kWin * E, err))
             return false;
@@ -2152,6 +2156,8 @@ struct Model::Impl {
             srcs[nt - 1] = gp.w_xf;
             if (remote)
                 CK(cudaMemcpyAsync(gp.d_tapr, m_taps, sizeof(float) * (size_t) (nt - 1) * ldb, cudaMemcpyHostToDevice, gp.s));
+            // (the drafter's last feed from this buffer read on its own stream: done before it is written again)
+            CK(cudaStreamWaitEvent(gp.s, gp.ev_tap[tap_buf], 0));
             k::taps_gather(srcs, 0u, nt, T, (int) E, gp.d_taps[tap_buf], (size_t) nt * E, gp.s);
         }
         if (!mmw(gp, head, gp.w_xf, T, gp.w_logits)) {

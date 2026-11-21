@@ -1256,8 +1256,13 @@ bool Dspark::load(const DsparkOptions& o, std::string& err) { return m->load(o, 
 bool Dspark::feed(const float* taps, int n, int64_t pos0, std::string& err) {
     return m->feed(taps, (size_t) kTaps * (size_t) m->E, false, n, pos0, err);
 }
-bool Dspark::feed_dev(const float* d_taps, size_t ld, int n, int64_t pos0, std::string& err) {
-    return m->feed(d_taps, ld, true, n, pos0, err);
+bool Dspark::feed_dev(const float* d_taps, size_t ld, int n, int64_t pos0, std::string& err, void* read_done) {
+    if (!m->feed(d_taps, ld, true, n, pos0, err)) return false;
+    if (read_done != nullptr && cudaEventRecord((cudaEvent_t) read_done, m->s) != cudaSuccess) {
+        err = "dspark: the feed's event: " + std::string(cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    return true;
 }
 bool Dspark::draft(int anchor, int max_n, std::vector<int>& toks, std::vector<float>& probs, std::string& err) {
     return m->draft(anchor, max_n, toks, probs, err);

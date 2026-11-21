@@ -468,7 +468,11 @@ so about 250 of its experts go to RAM.
 **Taps.** Every row of every step leaves its 8 taps on the last GPU as F32 [rows][8][4608]: a layer whose output is
 a tap (4, 10, ..., 40) publishes its rows to host memory the last GPU maps (the last GPU's own tap layer: a copy), the
 head adds its input (the fused mix + norm, `result_norm`), one gather interleaves them. Two buffers by turns: the
-drafter reads the last step's on its own stream while the next step writes the other. They are fed
+drafter reads the last step's on its own stream while the next step writes the other. The order is by construction, not by
+timing: `Dspark::feed_dev` records an event on the drafter's stream after its reads of a buffer, and the step that
+writes that buffer again waits on it on its own stream first (no measurable cost: `--sweep INKLING2_TAP_EVENT=1,0`,
+two rounds in ABBA order, prose 64.7 / 65.7 tok/s, code 55.6 / 56.0, thinking 38.4 / 38.3, within the runs' noise of
+3 - 10 tok/s). They are fed
 (`Dspark::feed_dev`) when the rows are kept - at the next draft, step or rewind - so `Model::keep` only shortens what
 is pending. The prompt path does the same a chunk at a time (the taps through pinned host buffers, a chunk in flight
 each; the head's mix + norm for every row), fed by the last GPU's stage. A rewind rolls the drafter back to the
