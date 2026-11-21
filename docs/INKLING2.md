@@ -198,6 +198,21 @@ the cache: a 21.8k prompt on an RTX PRO 6000 went 8.05 -> 9.7 s); predicting the
 layer's input (46% precise); tensor parallel experts (`IK2_TP=1`: 42.8 vs EP's 41.3 tok/s but slower prompts; kept
 as an option); the drafter (`--draft`: 2.4-2.7 tokens a step, but verifying 8 costs ~260 ms).
 
+### 6.2 On AMD
+
+`maya-ik2` builds for AMD cards too (HIP, `STRATA_ENABLE_HIP`): [INKLING2_AMD.md](INKLING2_AMD.md). The kernels above
+are NVIDIA's own (inline PTX, NVFP4), so the AMD build's model is `src/ik2/hip/`: a pack of unsloth's UD-Q2_K_XL
+(`tools/ik2/pack_gguf.py`) on maya-ds4's ggml block-type kernels, the layers split across the cards, the experts VRAM
+does not hold computed on the CPU or read from the SSD, and drafting with the model's own DSpark block
+([INKLING2_DSPARK.md](INKLING2_DSPARK.md)): on 4x Radeon AI PRO R9700, 37 tok/s, and 58 with drafts. The CUDA build
+is unchanged.
+
+To the server and the web app it is the same engine (family `ik2`, with everything in "Serving" above: this
+section's template, parser and tokenizer); its INFO line says `engine_kind=ik2-hip`. The server gives the AMD build
+the layer split (`engine_args`: `--layer-split`); on NVIDIA the GPUs are the engine's own `--gpus`. It takes the CUDA
+build's `--model`, `--gpus N` and `--chunk` as well, and `./maya.sh --setup --backend hip --model inkling-2-small`
+sets it up (download, pack, drafter, config, speed calibration).
+
 ## 7. Next
 
 1. Setup in `maya.py` (download, the RAM / VRAM check, the run config), as Hy4-Flash has.
