@@ -19,6 +19,13 @@ tokens), `--ab` prose 33.8 -> 62.1, code 36.1 -> 59.2, thinking 37.0 -> 39.3 tok
 official chat template, my_e2e's three turns 42.1 / 38.9 / 50.7 tok/s. The table below is the run before the merge
 (commit f620cbc: speculative decoding wired).
 
+After the measurement phase (2026-11-21: the VRAM plan measured, the measured values - "VRAM", "The measured values"
+below), the same checks: parity OK x4, the rewind test's five cases OK, short decode through `--serve` 37.6 tok/s
+without drafts and 58.3 with them (the 2.7k prompt continued: 65.4), `--ab` prose 33.9 -> 59.5, code 37.1 -> 58.3,
+thinking 37.3 -> 38.7 tok/s - within the runs' noise of the numbers above (drafted prose ranges 59 - 73 between runs).
+At 32K 10,604 of the 18,432 experts are in VRAM (10,565 before, when 0.3 GB a GPU was left free instead of the
+600 MiB reserve); prompts read as before (2.7k tokens at 946 tok/s).
+
 Measured on this PC; `--max-context 32768`, the pack's expert profile loads by itself, the drafter on by default.
 (The flags as they are named now: the drafter not loaded is `--dspark none`, maya-ds4's name; it was `off` then.)
 
