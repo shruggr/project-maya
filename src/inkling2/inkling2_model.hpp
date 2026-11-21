@@ -36,8 +36,10 @@ struct Options {
     std::string profile_out;
     std::vector<int> layer_split; // the first layer of each GPU after the first (empty: by the experts' bytes)
     int rewind = 4096;            // positions back from the furthest one read that a rewind may reach without the
-                                  // prompt being read again (the sliding-window rings keep that many rows more)
-    int prefill_chunk = 512;      // a prompt's tokens a forward takes through the layers at once (<= 1: token by token)
+                                  // prompt being read again (the sliding-window rings keep that many rows more;
+                                  // MEASURE: 0.75 GB over the 40 layers against prompts read again)
+    int prefill_chunk = 512;      // a prompt's tokens a forward takes through the layers at once (<= 1: token by token;
+                                  // MEASURE against maya-ds4's 2048 / 4096: --try-chunks)
     int layers = 0;               // (tests) only the first `layers` layers are loaded and run (0: all)
     double log_floor = 0;         // log_scaling_n_floor in place of the pack's (0: the pack's)
     std::string dspark_index;     // the drafter's index folder (inkling2_dspark.hpp; empty: no drafter): loaded on the

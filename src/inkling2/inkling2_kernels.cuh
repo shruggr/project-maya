@@ -9,7 +9,9 @@
 
 namespace inkling2::k {
 
-constexpr int kMaxStates = 16;   // the depth mix's states at most (the saved residual streams and the current one)
+// the depth mix's states at most (the saved residual streams and the current one): the model needs ceil(48 / 6) + 1 = 9
+// (n_layers_per_attn_res_block 6)
+constexpr int kMaxStates = 16;
 
 /// The attention over the depth: the states are the nb rows of blocks [nb][E] and cur [E], each RMS-normed (no gain,
 /// eps); for each of the nq queries (query [nq][E]) w = softmax_s(S_s . q / sqrt(E)), out[q] = sum_s w_s S_s.

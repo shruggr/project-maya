@@ -171,7 +171,7 @@ __global__ void attn_softmax_kernel(float* __restrict__ S, int nk) {
 // block = (a tile of kTile keys, a kv head): the tile's K rows and the kv head's queries in shared memory, then a
 // thread a (query head, key) - its score (a thread reading its own K row from the cache took most of a decode step's
 // attention time)
-constexpr int kTile = 32, kSeg = 128;
+constexpr int kTile = 32, kSeg = 128;   // (a tile's shared memory against blocks: measurable with INKLING2_PHASES)
 __global__ void attn_score_tile_kernel(const float* __restrict__ q, const float* __restrict__ rel,
                                        const float* __restrict__ sink, int H, int Hkv, int D, int n_rel,
                                        const float* __restrict__ rel_bias, int extent, const __half* __restrict__ K, int ring,
@@ -426,7 +426,7 @@ __global__ void attn_tile_kernel(const float* __restrict__ q, const float* __res
 // ... for a window's T rows: block = (a tile of TK keys, a kv head) - the tile's K rows in shared memory once for the
 // T x per queries (read where they lie), each query's softmax within the tile over the keys its row sees, then the
 // tile's V rows in the same shared memory for the parts.  st [T H][tiles][2], part [T H][tiles][D]
-constexpr int kATK = 16;      // keys a tile of the window attention
+constexpr int kATK = 16;      // keys a tile of the window attention (split_tk's measured best below, 16)
 // kAU: keys a thread of the scores takes (the query's values read once for its kAU dots; each dot summed in the
 // dimensions' order whatever kAU is, so the instances give the same bits).  Measured, ms of attention a pass at 2.7k
 // context for T = 1 / 2 / 4 / 8 / 9 rows: 1 key 3.8 / 5.8 / 9.7 / 18.0 / 20.0, 2 keys 3.4 / 4.0 / 5.6 / 10.0 / 11.4,
@@ -564,7 +564,7 @@ __global__ void attn_combine_seq_kernel(const float* __restrict__ st, const floa
 }
 // ... the same sums for more tiles than a block's shared memory holds factors for (contexts past kCombTiles * kATK
 // keys: 131072): the tiles' factors a chunk of kCombTiles at a time, summed in the same order
-constexpr int kCombTiles = 8192;
+constexpr int kCombTiles = 8192;   // (8192 floats = 32 KB of a block's shared memory)
 __global__ void attn_combine_seq_big_kernel(const float* __restrict__ st, const float* __restrict__ part, int ntile, int D,
                                             const float* __restrict__ gate, float* __restrict__ out) {
     __shared__ float sh[256];
@@ -1099,6 +1099,7 @@ int split_tk(int nk) {
 }  // namespace
 size_t attention_split_floats(int H, int D, int64_t max_keys) {
     const int64_t nk = std::max<int64_t>(max_keys, 2048);
+    // (at least 256 tiles: INKLING2_ATTN_TK's smallest tile, 8, over 2048 keys)
     const int64_t tiles = std::max<int64_t>((2048 + 7) / 8, (nk + 15) / 16);
     return (size_t) H * (size_t) tiles * (size_t) (D + 2);
 }

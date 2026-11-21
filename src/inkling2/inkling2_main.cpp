@@ -114,7 +114,7 @@ struct Lines {
     void start() {
         std::thread([this] {
             std::string buf;
-            char chunk[4096];
+            char chunk[4096];   // (a read's size only: the lines are put together across reads)
             for (;;) {
                 const long n = mm3::os::read_stdin(chunk, sizeof chunk);
                 if (n <= 0) break;
@@ -232,6 +232,8 @@ int sample(const float* row, int V, const mm3::sample::Req& r, const std::vector
 // 8 rounds, doubling to 32 while it keeps not paying, from 8 again with every request.  (Short on purpose: a rest costs
 // little where drafts are break-even and much where the text turns to code or prose - measured through the server:
 // rests of up to 128 rounds carried from a thinking block slept through most of the code after it.)
+// (a, b and t_draft's starting values, rest_len / its cap 32, the 8 rounds before judging, the 0.1 a / 0.3 a bars, the
+//  0.9 / 0.1 averages and b's 0.5 ms floor: MEASURE - docs/INKLING2_AMD.md, "Values and their sources")
 struct Drafting {
     bool on = false;
     double a = 30.0, b = 7.0, t_draft = 10.0;   // ms: a token's pass, a window row more, a draft
@@ -382,7 +384,7 @@ bool draft_round(inkling2::Model& m, Drafting& dr, int tok, const mm3::sample::R
         }
     }
     const int T = k + 1;
-    int ids[16], tops[16];
+    int ids[16], tops[16];   // (at least window_max(), 9 rows)
     ids[0] = tok;
     for (int i = 0; i < k; ++i) ids[i + 1] = toks[(size_t) i];
     if (want_lg) lg.resize((size_t) T * V);
@@ -710,7 +712,7 @@ int main(int argc, char** argv) {
     inkling2::Options o;
     std::vector<std::string> parities;
     std::string tokens;
-    int n_predict = 0, repeat = 1, short_n = 3;
+    int n_predict = 0, repeat = 1, short_n = 3;   // (short_n: MEASURE with --short-bench)
     bool serving = false, short_bench = false, window_bits = false;
     std::string dspark = "on", dspark_index;   // (the drafter's index: the config names it, the setup writes it)
     float dspark_cum = 0.5f, temperature = 0.0f;
@@ -890,6 +892,8 @@ int main(int argc, char** argv) {
             int am = 0;
             for (int i = 1; i < V; ++i)
                 if (lt[(size_t) t * V + i] > lt[(size_t) t * V + am]) am = i;
+            // (with the experts where they are a window's rows are the token steps' to the bit - 9 of 9,
+            //  docs/INKLING2_AMD.md: the bound only has to catch a real difference)
             const bool ok = am == tops[(size_t) t] && c >= 0.9995;
             bad += !ok;
             n_bits += std::memcmp(lt.data() + (size_t) t * V, lw.data() + (size_t) t * V, sizeof(float) * (size_t) V) == 0;
@@ -1006,7 +1010,8 @@ int main(int argc, char** argv) {
             }
             const double c = dot / std::sqrt(a2 * b2);
             // (exact means: the shared prefix was read by the prompt path and B resumes at one of its chunks' starts -
-            //  then the same chunks follow as in the cold read; otherwise the two differ in their arithmetic's order)
+            //  then the same chunks follow as in the cold read, only rounding is left: 0.9999; otherwise the two differ
+            //  in their arithmetic's order)
             const bool ok = topw == model.top() && (c >= 0.9999 || !exact);
             bad += !ok;
             std::printf("%s: A %zu tokens (+%d decoded), B %zu tokens sharing %zu: resumed at %lld (%zu read again, %.2f s; "

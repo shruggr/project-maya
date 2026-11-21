@@ -148,7 +148,7 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
     }
     sc.ustart.push_back((int) sc.uent.size());
     {
-        bool used[64] = {};
+        bool used[64] = {};   // (at least kWin, 9 rows)
         for (const CpuRowEntry& e : entries)
             if (e.row >= 0 && e.row < 64) used[e.row] = true;
         for (int t = 0; t < T && t < 64; ++t)

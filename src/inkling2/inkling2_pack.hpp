@@ -148,6 +148,9 @@ struct Pack {
         g.situ_lb = (float) num("situ_linear_beta");
         g.bos = (int) num("bos");
         g.eos = (int) num("eos");
+        // (the kernels' limits: n_embd and n_ff_exp whole 256-value blocks - ggml's k-quant super-blocks -, head_dim and
+        //  d_rel <= 256 - clip2, attention_split -, the 4-tap short convolution, n_used <= 16 and n_expert <= 1024 -
+        //  hy4's router -, the depth mix's states <= kMaxStates 16)
         if (g.n_layer < 1 || g.n_embd < 256 || g.n_embd % 256 || g.n_ff_exp % 256 || (int) g.swa.size() != g.n_layer ||
             g.n_head_kv < 1 || g.n_head % g.n_head_kv || g.head_dim < 1 || g.head_dim > 256 || g.d_rel < 1 ||
             g.d_rel > 256 || g.conv != 4 || g.n_used < 1 || g.n_used > 16 || g.n_expert > 1024 || g.res_block < 1 ||

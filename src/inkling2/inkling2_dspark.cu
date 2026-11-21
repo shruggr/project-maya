@@ -153,6 +153,8 @@ __global__ void half_to_float_kernel(const __half* __restrict__ x, int n, float*
 // T * per queries (per = H / Hkv query heads a kv head, all T rows) - the keys read once into shared memory, each
 // query's scores, their softmax within the tile (st: its maximum and sum) and the tile's part of the output - then a
 // combine a query.  A plain softmax of scale q . k: no sink, no bias.
+// (kMaxTiles: the combine's shared factors; kPartAcc = the 48 queries - 8 rows x 6 heads a kv head - over the 2 groups
+//  of 128 threads, which the load checks)
 constexpr int kMaxTiles = 4096, kPartAcc = 24;
 __global__ void attn_tile_kernel(const float* __restrict__ q, const float* __restrict__ kb, const float* __restrict__ vb,
                                  const __half* __restrict__ K, const __half* __restrict__ V, int ring, long long base,
@@ -939,6 +941,7 @@ struct Dspark::Impl {
             return false;
 
         // ---- scratch (before the head's tables: M's making borrows some)
+        // (64: the largest tile whose shared memory fits, 44 KB; 8 the measured default)
         tile = o.attn_tile >= 4 && o.attn_tile <= 64 ? o.attn_tile : 8;
         max_tiles = (int) std::min<int64_t>(kMaxTiles, (o.max_ctx + B + tile - 1) / tile);
         const int qk = std::max(std::max(E, FF), HD);
@@ -1011,7 +1014,7 @@ struct Dspark::Impl {
                 return false;
             }
         }
-        FR = (int) std::min<int64_t>(o.max_ctx, (int64_t) std::max(0, o.rewind) + 2 * kFeed);
+        FR = (int) std::min<int64_t>(o.max_ctx, (int64_t) std::max(0, o.rewind) + 2 * kFeed);   // (a rewind's reach, two feeds)
         if (!alloc(fring, (size_t) FR * E, err)) return false;
 
         // ---- the markov head: joint_proj as F32, markov_w1 as F16 rows, M = output @ hidden_out and m0 = output @ its bias

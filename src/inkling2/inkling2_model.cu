@@ -261,7 +261,9 @@ struct Model::Impl {
     float* h_big = nullptr;          // (pinned: a tap's tensor, the logits on their way out)
     size_t max_keys = 0;
     int Tc = 0;                      // the prompt path's chunk (0: none)
-    static constexpr int kStage = 24;   // streamed experts a pass
+    // streamed experts a pass, in two buffers: one is copied while the other's experts run - fewer passes against
+    // 2 x 24 blobs of VRAM (measurable: a prompt's tok/s)
+    static constexpr int kStage = 24;
     size_t blob_max = 0;
     // the hand-off between two GPUs' stages of a chunk: slot gi is GPU gi's input ([1 + states][T][E], pinned)
     struct Slot {
@@ -414,7 +416,7 @@ struct Model::Impl {
 
     size_t tensor_bytes(const std::string& n) const {
         const Tensor* t = pk.get(n);
-        return t ? (size_t) t->bytes * (t->type == "BF16" ? 2 : 1) + 256 : 0;
+        return t ? (size_t) t->bytes * (t->type == "BF16" ? 2 : 1) + 256 : 0;   // (+ alloc's 256-byte rounding; MEASURE)
     }
     size_t cache_rows(int il) const { return g.swa[(size_t) il] ? (size_t) (g.n_swa + o.rewind + Tc) : (size_t) o.max_ctx; }
     int n_states() const { return (g.n_layer + g.res_block - 1) / g.res_block; }
@@ -426,7 +428,7 @@ struct Model::Impl {
                                4 * (size_t) g.n_head_kv * g.head_dim + 64 + (size_t) g.n_expert + 4 * nu + 2 * nu * E +
                                4 * k::kMaxStates);
         return fl * 4 + T * HD * 2 + HD * E * 2 + T * nu * (size_t) g.n_ff_exp * 2 + S_n() * 6 +
-               (size_t) kTsMax * g.n_head * g.rel_extent * 4 + 2 * (size_t) kStage * blob_max + ((size_t) 32 << 20);
+               (size_t) kTsMax * g.n_head * g.rel_extent * 4 + 2 * (size_t) kStage * blob_max + ((size_t) 32 << 20);   // (+ slack; MEASURE)
     }
     // the attention's scores (F32, and their F16 copy beside): floats.  A pass of ts tokens over nk keys takes
     // n_head x ts x nk of them (attention_rows halves ts until it fits), so they must hold one token over every key
@@ -434,7 +436,9 @@ struct Model::Impl {
     // about 961K keys; kS_n, the floor, is a 512-token pass over 1,877 keys
     static constexpr size_t kS_n = (size_t) 44 << 20;
     size_t S_n() const { return std::max(kS_n, (size_t) g.n_head * max_keys); }
-    static constexpr int kTsMax = 512;                  // ... and its tokens a pass at most
+    // ... and its tokens a pass at most: the default prompt chunk (a longer chunk runs passes of 512); its rel-bias
+    // table is kTsMax x n_head x rel_extent floats, 100 MB
+    static constexpr int kTsMax = 512;
     bool chunk_scratch(Gpu& gp, std::string& err) {
         if (Tc <= 0) return true;
         const size_t blob_max = gp.blob_max;
@@ -481,7 +485,7 @@ struct Model::Impl {
         for (auto it = pk.t.lower_bound(p); it != pk.t.end() && it->first.compare(0, p.size(), p) == 0; ++it)
             if (it->first.find("_exps.") == std::string::npos) b += tensor_bytes(it->first);
         const size_t kvd = (size_t) g.n_head_kv * g.head_dim;
-        b += cache_rows(il) * kvd * 2 * 2 + (size_t) (1 + kSnaps) * hist_n() * 4 + 4096;
+        b += cache_rows(il) * kvd * 2 * 2 + (size_t) (1 + kSnaps) * hist_n() * 4 + 4096;   // (+ slack a layer; MEASURE)
         return b;
     }
     // the geometry of a layer's expert blobs (no data)
@@ -518,8 +522,9 @@ struct Model::Impl {
         std::memcpy(dst + l.tr[2], pk.data(*l.t_dn) + (size_t) e * l.db, l.db);
     }
 
-    // the attention's scratch, floats: a token's tiles over every key, or a window's 9 rows' over up to 4096 keys (a
-    // window whose keys are more runs its rows one at a time)
+    // the attention's scratch, floats: a token's tiles over every key, or a window's 9 rows' (kWin) over up to 4096 keys
+    // - every SWA layer's window and a global layer's first 4096 positions in one launch pair, 58 MB a GPU (a window
+    // whose keys are more runs its rows one at a time)
     size_t S_need() const {
         const size_t one = std::max((size_t) g.n_head * (2 * max_keys + 256),
                                     k::attention_split_floats(g.n_head, g.head_dim, (int64_t) max_keys));
@@ -529,7 +534,7 @@ struct Model::Impl {
         const size_t E = (size_t) g.n_embd, HD = (size_t) g.n_head * g.head_dim, nu = (size_t) g.n_used;
         return (size_t) 4 * ((2 + k::kMaxStates + 3 + 3 + 6) * E + 3 * HD + S_need() +
                              nu * (size_t) (2 * g.n_ff_exp + g.n_ff_exp + g.n_embd) + (size_t) g.n_vocab) +
-               nu * E * 2 + ((size_t) 64 << 20);
+               nu * E * 2 + ((size_t) 64 << 20);   // (+ slack; MEASURE)
     }
     bool scratch(Gpu& gp, bool last, std::string& err) {
         const size_t E = (size_t) g.n_embd, HD = (size_t) g.n_head * g.head_dim, nu = (size_t) g.n_used;
@@ -623,7 +628,9 @@ struct Model::Impl {
                 return false;
             }
             size_t room = gp.free0 - fixed;
-            for (int il = gp.l0; il < gp.l1; ++il) room -= std::min(room, L[(size_t) il].blob);   // (the cache's spare slot)
+            // (the cache's spare slot: one move at a time a layer - the hot expert lands in it, the cold one's slot is
+            //  the next spare)
+            for (int il = gp.l0; il < gp.l1; ++il) room -= std::min(room, L[(size_t) il].blob);
             struct Cand {
                 uint32_t cnt;
                 int e, il;
@@ -891,7 +898,7 @@ struct Model::Impl {
                 auto run = [&]() -> bool {
                     std::string& err = e;
                     CK(cudaSetDevice(gp.dev));
-                    gp.stage_bytes = (size_t) 256 << 20;
+                    gp.stage_bytes = (size_t) 256 << 20;   // (the load's pinned staging at least; MEASURE)
                     for (int il = gp.l0; il < gp.l1; ++il) gp.stage_bytes = std::max(gp.stage_bytes, L[(size_t) il].blob);
                     CK(cudaMallocHost((void**) &gp.stage, gp.stage_bytes));
                     if (!scratch(gp, gi + 1 == G.size(), e) || !chunk_scratch(gp, e)) return false;
@@ -961,9 +968,10 @@ struct Model::Impl {
                 CK(cudaSetDevice(G[gi].dev));
                 CK(cudaStreamCreateWithFlags(&G[gi].s3, cudaStreamNonBlocking));
                 G[gi].blob_max = std::max<size_t>(G[gi].blob_max, 1);
-                CK(cudaMallocHost((void**) &G[gi].h_swap, G[gi].blob_max * 16));
+                CK(cudaMallocHost((void**) &G[gi].h_swap, G[gi].blob_max * 16));   // (16: swap_poll's most moves a round)
                 G[gi].sw_thread = std::thread([this, gi] { swap_run(gi); });
             }
+        // (at least one move; above 16 swap_poll's bounce cap takes it)
         if (const char* e = std::getenv("INKLING2_SWAP_BATCH")) swap_batch = std::max(1, std::min(64, std::atoi(e)));
         if (const char* e = std::getenv("INKLING2_SWAP_BURST_MS")) burst_s = std::atof(e) * 1e-3;
         if (!fast_init(err)) return false;
@@ -1324,7 +1332,7 @@ struct Model::Impl {
         else if (tok_type == 14) dequantize_row_q6_K(row, h_x, E);
         else std::memcpy(h_x, row, (size_t) E * 4);
         int nb = 0;
-        use_decay(0.995f);
+        use_decay(0.995f);   // (a token's decay of the heat: MEASURE against maya-ds4's x0.9 every 256 tokens)
         if (!swap_poll(err)) return false;
         hw = std::max(hw, p + 1);
         const int slot = p % kSnapEvery == 0 || snap_next ? snap_alloc(p) : -1;
@@ -1381,6 +1389,8 @@ struct Model::Impl {
     int win_tops[16];
     int64_t win_p0 = -1;            // the last window's first position and rows (keep cuts back to them); -1: none
     int win_T = 0;
+    // a window's rows at most: a round takes 8 (the anchor and 7 drafts, mtp_config.block_size 8); the 9th only
+    // --window-test's 9-row window uses
     static constexpr int kWin = 9;
     // the drafter (Options::dspark_index): its taps out of every step and prompt chunk, fed once the rows are kept
     std::unique_ptr<Dspark> ds;
@@ -1484,7 +1494,7 @@ struct Model::Impl {
     float *h_xw = nullptr, *h_wtop = nullptr, *h_wlog = nullptr;
     float* job_logits = nullptr;
     unsigned *f_pub = nullptr, *f_cpu = nullptr, *f_hand = nullptr;   // (mapped host memory: a line a flag)
-    static constexpr int kLine = 16;
+    static constexpr int kLine = 16;   // (16 unsigned = 64 bytes, a cache line: each flag on its own line)
     double fast_s = 0, fast_enq_s = 0, lane_work_s = 0, lane_wait_s = 0;
     int64_t fast_n = 0;
     bool fast_ready = false;
@@ -1559,7 +1569,9 @@ struct Model::Impl {
         for (;;) {
             for (unsigned idle = 0; lane_seq.load(std::memory_order_acquire) == at; ++idle) {
                 if (lane_quit.load()) return;
-                if (idle < 20000) std::this_thread::yield();   // (between two tokens: awake; no request: asleep)
+                // (between two tokens: awake; no request: asleep - MEASURE: decode tok/s against CPU use; maya-ds4's
+                //  workers spin DS4_LANE_SPIN_US, 20000 us)
+                if (idle < 20000) std::this_thread::yield();
                 else std::this_thread::sleep_for(std::chrono::microseconds(200));
             }
             const unsigned v = lane_seq.load();
@@ -2019,6 +2031,7 @@ struct Model::Impl {
         if (!taps_flush(err)) return false;   // (the rows the last step left for the drafter: its buffer is the other one)
         use_decay(T == 1 ? 0.995f : std::pow(0.995f, (float) T));
         // (a window: its moves a batch as large as its rows' steps would have had, 16 at most)
+        // (a window's rows route up to T tokens' worth: up to 4 of them count, at most the bounce's 16)
         if (!swap_poll(err, std::min(16, swap_batch * std::min(T, 4)))) return false;
         hw = std::max(hw, p0 + T);
         job_slot = snap_next || p0 / kSnapEvery != (p0 + T - 1) / kSnapEvery || p0 % kSnapEvery == 0 ? snap_alloc(p0) : -1;
@@ -2329,6 +2342,7 @@ struct Model::Impl {
         }
         int mr = 0;
         std::vector<int> u;   // (the RAM experts routed to, in their RAM slots' order)
+        // (a prompt chunk's routings weighted min(1, 64 / T): MEASURE)
         for (int e = 0; e < ne; ++e) l.use[(size_t) e] += (float) cnt[(size_t) e] * std::min(1.0f, 64.0f / (float) T);
         for (int e = 0; e < ne; ++e) {
             if (l.slot_of[(size_t) e] >= 0) mr = std::max(mr, cnt[(size_t) e]);
@@ -2633,6 +2647,7 @@ struct Model::Impl {
                         }
                     }
                     if (hot < 0 || cold < 0) continue;
+                    // (the swap rule: MEASURE against maya-ds4's heat > coldest x 1.25 + 1.0)
                     const float gain = l.use[(size_t) hot] - 1.5f * l.use[(size_t) cold] - 0.5f;
                     if (gain > 0.0f) c.push_back({gain, {il, hot, cold, l.ram_of[(size_t) hot]}});
                 }
@@ -2651,7 +2666,7 @@ struct Model::Impl {
     bool swap_burst(std::string& err) {
         if (!swap_on()) return true;
         const double t0 = now_s();
-        for (int round = 0; round < 48 && now_s() - t0 < burst_s; ++round) {
+        for (int round = 0; round < 48 && now_s() - t0 < burst_s; ++round) {   // (48 x 64: MEASURE, off while burst_s 0)
             if (!swap_poll(err, 64)) return false;
             bool any = false;
             for (Gpu& gp : G) {
@@ -2674,6 +2689,7 @@ struct Model::Impl {
     }
 
     // ---- rewinds: the histories saved at positions (a ring of kSnaps slots, the same slot in every layer) -------------
+    // (96 x 64 = 6144 decoded positions, more than the 4096 a rewind reaches; the cadence: MEASURE)
     static constexpr int kSnaps = 96, kSnapEvery = 64;
     int64_t snap_pos[kSnaps];
     int snap_head = 0;
@@ -2804,7 +2820,7 @@ struct Model::Impl {
             return rewind(p0, true, at, err);
         }
         snap_next = true;
-        if (n >= 64 && !swap_burst(err)) return false;
+        if (n >= 64 && !swap_burst(err)) return false;   // (prompts of 64 tokens on: MEASURE)
         for (Gpu& gp : G) {
             st.streamed += gp.n_streamed;
             st.experts += gp.n_experts;
@@ -2891,7 +2907,7 @@ bool Model::load(const Options& o, std::string& err) {
     // short chunk whose state is wiped after it
     if (m->Tc > 1 && !std::getenv("INKLING2_NO_WARMUP")) {
         const double t0 = now_s();
-        std::vector<int> ids((size_t) std::min(m->Tc, 256), 0);
+        std::vector<int> ids((size_t) std::min(m->Tc, 256), 0);   // (the warm-up's chunk: MEASURE)
         const std::vector<uint32_t> keep = m->prof_cnt;
         std::vector<std::vector<float>> use;   // (the dummy chunk's routings are no one's: the cache does not see them)
         for (const auto& l : m->L) use.push_back(l.use);
