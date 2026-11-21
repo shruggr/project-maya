@@ -98,9 +98,11 @@ IK2_DSPARK = "maya-inkling2-dspark-q8_0"
 IK2_KV_BYTES = 8 * 2 * 8 * 128 * 2
 IK2_ATTN_BYTES = 48 * (128 + 2) * 4 // 16
 IK2_DSPARK_KV_BYTES = 2 * 8 * 128 * 2 + 8 * 48 * (4 + 2)
-# the drafter's VRAM on the last GPU at a context of 32768, GB: the engine's Options::dspark_reserve_gb - the drafter
-# reports 3.09 GB there (docs/INKLING2_DSPARK.md, "In the engine"); the setup and the page say this one figure
-IK2_DSPARK_GB = 3.09
+# the drafter's VRAM on the last GPU at a context of 32768, GB: measured - that GPU's free VRAM after the load's
+# warm-up with the drafter and without it (3314 MiB: its own 3162.5, its BLAS, stream and kernels 151.5 - docs/
+# INKLING2_AMD.md, "VRAM"); the engine places its experts after the drafter, so it needs no figure; the setup and the
+# page say this one
+IK2_DSPARK_GB = 3.47
 HY4_KV_BYTES = 13 * (2 * (512 + 64) + 128 * 4 // 4)   # (maya.py's: its cache a context token, on each GPU of a group)
 HY4_Q4_CONTEXTS = [32768, 65536, 131072, 262144]   # AngelSlim's Q4_K_M: the setup's choices for it (maya.py's HY4_Q4_CONTEXTS)
 # (... and its longer ones, up to the model's 1M, where the cache in the engine's smaller rows is at most this share of

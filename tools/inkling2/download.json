@@ -1,5 +1,5 @@
 {
- "_": "Inkling 2 Small's files for its AMD engine, maya-inkling2 (docs/INKLING2_AMD.md): unsloth's UD-Q2_K_XL GGUF set (tools/inkling2/pack_gguf.py packs it in place), and the model's DSpark drafter - Thinking Machines' own mtp.safetensors with the config.json that describes it (tools/inkling2/convert_dspark.py makes the engine's Q8_0 copy and its index, docs/INKLING2_DSPARK.md). Each file: [bytes, sha256], at the pinned revision. \"memory_gb\": the VRAM + RAM (GiB) that hold the whole model, the context aside - ceil(these files' 190.9 GiB + the engine's 8 GiB RAM margin + the drafter's 2.9 GiB): its experts outside VRAM are copied into RAM, never read from the SSD (maya.py's IK2_MEMORY_GB says where each part comes from).",
+ "_": "Inkling 2 Small's files for its AMD engine, maya-inkling2 (docs/INKLING2_AMD.md): unsloth's UD-Q2_K_XL GGUF set (tools/inkling2/pack_gguf.py packs it in place), and the model's DSpark drafter - Thinking Machines' own mtp.safetensors with the config.json that describes it (tools/inkling2/convert_dspark.py makes the engine's Q8_0 copy and its index, docs/INKLING2_DSPARK.md). Each file: [bytes, sha256], at the pinned revision. \"memory_gb\": the VRAM + RAM (GiB) that hold the whole model, the context aside - ceil(these files' 190.9 GiB + the engine's 8 GiB RAM margin + the drafter's 3.2 GiB): its experts outside VRAM are copied into RAM, never read from the SSD (maya.py's IK2_MEMORY_GB says where each part comes from).",
  "repo": "unsloth/Inkling-2-Small-GGUF",
  "revision": "3428220b50899e44a7f484c0d8a997e7ac2e9515",
  "quants": {
@@ -31,7 +31,7 @@
      "df70ea85f7308b2ab555b17d4876e7c0cbc963c4365df17f46d14c7a82927b66"
     ]
    },
-   "memory_gb": 202
+   "memory_gb": 203
   }
  },
  "drafter": {

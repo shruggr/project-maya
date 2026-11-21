@@ -684,8 +684,8 @@ int usage() {
                  "  --tokens-file F     (tests) a prompt a line; with --profile-out: a corpus' routings\n"
                  "  --serve             the server's line protocol on stdin / stdout (docs/INKLING2_AMD.md, \"Serving\")\n"
                  "  --rewind N          positions a rewind may go back without reading the prompt again (default 4096)\n"
-                 "  --short-prompt N    (serve) a prompt's unread tokens up to N take the decode path (default 3: measured,\n"
-                 "                      the prompt path is faster from about 4 tokens on)\n"
+                 "  --short-prompt N    (serve) a prompt's unread tokens up to N take the decode path (default 4: measured,\n"
+                 "                      the prompt path is faster from 5 tokens on)\n"
                  "  --eos a,b           (serve) the ids that end an answer (default 200006,199999)\n"
                  "  --window-test DIR   (tests) a verify window of 9 rows after a reference's prompt against 9 token steps,\n"
                  "                      a window cut back, a window's time for 1 .. 9 rows\n"
@@ -1035,7 +1035,7 @@ int main(int argc, char** argv) {
         // --short-bench: n tokens after a held context (the --tokens prompt), through the prompt path and through the
         // decode path - where the two cross is serve's --short-prompt
         std::vector<int> ids = int_list(tokens);
-        for (int n : {8, 16, 24, 32, 48, 64, 128, 256}) {
+        for (int n : {1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32, 64}) {
             if ((size_t) n * 2 > ids.size()) break;
             const size_t base = ids.size() - (size_t) n;
             double tp = 0, td = 0;
@@ -1094,6 +1094,7 @@ int main(int argc, char** argv) {
             std::printf("prompt: %zu tokens, %.2f s, %.2f tok/s (%lld experts streamed from RAM so far)\n", ids.size(), t1 - t0,
                         ids.size() / (t1 - t0), (long long) model.stats().streamed);
             std::fflush(stdout);
+            model.vram_notes("after a prompt");
         }
         const int64_t cpu0 = model.stats().cpu_experts, ex0 = model.stats().experts;
         const double cms0 = model.stats().cpu_ms;
@@ -1139,6 +1140,7 @@ int main(int argc, char** argv) {
         }
         const double t2 = now_s();
         const inkling2::Stats& st = model.stats();
+        model.vram_notes(dr.on ? "after a drafted decode" : "after a decode");
         if (n > 0) {
             std::printf("\ndecode: %d tokens, %.2f tok/s; %.1f%% of the routed experts on the CPU lane (%.1f ms a token), %lld "
                         "cache moves\n",

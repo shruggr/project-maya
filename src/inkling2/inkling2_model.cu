@@ -119,6 +119,10 @@ struct Gpu {
     cudaStream_t s = nullptr;
     std::vector<void*> allocs;
     size_t used = 0, free0 = 0, total = 0;
+    size_t gran = (size_t) 2 << 20;   // (the runtime's rounding of an allocation over 1 MiB: measured at the load)
+    size_t free_plan = 0;             // (free when the experts were placed)
+    size_t expert_alloc = 0;          // (the experts' one allocation, every layer's spare slot in it)
+    uint8_t* h_dummy = nullptr;       // (the warm-up's one zero expert, pinned: every layer's experts before place)
     int l0 = 0, l1 = 0;           // its layers [l0, l1)
     size_t expert_bytes = 0;
     int n_res = 0;
@@ -198,6 +202,19 @@ struct Gpu {
             }
         }
         return true;
+    }
+
+    // INKLING2_VRAM_LOG=1 (tests): this GPU's VRAM at a stage - free, this engine's own allocations (`extra`: the
+    // drafter's), and what left the GPU besides them since the start (free0)
+    void note(const char* what, size_t extra = 0) const {
+        static const bool on = std::getenv("INKLING2_VRAM_LOG") != nullptr;
+        if (!on) return;
+        size_t fr = 0, tot = 0;
+        cudaSetDevice(dev);
+        cudaMemGetInfo(&fr, &tot);
+        std::fprintf(stderr, "VRAM GPU %d %-34s free %9.1f MiB, ours %9.1f MiB (%zu allocations), other %8.1f MiB\n", dev,
+                     what, fr / 1048576.0, (used + extra) / 1048576.0, allocs.size(),
+                     ((double) free0 - (double) fr - (double) (used + extra)) / 1048576.0);
     }
 
     template <typename T>
@@ -416,20 +433,10 @@ struct Model::Impl {
 
     size_t tensor_bytes(const std::string& n) const {
         const Tensor* t = pk.get(n);
-        return t ? (size_t) t->bytes * (t->type == "BF16" ? 2 : 1) + 256 : 0;   // (+ alloc's 256-byte rounding; MEASURE)
+        return t ? (size_t) t->bytes * (t->type == "BF16" ? 2 : 1) : 0;
     }
     size_t cache_rows(int il) const { return g.swa[(size_t) il] ? (size_t) (g.n_swa + o.rewind + Tc) : (size_t) o.max_ctx; }
     int n_states() const { return (g.n_layer + g.res_block - 1) / g.res_block; }
-    // the prompt path's VRAM a GPU: a chunk's activations and operands, the attention's scores, the staging buffers
-    size_t chunk_bytes(size_t blob_max) const {   // (blob_max: its layers' largest expert)
-        if (Tc <= 0) return 0;
-        const size_t T = (size_t) Tc, E = (size_t) g.n_embd, HD = (size_t) g.n_head * g.head_dim, nu = (size_t) g.n_used;
-        const size_t fl = T * ((1 + n_states() + 3 + 3 + 2 + 1 + 2) * E + 5 * HD + (size_t) g.n_head * (g.d_rel + 1) +
-                               4 * (size_t) g.n_head_kv * g.head_dim + 64 + (size_t) g.n_expert + 4 * nu + 2 * nu * E +
-                               4 * k::kMaxStates);
-        return fl * 4 + T * HD * 2 + HD * E * 2 + T * nu * (size_t) g.n_ff_exp * 2 + S_n() * 6 +
-               (size_t) kTsMax * g.n_head * g.rel_extent * 4 + 2 * (size_t) kStage * blob_max + ((size_t) 32 << 20);   // (+ slack; MEASURE)
-    }
     // the attention's scores (F32, and their F16 copy beside): floats.  A pass of ts tokens over nk keys takes
     // n_head x ts x nk of them (attention_rows halves ts until it fits), so they must hold one token over every key
     // the context has, n_head x max_keys (48 x 1M = 50.3M at the model's 1M) - 44 Mi floats alone stop a prompt at
@@ -485,7 +492,7 @@ struct Model::Impl {
         for (auto it = pk.t.lower_bound(p); it != pk.t.end() && it->first.compare(0, p.size(), p) == 0; ++it)
             if (it->first.find("_exps.") == std::string::npos) b += tensor_bytes(it->first);
         const size_t kvd = (size_t) g.n_head_kv * g.head_dim;
-        b += cache_rows(il) * kvd * 2 * 2 + (size_t) (1 + kSnaps) * hist_n() * 4 + 4096;   // (+ slack a layer; MEASURE)
+        b += cache_rows(il) * kvd * 2 * 2 + (size_t) (1 + kSnaps) * hist_n() * 4;   // (the split's weights only)
         return b;
     }
     // the geometry of a layer's expert blobs (no data)
@@ -530,12 +537,6 @@ struct Model::Impl {
                                     k::attention_split_floats(g.n_head, g.head_dim, (int64_t) max_keys));
         return std::max(one, (size_t) 9 * g.n_head * (4096 / 16 + 2) * (size_t) (g.head_dim + 2));
     }
-    size_t scratch_bytes() const {
-        const size_t E = (size_t) g.n_embd, HD = (size_t) g.n_head * g.head_dim, nu = (size_t) g.n_used;
-        return (size_t) 4 * ((2 + k::kMaxStates + 3 + 3 + 6) * E + 3 * HD + S_need() +
-                             nu * (size_t) (2 * g.n_ff_exp + g.n_ff_exp + g.n_embd) + (size_t) g.n_vocab) +
-               nu * E * 2 + ((size_t) 64 << 20);   // (+ slack; MEASURE)
-    }
     bool scratch(Gpu& gp, bool last, std::string& err) {
         const size_t E = (size_t) g.n_embd, HD = (size_t) g.n_head * g.head_dim, nu = (size_t) g.n_used;
         const size_t kvd = (size_t) g.n_head_kv * g.head_dim, ff = (size_t) g.n_ff_exp;
@@ -555,12 +556,6 @@ struct Model::Impl {
                (!last || gp.alloc(gp.logits, (size_t) g.n_vocab, err));
     }
 
-    // The drafter's VRAM on the last GPU: Options::dspark_reserve_gb is its measure at a context of 32768; a position
-    // more costs its global layer's K / V rows (F16) and its attention's score rows (Dspark::ctx_bytes)
-    size_t dspark_bytes() const {
-        return (size_t) (o.dspark_reserve_gb * 1e9) +
-               (size_t) std::max<int64_t>(0, o.max_ctx - 32768) * Dspark::ctx_bytes();
-    }
     // RAM left to the rest (the system, the page cache's churn): 8 GiB, or INKLING2_RAM_MARGIN_GB=<GiB> (0 to 4096; read
     // once, logged once; an unreadable value keeps the 8) - maya-ds4's ram_margin and its DS4_RAM_MARGIN_GB
     static uint64_t ram_margin() {
@@ -577,9 +572,8 @@ struct Model::Impl {
         }();
         return m;
     }
-    // The plan: the layers over the GPUs by their bytes, then each GPU's room filled with its layers' experts - the
-    // most routed first by the profile (none: each layer's first ones, the layers in turn)
-    bool plan(std::string& err) {
+    // The split: the layers over the GPUs by their bytes (--layer-split sets it by hand)
+    bool split(std::string& err) {
         const int ng = (int) G.size();
         std::vector<size_t> all((size_t) NL);
         size_t total = 0;
@@ -592,6 +586,8 @@ struct Model::Impl {
             l.dense = dense_bytes(il);
             all[(size_t) il] = l.dense + l.blob * (size_t) g.n_expert;
             total += all[(size_t) il];
+            l.slot_of.assign((size_t) g.n_expert, -1);
+            l.ram_of.assign((size_t) g.n_expert, -1);
         }
         for (const Layer& l : L) blob_max = std::max(blob_max, l.blob);
         std::vector<int> first((size_t) ng + 1, NL);
@@ -610,27 +606,44 @@ struct Model::Impl {
                 while (gi < ng && acc * (size_t) ng >= total * (size_t) gi) first[(size_t) gi++] = il + 1;
             }
         }
-        const size_t head_bytes = tensor_bytes("output.weight") + (size_t) 8 * g.n_embd;
         st.experts_all = NL * g.n_expert;
         for (int gi = 0; gi < ng; ++gi) {
             Gpu& gp = G[(size_t) gi];
             gp.l0 = first[(size_t) gi];
             gp.l1 = first[(size_t) gi + 1];
             gp.blob_max = 1;
-            for (int il = gp.l0; il < gp.l1; ++il) gp.blob_max = std::max(gp.blob_max, L[(size_t) il].blob);
-            size_t fixed = scratch_bytes() + chunk_bytes(gp.blob_max) + (gi == ng - 1 ? head_bytes : 0) + ((size_t) o.reserve_mib << 20) +
-                           (gi == ng - 1 && !o.dspark_index.empty() ? dspark_bytes() : 0);
-            for (int il = gp.l0; il < gp.l1; ++il) fixed += L[(size_t) il].dense;
-            if (fixed > gp.free0) {
-                err = "GPU " + std::to_string(gp.dev) + ": " + std::to_string(gp.free0 >> 20) + " MiB free, layers " +
-                      std::to_string(gp.l0) + " .. " + std::to_string(gp.l1 - 1) + " need " + std::to_string(fixed >> 20) +
-                      " MiB without any expert (fewer layers on it: --layer-split, or a smaller --max-context)";
+            for (int il = gp.l0; il < gp.l1; ++il) {
+                gp.blob_max = std::max(gp.blob_max, L[(size_t) il].blob);
+                L[(size_t) il].gpu = gi;
+            }
+        }
+        return true;
+    }
+    // The experts' plan, each GPU on its own (maya-ds4's place_experts: the experts take what is left): what the GPU
+    // has free now - every other allocation of the engine made (its layers' dense tensors and caches, the scratch, the
+    // drafter) and the runtime's own taken (warm_up: the BLAS's workspace and kernels, the kernels' code, their
+    // scratch) - less reserve_mib, filled with its layers' experts, the most routed first by the profile (none: each
+    // layer's first ones, the layers in turn), each layer a spare slot more.  A GPU's experts are one allocation, which
+    // the runtime rounds up to its granularity (gran, measured at the load)
+    bool place(std::string& err) {
+        const uint64_t keep = (uint64_t) std::max<int64_t>(0, o.reserve_mib) << 20;
+        for (size_t gi = 0; gi < G.size(); ++gi) {
+            Gpu& gp = G[gi];
+            CK(cudaSetDevice(gp.dev));
+            size_t fr = 0, tot = 0;
+            CK(cudaMemGetInfo(&fr, &tot));
+            gp.free_plan = fr;
+            auto rounded = [&](size_t b) { return (b + gp.gran - 1) / gp.gran * gp.gran; };
+            size_t need = 0;   // (the experts' allocation: every layer's spare slot, then the experts placed)
+            for (int il = gp.l0; il < gp.l1; ++il) need += L[(size_t) il].blob;
+            if ((uint64_t) rounded(need) + keep > fr) {
+                err = "GPU " + std::to_string(gp.dev) + ": " + std::to_string(fr >> 20) + " MiB free with layers " +
+                      std::to_string(gp.l0) + " .. " + std::to_string(gp.l1 - 1) + " in place without their experts, " +
+                      std::to_string(o.reserve_mib) + " MiB to keep free: no room for the experts (fewer layers on it: "
+                      "--layer-split, or a smaller --max-context)";
                 return false;
             }
-            size_t room = gp.free0 - fixed;
-            // (the cache's spare slot: one move at a time a layer - the hot expert lands in it, the cold one's slot is
-            //  the next spare)
-            for (int il = gp.l0; il < gp.l1; ++il) room -= std::min(room, L[(size_t) il].blob);
+            const size_t room = fr - (size_t) keep;
             struct Cand {
                 uint32_t cnt;
                 int e, il;
@@ -638,10 +651,6 @@ struct Model::Impl {
             std::vector<Cand> c;
             const int cap = std::max(0, std::min(g.n_expert, (int) std::lround(o.vram_experts * g.n_expert)));
             for (int il = gp.l0; il < gp.l1; ++il) {
-                Layer& l = L[(size_t) il];
-                l.gpu = gi;
-                l.slot_of.assign((size_t) g.n_expert, -1);
-                l.ram_of.assign((size_t) g.n_expert, -1);
                 const bool pr = (size_t) (il + 1) * g.n_expert <= prof_in.size();
                 for (int e = 0; e < g.n_expert; ++e)
                     c.push_back({pr ? prof_in[(size_t) il * g.n_expert + e] : 0u, e, il});
@@ -654,11 +663,12 @@ struct Model::Impl {
             std::vector<int> n_in((size_t) NL, 0);
             for (const Cand& x : c) {
                 Layer& l = L[(size_t) x.il];
-                if (l.blob > room || n_in[(size_t) x.il] >= cap) continue;
-                room -= l.blob;
+                if (n_in[(size_t) x.il] >= cap || rounded(need + l.blob) > room) continue;
+                need += l.blob;
                 l.slot_of[(size_t) x.e] = 0;   // (numbered below, in the experts' order)
                 ++n_in[(size_t) x.il];
             }
+            gp.expert_alloc = need;
             for (int il = gp.l0; il < gp.l1; ++il) {
                 Layer& l = L[(size_t) il];
                 int ns = 0, nr = 0;
@@ -684,7 +694,8 @@ struct Model::Impl {
         return true;
     }
 
-    bool load_layer(Layer& l, Gpu& gp, std::string& err) {
+    // a layer's every tensor but its routed experts, its caches and histories (the experts: load_experts, after place)
+    bool load_dense(Layer& l, Gpu& gp, std::string& err) {
         const std::string p = "blk." + std::to_string(l.il) + ".";
         const int E = g.n_embd, HD = g.n_head * g.head_dim, kvd = g.n_head_kv * g.head_dim;
         bool ok = true;
@@ -727,11 +738,17 @@ struct Model::Impl {
             !zeros(gp, l.hist_a, (size_t) 3 * E, err) || !zeros(gp, l.hist_f, (size_t) 3 * E, err) ||
             !gp.alloc(l.K, rows * kvd, err) || !gp.alloc(l.V, rows * kvd, err) || !gp.alloc(l.snap, (size_t) kSnaps * hist_n(), err))
             return false;
-        if (!gp.alloc(l.slot_d, (size_t) g.n_expert, err) ||
-            !gp.h2d(l.slot_d, l.slot_of.data(), sizeof(int) * (size_t) g.n_expert, err))
-            return false;
-        // the experts in VRAM, 32 a copy
-        if (!gp.alloc(l.experts, l.blob * (size_t) (l.n_res + 1), err)) return false;
+        l.use.assign((size_t) g.n_expert, 0.0f);   // (the warm-up's routings land here: put back after it)
+        return gp.alloc(l.slot_d, (size_t) g.n_expert, err) &&
+               gp.h2d(l.slot_d, l.slot_of.data(), sizeof(int) * (size_t) g.n_expert, err);
+    }
+    // its routed experts: the VRAM ones at `at` (its share of the GPU's experts' allocation, n_res + 1 blobs: the
+    // cache's spare slot), the others copied into RAM
+    bool load_experts(Layer& l, Gpu& gp, uint8_t* at, std::string& err) {
+        const std::string p = "blk." + std::to_string(l.il) + ".";
+        const int E = g.n_embd;
+        if (!gp.h2d(l.slot_d, l.slot_of.data(), sizeof(int) * (size_t) g.n_expert, err)) return false;
+        l.experts = at;
         l.spare = l.n_res;
         l.use.assign((size_t) g.n_expert, 0.0f);
         if ((size_t) (l.il + 1) * g.n_expert <= prof_in.size()) {   // (the profile as the counts' start, at most 1)
@@ -826,6 +843,99 @@ struct Model::Impl {
         return true;
     }
 
+    // the runtime's rounding of an allocation over 1 MiB (here, ROCm 7 on an R9700: whole 2 MiB pages), measured -
+    // what two probe allocations take of the free VRAM: the smallest power of two from 4 KiB that rounds both so (none:
+    // the larger of the two, which no rounding of the experts' one allocation can pass)
+    bool granule(Gpu& gp, std::string& err) {
+        const size_t probe[2] = {((size_t) 1 << 20) + 1, ((size_t) 2 << 20) + 1};   // (2 MiB + 1: 3 MiB in 1 MiB pages)
+        size_t took[2] = {0, 0};
+        for (int i = 0; i < 2; ++i) {
+            size_t a = 0, b = 0, t = 0;
+            void* v = nullptr;
+            CK(cudaMemGetInfo(&a, &t));
+            CK(cudaMalloc(&v, probe[i]));
+            CK(cudaMemGetInfo(&b, &t));
+            CK(cudaFree(v));
+            took[i] = a > b ? a - b : 0;
+        }
+        auto up = [](size_t x, size_t q) { return (x + q - 1) / q * q; };
+        for (size_t q = 4096; q <= ((size_t) 64 << 20); q *= 2)
+            if (up(probe[0], q) == took[0] && up(probe[1], q) == took[1]) {
+                gp.gran = q;
+                return true;
+            }
+        gp.gran = std::max({took[0], took[1], (size_t) 4096});
+        return true;
+    }
+    // The runtime's own VRAM taken before the experts are placed, so that place counts it: the prompt path's first
+    // run makes the BLAS load its kernels and the runtime the kernels' code and their scratch (and pays the seconds a
+    // first run takes) - a dummy chunk through every layer, each layer's experts one zero blob in pinned memory (every
+    // pick streamed from it), the drafter fed and asked once; the state wiped after it, the counts as they were
+    // dummy false: the same chunk once the experts are in place - the first run of their own layout (the VRAM experts'
+    // sets) pays seconds more, here and not in the first prompt
+    bool warm_up(std::string& err, bool dummy = true) {
+        if (Tc <= 1 || std::getenv("INKLING2_NO_WARMUP")) return true;
+        const double t0 = now_s();
+        if (!dummy) {
+            const std::vector<uint32_t> keep = prof_cnt;
+            std::vector<std::vector<float>> use;
+            for (const Layer& l : L) use.push_back(l.use);
+            const Stats st0 = st;
+            const bool sw = o.expert_cache;
+            o.expert_cache = false;
+            std::vector<int> ids((size_t) std::min(Tc, warm_n), 0);
+            const bool ok = prompt(ids.data(), (int) ids.size(), 0, nullptr, err) && reset(err);
+            o.expert_cache = sw;
+            prof_cnt = keep;
+            st = st0;
+            for (size_t i = 0; i < use.size(); ++i) L[i].use = use[i];
+            for (Gpu& gp : G) gp.n_streamed = gp.n_experts = 0;
+            if (o.verbose) std::fprintf(stderr, "the warm-up with the experts in place: %.1f s\n", now_s() - t0);
+            return ok;
+        }
+        for (Gpu& gp : G) {
+            CK(cudaSetDevice(gp.dev));
+            CK(cudaMallocHost((void**) &gp.h_dummy, gp.blob_max));
+            std::memset(gp.h_dummy, 0, gp.blob_max);
+        }
+        for (Layer& l : L) {
+            l.n_res = 0;
+            l.ram = G[(size_t) l.gpu].h_dummy;
+            l.experts = G[(size_t) l.gpu].xstage[0];   // (never read: no expert is in a VRAM slot)
+            std::fill(l.ram_of.begin(), l.ram_of.end(), 0);
+        }
+        const std::vector<uint32_t> keep = prof_cnt;
+        const Stats st0 = st;
+        const bool sw = o.expert_cache;
+        o.expert_cache = false;
+        std::vector<int> ids((size_t) std::min(Tc, warm_n), 0);
+        bool ok = prompt(ids.data(), (int) ids.size(), 0, nullptr, err);
+        if (ok && ds) {
+            n_end = (int64_t) ids.size();
+            std::vector<int> t;
+            std::vector<float> pr;
+            ok = ds->draft(0, Dspark::kBlock - 1, t, pr, err);
+        }
+        ok = ok && reset(err);
+        o.expert_cache = sw;
+        prof_cnt = keep;
+        st = st0;
+        for (Layer& l : L) {
+            l.ram = nullptr;
+            l.experts = nullptr;
+            std::fill(l.ram_of.begin(), l.ram_of.end(), -1);
+            l.use.assign((size_t) g.n_expert, 0.0f);
+        }
+        for (Gpu& gp : G) {
+            CK(cudaFreeHost(gp.h_dummy));
+            gp.h_dummy = nullptr;
+            gp.n_streamed = gp.n_experts = 0;
+        }
+        if (o.verbose) std::fprintf(stderr, "the warm-up: %zu tokens in %.1f s\n", ids.size(), now_s() - t0);
+        return ok;
+    }
+    int warm_n = 256;   // (the warm-up's tokens, at most a chunk)
+
     bool load(const Options& opt, std::string& err) {
         const double t0 = now_s();
         o = opt;
@@ -854,8 +964,15 @@ struct Model::Impl {
             }
             G[i].dev = devs[i];
             CK(cudaSetDevice(devs[i]));
+            size_t f_pre = 0;
+            CK(cudaMemGetInfo(&f_pre, &G[i].total));
             CK(cudaStreamCreateWithFlags(&G[i].s, cudaStreamNonBlocking));
             CK(cudaMemGetInfo(&G[i].free0, &G[i].total));
+            if (!granule(G[i], err)) return false;
+            if (std::getenv("INKLING2_VRAM_LOG"))
+                std::fprintf(stderr, "VRAM GPU %d at the start: free %.1f MiB, %.1f MiB after its first stream; allocations "
+                             "over 1 MiB rounded to %zu KiB\n", G[i].dev, f_pre / 1048576.0, G[i].free0 / 1048576.0,
+                             G[i].gran >> 10);
         }
         // the expert profile (maya-ds4's: <pack>/expert-profile.bin unless --expert-profile names one, "none" none):
         // read when it is there and whole, else the counts start from nothing - written back either way
@@ -872,9 +989,7 @@ struct Model::Impl {
         prof_cnt.assign((size_t) g.n_layer * g.n_expert, 0);
         h_rl.assign((size_t) g.n_expert, 0.0f);
         L.resize((size_t) NL);
-        if (!plan(err)) return false;
-        if (o.verbose)
-            for (const std::string& s : info_lines()) std::fprintf(stderr, "%s\n", s.c_str());
+        if (!split(err)) return false;
         // the embedding table in RAM (a row a token decoded on the host)
         {
             const Tensor* t = need("token_embd.weight", err);
@@ -901,19 +1016,22 @@ struct Model::Impl {
                     gp.stage_bytes = (size_t) 256 << 20;   // (the load's pinned staging at least; MEASURE)
                     for (int il = gp.l0; il < gp.l1; ++il) gp.stage_bytes = std::max(gp.stage_bytes, L[(size_t) il].blob);
                     CK(cudaMallocHost((void**) &gp.stage, gp.stage_bytes));
-                    if (!scratch(gp, gi + 1 == G.size(), e) || !chunk_scratch(gp, e)) return false;
+                    gp.note("after the load's pinned stage");
+                    if (!scratch(gp, gi + 1 == G.size(), e)) return false;
+                    gp.note("after the decode scratch");
+                    if (!chunk_scratch(gp, e)) return false;
+                    gp.note("after the prompt path's scratch");
                     if (gi == 0 && !f32(gp, "token_embd_norm.weight", tok_norm, e, g.n_embd)) return false;
                     if (gi + 1 == G.size() &&
                         (!mat(gp, "output.weight", head, e, g.n_embd, g.n_vocab) ||
                          !f32(gp, "output_norm.weight", out_norm, e, g.n_embd) ||
                          !f32(gp, "output_res_query.weight", out_res, e, g.n_embd)))
                         return false;
-                    for (int il = gp.l0; il < gp.l1; ++il) {
-                        if (!load_layer(L[(size_t) il], gp, e)) return false;
-                        if (o.verbose) std::fprintf(stderr, "layer %d on GPU %d (%.0f s)\n", il, gp.dev, now_s() - t0);
-                    }
-                    CK(cudaFreeHost(gp.stage));
-                    gp.stage = nullptr;
+                    gp.note("after the head");
+                    for (int il = gp.l0; il < gp.l1; ++il)
+                        if (!load_dense(L[(size_t) il], gp, e)) return false;
+                    gp.note("after its layers without experts");
+                    if (o.expert_cache) CK(cudaStreamCreateWithFlags(&gp.s3, cudaStreamNonBlocking));   // (the mover's)
                     return true;
                 };
                 oks[gi] = run() ? 1 : 0;
@@ -924,7 +1042,6 @@ struct Model::Impl {
                 err = errs[gi];
                 return false;
             }
-        if (std::getenv("INKLING2_VERIFY_LOAD") && !verify(err)) return false;
         CK(cudaSetDevice(G[0].dev));
         const size_t E = (size_t) g.n_embd;
         CK(cudaMallocHost((void**) &h_x, E * 4));
@@ -938,6 +1055,56 @@ struct Model::Impl {
         CK(cudaMallocHost((void**) &h_big, (size_t) g.n_vocab * 4));
         CK(cudaMallocHost((void**) &h_plan, 128));
         lane.reset(new hy4::Lane(o.cpu_threads > 0 ? o.cpu_threads - 1 : -1));   // (workers besides the caller)
+        if (!fast_init(err)) return false;
+        notes("after the host-free step's buffers");
+        if (Tc > 0) {
+            for (size_t gi = 0; gi < G.size(); ++gi) {
+                slots.emplace_back(new Slot);
+                CK(cudaMallocHost((void**) &slots.back()->h, (size_t) (1 + n_states()) * Tc * E * 4));
+            }
+        }
+        {   // the drafter (its load's own temporaries fit here, before the experts take the room)
+            std::string e;
+            if (!dspark_init(e)) std::fprintf(stderr, "maya-inkling2: no drafter (%s): decoding without drafts\n", e.c_str());
+        }
+        notes("after the drafter");
+        if (!warm_up(err)) return false;
+        notes("after the warm-up");
+        if (!place(err)) return false;
+        if (o.verbose)
+            for (const std::string& s : info_lines()) std::fprintf(stderr, "%s\n", s.c_str());
+        {   // each GPU's experts on a thread of its own
+            std::vector<std::thread> te;
+            for (size_t gi = 0; gi < G.size(); ++gi)
+                te.emplace_back([&, gi] {
+                    Gpu& gp = G[gi];
+                    std::string& e = errs[gi];
+                    auto run = [&]() -> bool {
+                        std::string& err = e;
+                        CK(cudaSetDevice(gp.dev));
+                        uint8_t* at = nullptr;
+                        if (!gp.alloc(at, gp.expert_alloc, err)) return false;
+                        for (int il = gp.l0; il < gp.l1; ++il) {
+                            Layer& l = L[(size_t) il];
+                            if (!load_experts(l, gp, at, err)) return false;
+                            at += l.blob * (size_t) (l.n_res + 1);
+                            if (o.verbose) std::fprintf(stderr, "layer %d on GPU %d (%.0f s)\n", il, gp.dev, now_s() - t0);
+                        }
+                        gp.note("after its experts");
+                        CK(cudaFreeHost(gp.stage));
+                        gp.stage = nullptr;
+                        return true;
+                    };
+                    oks[gi] = run() ? 1 : 0;
+                });
+            for (auto& x : te) x.join();
+            for (size_t gi = 0; gi < G.size(); ++gi)
+                if (!oks[gi]) {
+                    err = errs[gi];
+                    return false;
+                }
+        }
+        if (std::getenv("INKLING2_VERIFY_LOAD") && !verify(err)) return false;
         {   // the RAM experts registered with the driver, a thread a GPU's layers
             const double tr = now_s();
             std::vector<std::thread> rt;
@@ -963,10 +1130,10 @@ struct Model::Impl {
             for (auto& x : rt) x.join();
             if (o.verbose) std::fprintf(stderr, "RAM experts registered and streamed once in %.1f s\n", now_s() - tr);
         }
+        notes("after the RAM experts' registration");
         if (o.expert_cache && st.ram_gb > 0 && !ram_unreg.load())
             for (size_t gi = 0; gi < G.size(); ++gi) {
                 CK(cudaSetDevice(G[gi].dev));
-                CK(cudaStreamCreateWithFlags(&G[gi].s3, cudaStreamNonBlocking));
                 G[gi].blob_max = std::max<size_t>(G[gi].blob_max, 1);
                 CK(cudaMallocHost((void**) &G[gi].h_swap, G[gi].blob_max * 16));   // (16: swap_poll's most moves a round)
                 G[gi].sw_thread = std::thread([this, gi] { swap_run(gi); });
@@ -974,7 +1141,7 @@ struct Model::Impl {
         // (at least one move; above 16 swap_poll's bounce cap takes it)
         if (const char* e = std::getenv("INKLING2_SWAP_BATCH")) swap_batch = std::max(1, std::min(64, std::atoi(e)));
         if (const char* e = std::getenv("INKLING2_SWAP_BURST_MS")) burst_s = std::atof(e) * 1e-3;
-        if (!fast_init(err)) return false;
+        notes("after the cache's movers");
         st.ram_locked = st.ram_gb > 0 && !ram_unlocked.load();
         st.ram_pinned = st.ram_gb > 0 && !ram_unreg.load();
         if (Tc > 0 && st.ram_gb > 0 && !st.ram_pinned) {
@@ -982,12 +1149,8 @@ struct Model::Impl {
                                  "run token by token\n");
             Tc = 0;
         }
-        if (Tc > 0) {
-            for (size_t gi = 0; gi < G.size(); ++gi) {
-                slots.emplace_back(new Slot);
-                CK(cudaMallocHost((void**) &slots.back()->h, (size_t) (1 + n_states()) * Tc * E * 4));
-            }
-        }
+        if (!warm_up(err, false)) return false;
+        notes("after the second warm-up");
         for (const Gpu& gp : G) st.vram_gb += (double) gp.used / 1e9;
         st.load_s = now_s() - t0;
         return true;
@@ -2372,7 +2535,7 @@ struct Model::Impl {
             if (!sets(l, gp, T, gp.pmap[b], gp.xstage[b], np, pmr, true, err)) return false;
             CK(cudaEventRecord(gp.ev_done[b], s));
         }
-        if (u.size() > (size_t) 32 * kStage) {
+        if (u.size() > (size_t) g.n_expert) {
             err = "layer " + std::to_string(l.il) + ": more staging passes than the maps hold";
             return false;
         }
@@ -2861,6 +3024,10 @@ struct Model::Impl {
         return true;
     }
 
+    void notes(const char* what) const {
+        for (const Gpu& gp : G) gp.note(what, &gp == &G.back() && ds ? (size_t) (ds->stats().vram_gb * 1e9 + 0.5) : 0);
+    }
+
     std::vector<std::string> info_lines() const {
         std::vector<std::string> v;
         char b[512];
@@ -2889,43 +3056,7 @@ struct Model::Impl {
 Model::Model() : m(new Impl) {}
 Model::~Model() = default;
 
-bool Model::load(const Options& o, std::string& err) {
-    if (!m->load(o, err)) return false;
-    struct AtEnd {   // (the drafter after the warm-up below: its rows are no one's)
-        Impl* m;
-        bool* ok;
-        std::string* err;
-        ~AtEnd() {
-            if (!*ok) return;
-            std::string e;
-            if (!m->dspark_init(e)) std::fprintf(stderr, "maya-inkling2: no drafter (%s): decoding without drafts\n", e.c_str());
-        }
-    };
-    bool loaded = false;
-    AtEnd at_end{m.get(), &loaded, &err};
-    // the prompt path's first run pays for the BLAS's start and the kernels' first launches (seconds): paid here, on a
-    // short chunk whose state is wiped after it
-    if (m->Tc > 1 && !std::getenv("INKLING2_NO_WARMUP")) {
-        const double t0 = now_s();
-        std::vector<int> ids((size_t) std::min(m->Tc, 256), 0);   // (the warm-up's chunk: MEASURE)
-        const std::vector<uint32_t> keep = m->prof_cnt;
-        std::vector<std::vector<float>> use;   // (the dummy chunk's routings are no one's: the cache does not see them)
-        for (const auto& l : m->L) use.push_back(l.use);
-        const bool sw = m->o.expert_cache;
-        m->o.expert_cache = false;
-        if (!m->prompt(ids.data(), (int) ids.size(), 0, nullptr, err) || !m->reset(err)) return false;
-        m->o.expert_cache = sw;
-        for (size_t i = 0; i < use.size(); ++i) m->L[i].use = use[i];
-        m->prof_cnt = keep;
-        m->st = Stats{m->st.load_s + (now_s() - t0), m->st.vram_gb, m->st.ram_gb, m->st.ram_locked};
-        m->st.experts_vram = 0;
-        for (const auto& gp : m->G) m->st.experts_vram += gp.n_res;
-        m->st.experts_all = m->NL * m->g.n_expert;
-        m->st.ram_pinned = true;
-    }
-    loaded = true;
-    return true;
-}
+bool Model::load(const Options& o, std::string& err) { return m->load(o, err); }
 bool Model::forward(const int* ids, int n, int64_t pos0, float* logits_out, std::string& err) {
     if (pos0 != m->n_end) {
         err = "forward at position " + std::to_string(pos0) + ": the context ends at " + std::to_string(m->n_end) +

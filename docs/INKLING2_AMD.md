@@ -80,7 +80,7 @@ than an undrafted one (a poll a pass, not a token), so:
 
 Not done:
 1. Nothing overlaps the draft (8 ms on the last GPU, the others idle) with the pass that follows it.
-2. The drafter takes 3.1 GB of the last GPU (2.6 without the taps' buffers and the 32k caches): about 250 of that
+2. The drafter takes 3.3 GiB of the last GPU at 32K (measured: "VRAM" below): about 300 of that
    GPU's experts live in RAM instead.
 3. Sampled requests copy every window row's logits to the host for the verdict (0.8 MB a row).
 4. Thinking text is break-even (half of 1.5 offered drafts kept): the drafter rests there, it does not gain.
@@ -381,6 +381,55 @@ configured spare. CMake hooks: `cmake/inkling2_engine.cmake`, `cmake/inkling2_ke
 - Routing skew: on the long reference prompt the top 60% of a layer's experts take 97.5% of its picks (worst layer
   89%) - one document, so an upper bound; placement should also adapt per conversation.
 
+## VRAM: the experts take what is left (measured, 2026-11-21)
+
+The load places the routed experts last, as maya-ds4's `place_experts` does: each GPU first takes everything else -
+the decode and prompt-path scratch, its layers' dense tensors, caches and histories, the head, the host-free step's
+buffers, the drafter on the last GPU (its load's temporaries fit there, before the experts take the room) - then the
+runtime's own share is taken by a warm-up (`Impl::warm_up`: a 256-token dummy chunk through every layer, each layer's
+experts one zero blob in pinned memory, the drafter fed and asked once), and only then `Impl::place` reads the GPU's
+free VRAM and fills it, less `--reserve-mib`, with its layers' experts (the most routed by the profile first, a spare
+slot a layer). A GPU's experts are one allocation, rounded up to the runtime's granularity - measured at the load with
+two probe allocations (here 2 MiB pages: `hipMalloc` of 1 MiB + 1 takes 2 MiB, of 2 MiB + 1 takes 4). A second
+warm-up with the experts in place pays their own first run (the first prompt was 3x slower without it; it takes no
+VRAM). There is no estimate left in the plan: the guessed slacks (+256 B a tensor, +4096 B a layer, +32 MiB prompt
+path, +64 MiB decode scratch) and the drafter's 3.09 GB figure are gone. `INKLING2_VRAM_LOG=1` prints a line a GPU at
+each stage of the load and after each prompt, decode and served request: its free VRAM, the engine's own allocations
+and the rest.
+
+Where the VRAM outside the old plan went (GPU 0 at a 32K context, MiB; "runtime" is free VRAM lost beyond the
+engine's own allocations):
+
+| Stage | Engine's allocations | Runtime |
+|---|---|---|
+| The first stream (the device's start: before `free0`, never in a plan) | - | 146 |
+| Decode scratch (31 allocations) | 56.2 | 1.8 (64 KiB minimum an allocation) |
+| Prompt path scratch (41 allocations, the BLAS handle, the side stream) | 1299.7 | 70.3 (hipblasCreate 60, a stream 2, rounding) |
+| 13 layers' dense tensors, caches, histories (371 allocations) | 1840.0 | 166.0 (2 MiB pages: a quarter to half a page an allocation) |
+| The host-free step's buffers (57 allocations) | 15.6 | 4.4 |
+| The warm-up (the BLAS's kernels, the kernels' code, their scratch) | - | 156.0 |
+| The experts (one allocation) | 28186.4 | 1.6 |
+| Last GPU: the drafter (its weights, caches, scratch and the engine's tap buffers) | 3162.5 | 151.5 (its BLAS handle, stream, kernels) |
+
+Nothing grows after the load: prompts up to 80K tokens, drafted and undrafted decodes, and served requests leave the
+free VRAM where the load left it, to the MiB. (A probe of this runtime, `hipMemGetInfo` around each call: the first
+stream 146 MiB, each further stream 2, hipblasCreate 60, a first GemmEx 40, host memory - pinned, mapped or
+registered, 4 GiB of it - none.)
+
+Free VRAM after the load and after a long prompt, MiB a GPU (GPUs 0, 1, 2 / GPU 3):
+
+| Context | Before (old plan, `--reserve-mib` R) | Now, `--reserve-mib 600`: after the load | after a long prompt |
+|---|---|---|---|
+| 32K | R - 324 / R - 642 (R = 1500: 1176 / 858) | 606 / 608 | 606 / 608 (30,000 tokens) |
+| 256K | 310 - 340 with R = 1024 | 602 / 602 | 602 / 602 (80,000 tokens) |
+| 1M | - | does not load: the experts VRAM leaves would need 131 GB of RAM, 121 GB is there (see "Long contexts") | - |
+
+The rest above 600 is the experts' rounding: what no further expert fits (an expert is 9.6 - 12.1 MiB) and the
+allocation's 2 MiB page. The experts in VRAM: 10,574 of 18,432 at 32K (10,565 before, when 0.3 GB a GPU was left
+free instead of 0.6), 9,646 at 256K (9,630 before) - the old plan's slacks and the drafter's 3.09 GB over-counted
+about as much as the runtime's share it missed. The load is about a minute longer than before (247 - 293 s against
+166 - 225): the dense tensors and the experts are read in two passes over the files.
+
 ## Values and their sources
 
 Every value of this engine, its drafter, the setup, the server's and the Models page's Inkling 2 rows and the tools,
@@ -400,7 +449,7 @@ with where it comes from (2026-11-20). Sources:
 | # | Value | What it does | Source | Where it comes from |
 |---|---|---|---|---|
 | E1 | `max_ctx` 32768 | Positions the global layers' caches hold; the engine's context | MAYA | ds4_model.hpp `max_context = 32768`. Every recorded measurement used 32768 (INKLING2_AMD.md). The setup writes 64K or 256K instead (S15, S16). |
-| E2 | `reserve_mib` 600 | VRAM each GPU keeps free beyond the plan | MAYA | ds4_model.hpp `reserve_mib = 600`. The setup writes 3072 (S27), as DeepSeek's does. |
+| E2 | `reserve_mib` 600 | VRAM each GPU keeps free: the experts take the GPU's free VRAM, measured once everything else is in place, less this | MAYA | ds4_model.hpp `reserve_mib = 600`; the plan is maya-ds4's place_experts rule ("VRAM" above): free after the load is 600 plus less than one expert, measured at 32K and 256K. The setup writes 3072 (S27), as DeepSeek's does. |
 | E3 | `vram_experts` 1.0 | The largest share of a layer's experts kept in VRAM | MAYA | ds4_model.hpp `1.0` |
 | E4 | `cpu_threads` 0: a thread a physical core, the caller's among them; N at most N | CPU lane workers | MAYA | ds4_model.hpp's cpu_threads (0 and its meaning). Not mirrored: maya-ds4's lane picks between the cores, the performance cores or one NUMA node by a measurement at load; this lane is hy4::Lane |
 | E5 | Default profile `<pack>/expert-profile.bin` (a pack's `default.prof` read in its place) | Expert profile read when none is given | MAYA | ds4_main.cpp's `o.pack + "/expert-profile.bin"` |
@@ -410,7 +459,7 @@ with where it comes from (2026-11-20). Sources:
 | E9 | `prefill_chunk` 512 | Prompt tokens per prompt-path chunk | MEASURE | Against maya-ds4's auto rule (2048 on one GPU, 4096 on several): `--try-chunks` |
 | E10 | `log_floor` 0, so the pack's 8192 is used | log_scaling_n_floor | MODEL | config.json `text_config.log_scaling_n_floor 8192`; inkling2.txt 8192. The GGUF still says 128000 (see T1). |
 | E11 | `dspark_cum` 0.5 | Floor on the running product of the drafts' probabilities | MEASURED | DSPARK.md: the ">= 0.5" row is the best of the projected rules. Also MAYA: ds4_main.cpp `0.5f` (measured there on a Radeon 8065S, +6.5%). |
-| E12 | `dspark_reserve_gb` 3.09 | VRAM the last GPU keeps for the drafter at 32K | MEASURED | The drafter reports 3.09 GB at a 32K context (INKLING2_DSPARK.md, "In the engine"); serve/models.py's IK2_DSPARK_GB, the setup's and the page's, is the same figure (tools/test_setup_ik2.py checks it). The next phase replaces it by the drafter's exact allocation |
+| E12 | Removed (`dspark_reserve_gb` 3.09) | - | MEASURED | The drafter is loaded before the experts are placed, so the plan measures it in place: 3314 MiB at 32K (its 3162.5 MiB and its runtime's 151.5), 4794 at 256K ("VRAM" above) |
 | E13 | `expert_cache` on, `--no-expert-cache` | Expert cache on by default | MAYA | ds4_model.hpp's expert_cache, ds4_main.cpp's flag |
 | E14 | `dspark_index` empty: no drafter | The drafter loads only when its index folder is named | CHOSEN (design) | The drafter is a download of its own beside the GGUF set (not in the pack, as maya-ds4's is): the config names its index, the setup writes it |
 | E15 | `--short-prompt` 3 | A prompt's unread tail of at most 3 tokens goes through the decode path | MEASURE | The comment's "measured" has no recorded numbers: `--short-bench` |
@@ -437,16 +486,16 @@ with where it comes from (2026-11-20). Sources:
 | E36 | At most 7 drafts | Drafts per round | MODEL | config `mtp_config.block_size 8`: the anchor plus 7 drafts |
 | E37 | Window sized by expected tokens per ms, on by default | How many drafts to verify | MEASURED | The rule's gain is in DSPARK.md. **Differs**: ds4's cost-aware window is off by default "until measured on GPUs" (ds4_main.cpp); ds4 uses only the fixed cum cut. |
 | E38 | `ids[16]`, `tops[16]` | Window buffers | CHOSEN (bound) | At least window_max(), kWin 9 |
-| E39 | +256 B per tensor | Slack per tensor in the VRAM plan | MEASURE | VRAM slack: each allocation's 256-byte alignment (al256, alloc's 256-byte minimum); becomes the exact size |
+| E39 | Removed (+256 B per tensor) | - | MEASURED | The plan no longer estimates: it reads the free VRAM after the other allocations and the runtime's warm-up ("VRAM" above: each allocation's real size, 64 KiB at least and whole 2 MiB pages above 1 MiB, is in what it reads) |
 | E40 | SWA ring = `n_swa + rewind + Tc` = 1024 + 4096 + 512 = 5632 rows | Rows of each sliding-window layer's cache | DERIVED | n_swa 1024 (GGUF `attention.sliding_window`) + E8 + E9 |
-| E41 | +32 MiB | Slack in the prompt path's VRAM | MEASURE | VRAM slack of the prompt path; becomes the exact size |
+| E41 | Removed (+32 MiB) | - | MEASURED | The plan no longer estimates: it reads the free VRAM after the other allocations and the runtime's warm-up ("VRAM" above: each allocation's real size, 64 KiB at least and whole 2 MiB pages above 1 MiB, is in what it reads) |
 | E42 | `S_n()` = max(44 Mi, n_head x max_keys) floats | Prompt-path attention score scratch | DERIVED | A pass of ts tokens over nk keys takes n_head x ts x nk scores and attention_rows halves ts until it fits: one token over every key, 48 x 1M, must fit (44 Mi alone stopped a prompt at about 961K keys). The floor 44 Mi (a 512-token pass over 1,877 keys) is CHOSEN |
 | E43 | `kTsMax` 512 | Tokens per pass of the prompt attention | CHOSEN (bound) | The default prompt chunk: its rel-bias table is kTsMax x 48 x 1024 floats (100 MB); a longer chunk runs passes of 512 |
 | E44 | `kStage` 24 | Experts streamed per staging pass (two buffers) | CHOSEN (trade) | Two staging buffers of 24 blobs: one copied while the other's experts run - fewer passes against VRAM. Measurable (prompt tok/s) |
-| E45 | +4096 B per layer | Slack per layer | MEASURE | VRAM slack a layer; becomes the exact size |
+| E45 | Removed (+4096 B per layer) | - | MEASURED | The plan no longer estimates: it reads the free VRAM after the other allocations and the runtime's warm-up ("VRAM" above: each allocation's real size, 64 KiB at least and whole 2 MiB pages above 1 MiB, is in what it reads) |
 | E46 | Window scratch: 9 rows over up to 4096 keys | Attention scratch size for a window | CHOSEN (trade) | 9 = kWin rows; 4096 keys holds every SWA window (1024) and a global layer's first 4096 positions in one launch pair (58 MB a GPU); past it a window's rows run one at a time |
-| E47 | +64 MiB | Decode scratch slack | MEASURE | Decode scratch slack; becomes the exact size |
-| E48 | Drafter VRAM baseline at 32768 positions, + `ctx_bytes` for each position beyond | Drafter VRAM at other contexts | MEASURED | The 3.09 GB figure was measured at 32k (DSPARK.md). ctx_bytes: D10. |
+| E47 | Removed (+64 MiB) | - | MEASURED | The plan no longer estimates: it reads the free VRAM after the other allocations and the runtime's warm-up ("VRAM" above: each allocation's real size, 64 KiB at least and whole 2 MiB pages above 1 MiB, is in what it reads) |
+| E48 | Removed from the engine; the setup's per-position cost `ctx_bytes` (D10) | Drafter VRAM at other contexts | MEASURED | 3314 MiB at 32K and 4794 at 256K: 1400 MiB for 229,376 positions, 6400 bytes each, D10 exactly |
 | E49 | head + `8·n_embd` B | VRAM of output_norm + output_res_query (2 F32 vectors) | DERIVED | 2 x 4608 x 4 B |
 | E50 | One spare expert slot per layer | Room for the cache's moves | CHOSEN (bound) | One move at a time a layer: the hot expert lands in the spare slot, the cold one's slot is the next spare |
 | E51 | RAM experts + `ram_margin()` 8 GiB (INKLING2_RAM_MARGIN_GB) must fit in the RAM to be had | The load stops otherwise | MAYA | ds4_model.cu's ram_margin (8 GiB, DS4_RAM_MARGIN_GB); the setup's IK2_MEMORY_GB counts the same 8 GiB (IK2_RAM_MARGIN_GIB) |
@@ -547,8 +596,8 @@ with where it comes from (2026-11-20). Sources:
 | S16 | `IK2_RECOMMENDED_CONTEXT` 262144 | Highest recommendation | MAYA | DS4_RECOMMENDED_CONTEXT (DeepSeek's reason: its indexer's quadratic cost). maya-inkling2 has been run end to end with a server at 256K and prompts up to 109,464 tokens (W2) |
 | S17 | IK2_KV_BYTES 32768 + IK2_ATTN_BYTES 1560 on each GPU (+ IK2_DSPARK_KV_BYTES 6400 while it drafts) | Cache VRAM per context token | DERIVED | From the engine's allocations (serve/models.py says which): the global layers' K / V rows; each GPU's attention_split scratch, 48 x 130 floats a 16-key tile (past its 58 MB floor, 37,152 positions); the SWA rings are 5632 rows whatever the context. The setup and the page read the same constants |
 | S18 | `IK2_DSPARK_KV_BYTES` 6400 | The drafter's per token | DERIVED | = D10 |
-| S19 | `IK2_MEMORY_GB` 202 (download.json the same) | VRAM + RAM that must hold the model | DERIVED | ceil(files 190.9 GiB + the engine's RAM margin 8 GiB + the drafter's 3.09 GB = 2.9 GiB) |
-| S20 | `IK2_DSPARK_GB` 3.09 | Drafter's VRAM added to the need | MEASURED | = E12, the one figure |
+| S19 | `IK2_MEMORY_GB` 203 (download.json the same) | VRAM + RAM that must hold the model | DERIVED | ceil(files 190.9 GiB + the engine's RAM margin 8 GiB + the drafter's 3.47 GB = 3.2 GiB) |
+| S20 | `IK2_DSPARK_GB` 3.47 | Drafter's VRAM added to the need | MEASURED | The last GPU's free VRAM after the load's warm-up with the drafter and without it: 25124 against 28438 MiB at 32K ("VRAM" above) |
 | S21 | `data/expert-profile-inkling2.bin` | Shipped expert profile | MEASURED | The path follows DS4_PROFILE (maya.py). The contents equal the pack's default.prof byte for byte: 15,139,200 routings = 39,425 tokens x 48 x 8. **The corpus is not recorded** (commit 8d4e2c7 says only "the profile the AMD runs used"). |
 | S22 | Set up on AMD under Linux only | Platform gate | CHOSEN (scope) | maya-ik2, the NVIDIA engine, has no setup |
 | S23 | VRAM + RAM < need: a warning, the setup goes on | Memory gate | MAYA | DeepSeek's check (check_pc); the warning says the engine then stops at its start |
@@ -584,7 +633,7 @@ with where it comes from (2026-11-20). Sources:
 | W7 | Trained context from inkling2.txt `context_length` | Slider top | MODEL | inkling2.txt `context_length 1048576` |
 | W8 | Drafter searched at `<models>/Inkling-2-Small-MTP/maya-inkling2-dspark-q8_0` and `pack.parents[2]/...` | Finds the index | DERIVED | From S7 / S8 / S9 |
 | W9 | The page's cost: the server's kv_bytes + kv_gpu_bytes x GPUs + dspark_kv_bytes while it drafts | Cache GB shown for a context | DERIVED | = S17, from serve/models.py |
-| W10 | "About {IK2_DSPARK_GB} GB" (3.09) | Drafting hint | MEASURED | = E12 |
+| W10 | "About {IK2_DSPARK_GB} GB" (3.47) | Drafting hint | MEASURED | = S20 |
 | W11 | Levels none, auto, low, medium, high, xhigh, max | Thinking levels offered | MODEL | The template's levels as the other PR's server takes them (frontend.py's INKLING_EFFORT): its effort_kwargs reads minimal as thinking off (0), so the page does not offer it beside Off |
 | W12 | Default "auto" (the template's 0.9) | Default thinking level | MODEL | chat_template.jinja:5 |
 | W13 | 0 / 0.2 / 0.7 / 0.9 / 0.99 in the titles | Labels | MODEL | chat_template.jinja:1 |

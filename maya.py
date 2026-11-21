@@ -901,11 +901,11 @@ IK2_KV_BYTES, IK2_ATTN_BYTES, IK2_DSPARK_KV_BYTES = SM.IK2_KV_BYTES, SM.IK2_ATTN
 #            or the experts VRAM does not hold copied into RAM - the engine never reads them from the SSD);
 #   margin   8 GiB, IK2_RAM_MARGIN_GIB: the RAM the engine leaves the rest beyond its RAM experts (it stops at its
 #            start when the RAM cannot hold both);
-#   drafter  IK2_DSPARK_GB, 3.09 GB = 2.9 GiB of the last GPU at a 32K context, measured (docs/INKLING2_DSPARK.md, "In
-#            the engine"): the calibration may turn drafting on, so it is counted (its experts then go to RAM)
-IK2_MEMORY_GB = 202
+#   drafter  IK2_DSPARK_GB, 3.47 GB = 3.2 GiB of the last GPU at a 32K context, measured (docs/INKLING2_AMD.md,
+#            "VRAM"): the calibration may turn drafting on, so it is counted (its experts then go to RAM)
+IK2_MEMORY_GB = 203
 IK2_RAM_MARGIN_GIB = 8                              # (the engine's ram_margin(), maya-ds4's: INKLING2_RAM_MARGIN_GB)
-IK2_DSPARK_GB = SM.IK2_DSPARK_GB                    # (the engine's Options::dspark_reserve_gb)
+IK2_DSPARK_GB = SM.IK2_DSPARK_GB                    # (measured: serve/models.py)
 # its expert profile (uint32 [48][384] routings, the most routed in VRAM at the load): the pack's expert-profile.bin
 # (maya-ds4's name), copied from here where the pack has none - the engine reads it by itself and writes back to it
 IK2_PROFILE = ROOT / "data" / "expert-profile-inkling2.bin"

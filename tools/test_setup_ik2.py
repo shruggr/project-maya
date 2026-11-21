@@ -65,7 +65,7 @@ class Layout:
         self.mtp.mkdir(parents=True)
         shards = {"Inkling-2-Small-UD-Q2_K_XL-00001-of-00002.gguf": 4096,
                   "Inkling-2-Small-UD-Q2_K_XL-00002-of-00002.gguf": 8192}
-        man = dict(TABLE, quants={"ud-q2_k_xl": {"folder": "UD-Q2_K_XL", "memory_gb": 202,
+        man = dict(TABLE, quants={"ud-q2_k_xl": {"folder": "UD-Q2_K_XL", "memory_gb": 203,
                                                  "files": {n: [b, "a" * 64] for n, b in shards.items()}}},
                    drafter=dict(TABLE["drafter"], files={"mtp.safetensors": [100, "b" * 64],
                                                          "config.json": [10, "c" * 64]}))
@@ -116,11 +116,11 @@ class Manifest(unittest.TestCase):
 
     def test_the_memory_derived(self):
         """IK2_MEMORY_GB (download.json's memory_gb) as its comment derives it, in GiB: the files, the engine's RAM
-        margin (maya-ds4's 8 GiB, the engine's ram_margin) and the drafter's measured 3.09 GB, rounded up."""
+        margin (maya-ds4's 8 GiB, the engine's ram_margin) and the drafter's measured 3.47 GB, rounded up."""
         import math
         files = sum(maya.ik2_entry()["files"].values()) / 2**30
         self.assertAlmostEqual(files, 190.9, delta=0.05)
-        self.assertEqual(maya.IK2_MEMORY_GB, math.ceil(files + maya.IK2_RAM_MARGIN_GIB + 3.09e9 / 2**30))
+        self.assertEqual(maya.IK2_MEMORY_GB, math.ceil(files + maya.IK2_RAM_MARGIN_GIB + 3.47e9 / 2**30))
         src = (ROOT / "src" / "inkling2" / "inkling2_model.cu").read_text(encoding="utf-8")
         self.assertIn("double gib = 8.0;", src)                       # (the engine's ram_margin(): the same 8 GiB)
         self.assertEqual(maya.IK2_RAM_MARGIN_GIB, 8)
@@ -252,12 +252,13 @@ class Context(unittest.TestCase):
                          (models.IK2_KV_BYTES, models.IK2_ATTN_BYTES, models.IK2_DSPARK_KV_BYTES))
 
     def test_the_drafters_vram_one_figure(self):
-        """The engine's reserve, the setup's and the page's figure: one, the measured 3.09 GB."""
+        """The setup's and the page's figure: one, the measured 3.47 GB - the engine needs none (it places its experts
+        after the drafter is in, in what is left)."""
         from serve import models
         hpp = (ROOT / "src" / "inkling2" / "inkling2_model.hpp").read_text(encoding="utf-8")
-        self.assertEqual(float(re.search(r"double dspark_reserve_gb = ([0-9.]+);", hpp).group(1)), models.IK2_DSPARK_GB)
+        self.assertNotIn("dspark_reserve_gb", hpp)
         self.assertEqual(maya.IK2_DSPARK_GB, models.IK2_DSPARK_GB)
-        self.assertEqual(models.IK2_DSPARK_GB, 3.09)
+        self.assertEqual(models.IK2_DSPARK_GB, 3.47)
 
     def test_recommended_by_this_pcs_memory(self):
         """As DeepSeek's (ds4_recommended_context): the largest context from 64K up to 256K whose cache fits in VRAM +

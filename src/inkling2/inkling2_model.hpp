@@ -24,7 +24,9 @@ struct Options {
     std::string pack;
     std::vector<int> gpus;        // empty: every visible GPU
     int64_t max_ctx = 32768;      // positions the global layers' caches hold (maya-ds4's default)
-    int64_t reserve_mib = 600;    // VRAM each GPU keeps free beyond the plan, MiB (maya-ds4's --reserve-mib and default)
+    // VRAM each GPU keeps free, MiB (maya-ds4's --reserve-mib and default): the experts take what the GPU has free once
+    // everything else is in place and the runtime has taken its own (Impl::place), less this
+    int64_t reserve_mib = 600;
     double vram_experts = 1.0;    // the share of each layer's routed experts kept in VRAM at most
     // the CPU lane's threads, the caller's among them (maya-ds4's meaning and default): 0 a thread a physical core;
     // n: at most n, a thread a core
@@ -45,10 +47,6 @@ struct Options {
     std::string dspark_index;     // the drafter's index folder (inkling2_dspark.hpp; empty: no drafter): loaded on the
                                   // last GPU, fed every position's taps by the steps and the prompt path
     float dspark_cum = 0.5f;      // its cut on the running product of the drafts' probabilities (Model::set_draft_cum)
-    // VRAM the last GPU keeps for it beyond reserve_mib (fewer experts there), at a context of 32768 - what the drafter
-    // reports there, measured (docs/INKLING2_DSPARK.md); a longer one adds Dspark::ctx_bytes a position.  serve/
-    // models.py's IK2_DSPARK_GB is the same figure (the setup's and the Models page's)
-    double dspark_reserve_gb = 3.09;
     bool expert_cache = true;     // experts move between VRAM and the CPU lane as they are used (maya-ds4's)
     bool verbose = false;
 };
@@ -143,6 +141,8 @@ public:
     /// (T tokens' picks, n each, the first token at position pos0)
     using PickHook = std::function<bool(int il, int* ids, int n, int64_t pos0, int T)>;
     void set_pick_hook(PickHook h);
+    /// (tests, INKLING2_VRAM_LOG=1) a line a GPU: its free VRAM, this engine's allocations and the rest
+    void vram_notes(const char* what) const;
 
 private:
     struct Impl;

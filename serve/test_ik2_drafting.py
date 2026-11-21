@@ -196,7 +196,7 @@ const s = {context: 262144, gpus: [0, 1, 2, 3], env: {}, images: false, draft: "
            prefill_chunk: null, cpu_threads: null, dspark_cum: null};
 const base = {file: "maya-inkling2-hip.json", running: false, backend: "hip", family: "ik2", model: "inkling-2-small",
               quant: "UD-Q2_K_XL", settings: s, context_range: {min: 4096, max: 1048576, tested: 262144}};
-const own = {kv_bytes: 32768, kv_gpu_bytes: 1560, dspark_kv_bytes: 6400, dspark_gb: 3.09};   // (models.py's entry)
+const own = {kv_bytes: 32768, kv_gpu_bytes: 1560, dspark_kv_bytes: 6400, dspark_gb: 3.47};   // (models.py's entry)
 const cases = {
   amd: {...base, ...own, choices: {draft: ["dspark", "none"], images: false, text_only: true, drafting: true}},
   amd_none: {...base, ...own, settings: {...s, draft: "none"}, choices: {draft: ["none"], images: false, text_only: true, drafting: true}},
@@ -235,7 +235,7 @@ class PageJs(unittest.TestCase):
                             ("CPU threads", "--cpu-threads"), ("Draft confidence", "--dspark-cum")):
             self.assertEqual(f[label]["flag"], flag)
         self.assertIn("running product", f["Draft confidence"]["hint"])
-        self.assertIn("About 3.09 GB", f["Drafting"]["hint"])             # (models.py's IK2_DSPARK_GB, the engine's)
+        self.assertIn("About 3.47 GB", f["Drafting"]["hint"])             # (models.py's IK2_DSPARK_GB, measured)
         # (the Context size line: the caches, the 4 GPUs' attention scratch and the drafter's rows - the setup's figure)
         gb = 262144 * (32768 + 4 * 1560 + 6400) / 2**30
         self.assertIn(f"≈ {gb:.1f} GB of GPU memory", f["Context size"]["below"]["p"]["hint"])
