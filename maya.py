@@ -10248,7 +10248,7 @@ def write_config_ik2(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     setup's rule - the Models page switches it), the model's own sampling and thinking level at every setup; a setup
     again keeps what the config before says that this one does not ask - where the server listens, its key, the env,
     and the engine settings set by hand (the VRAM kept free, the layer split, the CPU lane's threads, an expert
-    profile, the prompt chunk, drafting and the drafts' floor).  The VRAM kept free (--reserve-mib, maya-ds4's flag):
+    profile, the prompt chunk, drafting and the drafts' floor, --mmap-experts).  The VRAM kept free (--reserve-mib, maya-ds4's flag):
     DeepSeek's on AMD (--vram-reserve-mib, else hip_reserve_mib).  The GPUs: the server shows the engine the config's
     "gpu" cards and splits the layers over them (--layer-split auto)."""
     step(8, "the configuration and the start script")
@@ -10260,9 +10260,12 @@ def write_config_ik2(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         args += ["--dspark-index", str(index)]
     kept = keep_args([str(x) for x in old.get("args") or []], args,
                      ("--reserve-mib", "--vram-experts", "--layer-split", "--cpu-threads", "--expert-profile",
-                      "--prefill-chunk", "--dspark", "--dspark-cum", "--rewind", "--short-prompt"))
+                      "--prefill-chunk", "--dspark", "--dspark-cum", "--rewind", "--short-prompt", "--mmap-experts"))
     if "--dspark" not in args[:-1] and index is not None:
         args += ["--dspark", "none"]                   # (until the speed calibration finds that drafting pays here)
+    if getattr(a, "mmap_experts", None):   # given now: written, and a later setup keeps it (DeepSeek's, issue #422)
+        set_arg(args, "--mmap-experts", a.mmap_experts)
+        ok(f"the CPU lane's experts: --mmap-experts {a.mmap_experts}")
     # (the VRAM kept free on each GPU: as DeepSeek's setup writes it on AMD - --vram-reserve-mib, else hip_reserve_mib)
     if getattr(a, "vram_reserve_mib", None) is not None:   # given now: written, and a later setup keeps it
         set_arg(args, "--reserve-mib", a.vram_reserve_mib)
@@ -10304,8 +10307,8 @@ def write_config_ik2(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
 def set_up_ik2(a, prev: dict) -> Path | None:
     """Inkling 2 Small's steps 1-9, on AMD only (its engine maya-inkling2; on NVIDIA the model's engine is maya-ik2,
     which has no setup yet - check_pc says so and stops): the PC (AMD on Linux; the memory, as DeepSeek's setup: below
-    VRAM + RAM that hold the model it warns and goes on - here the engine then stops at its start, since the experts
-    VRAM does not hold are copied into RAM, never read from the SSD), the context (up to the model's 1M, recommended as
+    VRAM + RAM that hold the model it warns and goes on - the engine then reads the experts RAM does not hold in place
+    from the model's files, --mmap-experts auto), the context (up to the model's 1M, recommended as
     DeepSeek's), the engine (build-hip/maya-inkling2), unsloth's UD-Q2_K_XL set, the model's DSpark drafter (converted
     to the engine's Q8_0 copy), the pack with its expert profile, the config, and the speed calibration - the drafter
     or none, as DeepSeek's (--drafting measure | on | off).  Files already there are used as they are: nothing is
@@ -10320,8 +10323,9 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     need = ik2_memory_gb()
     if total > 0 and vram + total < need:              # (DeepSeek's check: said, the setup goes on)
         warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{need:.0f} GB that hold {name} - the "
-             "experts VRAM does not hold are copied into RAM (the engine never reads them from the SSD), so it would "
-             f"stop at its start. More of the AMD GPUs ({ME} --setup --gpus 0,1,...) or more RAM make it fit")
+             "most used of the experts VRAM does not hold are copied into RAM and the others read in place from the "
+             f"model's files on the SSD (--mmap-experts auto), slower. More of the AMD GPUs ({ME} --setup --gpus "
+             "0,1,...) or more RAM make it fit")
     else:
         ok(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: they hold {name} (about {need:.0f} GB), the experts "
            "VRAM does not hold in RAM")
@@ -10334,7 +10338,7 @@ def set_up_ik2(a, prev: dict) -> Path | None:
        f"; its cache: {ik2_kv_gb(ctx, n, True):.1f} GB of VRAM across the GPUs, whose experts then live in RAM")
     if ctx > rec and total > 0 and ik2_kv_gb(ctx, n, True) > vram + total - need:
         warn(f"a {context_label(ctx)} context's cache leaves too little of this PC's memory for the model's experts: "
-             f"{context_label(rec)} fits (the engine may stop at its start)")
+             f"{context_label(rec)} fits (the experts RAM does not hold are then read from the SSD, slower)")
     models = ik2_models_dir(a, prev)
     d = ik2_dir(a, models, prev, quant)
     mtp = ik2_mtp_dir(models, prev)
@@ -10953,8 +10957,10 @@ def main() -> int:
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
                          "programs (default 700), kept in the config")
     ap.add_argument("--mmap-experts", choices=["auto", "on", "off"],
-                    help="DeepSeek: the experts VRAM does not hold - read in place from the files (auto, the default), "
-                         "or off: copied into RAM (with DS4_REQUIRE_ALL_RAM=1 all of them); kept in the config")
+                    help="DeepSeek and Inkling 2 Small: the experts VRAM does not hold - auto (the default): DeepSeek "
+                         "copies them into RAM when it holds them all, else reads them in place from the files, Inkling "
+                         "2 Small copies the most used that fit; on: read in place; off: the most used copied into RAM "
+                         "(DeepSeek: with DS4_REQUIRE_ALL_RAM=1 all of them); kept in the config")
     ap.add_argument("--fast-prefill", choices=["on", "off"],
                     help="DeepSeek: fast prompt reading - long prompts read faster (the prompt skip as a per-layer "
                          "cone); answers can shift slightly, so it is off by default; kept in the config")
@@ -11080,10 +11086,10 @@ def main() -> int:
             else:
                 set_mixed_gpus(cfg, a.mixed_gpus)
                 pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-        if a.mmap_experts:   # (#422: given on a start too - written into a DeepSeek config, which keeps it)
+        if a.mmap_experts:   # (#422: given on a start too - written into a DeepSeek or maya-inkling2 config, which keeps it)
             cfg = read_json(pick)
-            if config_family(cfg) != "deepseek":
-                warn("--mmap-experts is a DeepSeek setting: this GLM-5.3-Flash config does not use it")
+            if config_family(cfg) != "deepseek" and not Path(str(cfg.get("exe", ""))).name.startswith("maya-inkling2"):
+                warn("--mmap-experts is a DeepSeek and Inkling 2 Small (AMD) setting: this config does not use it")
             else:
                 set_arg(cfg.setdefault("args", []), "--mmap-experts", a.mmap_experts)
                 pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")

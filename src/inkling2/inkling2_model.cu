@@ -103,6 +103,7 @@ struct Layer {
     std::vector<int> slot_of;     // each expert's VRAM slot (-1: in RAM), and its RAM slot (-1: in VRAM)
     std::vector<int> ram_of;
     int n_res = 0;
+    int n_copy = 0;               // RAM slots below it: copied into `ram`; from it on: in place in the model's files
     uint8_t* ram = nullptr;
     bool ram_reg = false;
     size_t ram_bytes = 0;
@@ -169,6 +170,11 @@ struct Gpu {
     bool sw_quit = false;
     cudaStream_t s3 = nullptr;
     uint8_t* h_swap = nullptr;
+    // (--mmap-experts: a prompt's experts in place in the files are gathered here - pinned, kStage blobs - and copied
+    //  to the staging slots from it; ev_fst: its last copy out, waited on before the next gather)
+    uint8_t* h_fst = nullptr;
+    cudaEvent_t ev_fst = nullptr;
+    bool fst_busy = false;
     // (a verify window's rows: kWin of each)
     float *w_cb = nullptr, *w_mixo = nullptr, *w_xn = nullptr, *w_stat = nullptr, *w_q = nullptr, *w_gate = nullptr;
     float *w_ao = nullptr, *w_rel = nullptr, *w_sink = nullptr, *w_kc = nullptr, *w_vc = nullptr, *w_dk = nullptr;
@@ -729,26 +735,70 @@ struct Model::Impl {
             gp.expert_alloc = need;
             for (int il = gp.l0; il < gp.l1; ++il) {
                 Layer& l = L[(size_t) il];
-                int ns = 0, nr = 0;
-                for (int e = 0; e < g.n_expert; ++e) {
+                int ns = 0;
+                for (int e = 0; e < g.n_expert; ++e)
                     if (l.slot_of[(size_t) e] == 0) l.slot_of[(size_t) e] = ns++;
-                    else l.ram_of[(size_t) e] = nr++;
-                }
                 l.n_res = ns;
                 gp.n_res += ns;
                 gp.expert_bytes += l.blob * (size_t) ns;
                 st.experts_vram += ns;
-                st.ram_gb += (double) (l.blob * (size_t) nr) / 1e9;
             }
         }
-        // (they are copied into RAM - never read from the files - beside ram_margin() for the rest, maya-ds4's rule)
-        const uint64_t avail = hy4::ram_available();
-        if (avail > 0 && st.ram_gb * 1e9 + (double) ram_margin() > (double) avail) {
-            err = "the experts outside VRAM need " + std::to_string((int) st.ram_gb) + " GB of RAM and " +
-                  std::to_string((int) (ram_margin() >> 30)) + " GiB are left to the rest, " +
-                  std::to_string((int) (avail / 1e9)) + " GB can be had";
-            return false;
+        return place_ram();
+    }
+    // The experts outside VRAM: copied into RAM or read in place from the model's files - maya-ds4's copy_experts
+    // rule (--mmap-experts): off: the most routed (routings a byte, as the VRAM ones) that fit the RAM this process
+    // can get beside ram_margin(), the others in place; on: none.  auto, the default: maya-ds4's copies all of them
+    // when they fit with 8 GiB more to spare, else none (its #339: a part copied cost decode speed on 32 / 64 GB) -
+    // here it is off's: measured at a 1M context (131 GB outside VRAM, 109 GB to be had), the 2.7k-token prompt
+    // continued with drafts at 47.2 tok/s with 100 GiB copied against 32.2 with none, its prompt read alike (49 / 51
+    // tok/s, both bound by the disk: docs/INKLING2_AMD.md).  A layer's RAM slots: the copied ones first (0 .. n_copy -
+    // 1, a blob each in `ram`), then the ones in the files
+    bool place_ram() {
+        struct Out {
+            double key;
+            int il, e;
+        };
+        std::vector<Out> out;
+        double all = 0;
+        for (int il = 0; il < NL; ++il) {
+            const Layer& l = L[(size_t) il];
+            const bool pr = (size_t) (il + 1) * g.n_expert <= prof_in.size();
+            for (int e = 0; e < g.n_expert; ++e)
+                if (l.slot_of[(size_t) e] < 0) {
+                    out.push_back({(pr ? (double) prof_in[(size_t) il * g.n_expert + e] : 0.0) / (double) l.blob, il, e});
+                    all += (double) l.blob;
+                }
         }
+        std::stable_sort(out.begin(), out.end(), [](const Out& a, const Out& b) { return a.key > b.key; });
+        const uint64_t avail = hy4::ram_available();
+        const double can = avail == 0 ? 1e300 : std::max(0.0, (double) avail - (double) ram_margin());
+        double budget = o.mmap_experts > 0 ? 0.0 : std::min(all, can);
+        if (const char* v = std::getenv("INKLING2_COPY_GB")) budget = std::atof(v) * 1e9;   // (tests: the hottest n GB)
+        if (o.mmap_experts <= 0 && all > can)
+            std::fprintf(stderr, "maya-inkling2: --mmap-experts %s: the CPU lane's experts (%.1f GB) do not all fit the RAM "
+                                 "this process can get (%.1f GB beside %.0f GB for the rest) - the most routed copied, the "
+                                 "others read in place from the model's files\n", o.mmap_experts < 0 ? "auto" : "off",
+                         all / 1e9, can / 1e9, ram_margin() / 1e9);
+        std::vector<char> cp((size_t) NL * g.n_expert, 0);
+        double used = 0;
+        for (const Out& x : out) {   // (the hottest that fit the budget)
+            const double b = (double) L[(size_t) x.il].blob;
+            if (used + b > budget) break;
+            used += b;
+            cp[(size_t) x.il * g.n_expert + x.e] = 1;
+        }
+        for (int il = 0; il < NL; ++il) {
+            Layer& l = L[(size_t) il];
+            int nr = 0;
+            for (int e = 0; e < g.n_expert; ++e)
+                if (l.slot_of[(size_t) e] < 0 && cp[(size_t) il * g.n_expert + e]) l.ram_of[(size_t) e] = nr++;
+            l.n_copy = nr;
+            for (int e = 0; e < g.n_expert; ++e)
+                if (l.slot_of[(size_t) e] < 0 && !cp[(size_t) il * g.n_expert + e]) l.ram_of[(size_t) e] = nr++;
+        }
+        st.ram_gb = used / 1e9;
+        st.file_gb = (all - used) / 1e9;
         return true;
     }
 
@@ -814,22 +864,43 @@ struct Model::Impl {
             const uint32_t mx = std::max<uint32_t>(1, *std::max_element(c, c + g.n_expert));
             for (int e = 0; e < g.n_expert; ++e) l.use[(size_t) e] = (float) c[e] / (float) mx;
         }
-        std::vector<int> res, ram;
-        for (int e = 0; e < g.n_expert; ++e) (l.slot_of[(size_t) e] >= 0 ? res : ram).push_back(e);
+        std::vector<int> res, ram, fil;   // (ram / fil: by their RAM slots - the copied ones, the ones in the files)
+        for (int e = 0; e < g.n_expert; ++e)
+            if (l.slot_of[(size_t) e] >= 0) res.push_back(e);
+        ram.resize((size_t) l.n_copy);
+        for (int e = 0; e < g.n_expert; ++e) {
+            const int r = l.ram_of[(size_t) e];
+            if (l.slot_of[(size_t) e] >= 0 || r < 0) continue;
+            if (r < l.n_copy) ram[(size_t) r] = e;
+            else {
+                if ((size_t) (r - l.n_copy) >= fil.size()) fil.resize((size_t) (r - l.n_copy) + 1);
+                fil[(size_t) (r - l.n_copy)] = e;
+            }
+        }
         const size_t per = std::max<size_t>(1, gp.stage_bytes / l.blob);   // (straight into the pinned stage)
         for (size_t s0 = 0; s0 < res.size(); s0 += per) {
             const size_t ne = std::min(per, res.size() - s0);
             for (size_t i = 0; i < ne; ++i) blob_copy(l, res[s0 + i], gp.stage + i * l.blob);
             CK(cudaMemcpy(l.experts + s0 * l.blob, gp.stage, l.blob * ne, cudaMemcpyHostToDevice));
         }
-        // the others into RAM (anonymous memory, huge pages where the system gives them, page-locked when it lets us)
-        if (!ram.empty()) {
+        // the others into RAM (anonymous memory, huge pages where the system gives them, page-locked when it lets us),
+        // or read in place from the files (--mmap-experts)
+        if (!ram.empty() || !fil.empty()) {
             l.cex.beta = g.situ_beta;
             l.cex.lb = g.situ_lb;
             if (!l.cex.init(l.tg, l.td, E, g.n_ff_exp, err)) {
                 err = p + ": the CPU lane does not take these experts: " + err;
                 return false;
             }
+            l.cex.n_copy = l.n_copy;
+            l.cex.fgu.resize(fil.size());
+            l.cex.fdn.resize(fil.size());
+            for (size_t i = 0; i < fil.size(); ++i) {
+                l.cex.fgu[i] = pk.data(*l.t_gu) + (size_t) fil[i] * l.gub;
+                l.cex.fdn[i] = pk.data(*l.t_dn) + (size_t) fil[i] * l.db;
+            }
+        }
+        if (!ram.empty()) {
 #if defined(__linux__)
             l.ram_bytes = l.blob * ram.size();
             void* m = mmap(nullptr, l.ram_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -842,20 +913,58 @@ struct Model::Impl {
             // (page-locked through the GPU's driver, which the prompt path's copies to the staging slots need - DMA
             //  straight from these pages; mlock alone stops at the user's limit)
             // (after the load, register_ram: pinned pages while the file is still being read slow the reads to a crawl)
-            // (the file's pages of this layer's experts are not read again: the mapping lets go of them)
-            madvise((void*) ((uintptr_t) pk.data(*l.t_gu) & ~(uintptr_t) 4095), (size_t) l.t_gu->bytes, MADV_DONTNEED);
-            madvise((void*) ((uintptr_t) pk.data(*l.t_dn) & ~(uintptr_t) 4095), (size_t) l.t_dn->bytes, MADV_DONTNEED);
+            // (the file's pages of this layer's experts are not read again: the mapping lets go of them - unless some
+            //  are read in place)
+            if (fil.empty()) {
+                madvise((void*) ((uintptr_t) pk.data(*l.t_gu) & ~(uintptr_t) 4095), (size_t) l.t_gu->bytes, MADV_DONTNEED);
+                madvise((void*) ((uintptr_t) pk.data(*l.t_dn) & ~(uintptr_t) 4095), (size_t) l.t_dn->bytes, MADV_DONTNEED);
+            }
 #else
             err = "the CPU lane's experts in RAM: Linux only for now";
             return false;
 #endif
-            l.cex.base = l.ram;
-            l.cex.blob = l.blob;
-            l.cex.tr_down = l.tr[2];
-            l.cex.beta = g.situ_beta;
-            l.cex.lb = g.situ_lb;
         }
+#if defined(__linux__)
+        if (!fil.empty())   // (the pages of its experts copied into VRAM or RAM: let go of, the others' kept)
+            for (int e = 0; e < g.n_expert; ++e) {
+                if (l.slot_of[(size_t) e] < 0 && l.ram_of[(size_t) e] >= l.n_copy) continue;
+                for (const auto& [base, n] : {std::pair<uintptr_t, size_t>{(uintptr_t) (pk.data(*l.t_gu) + (size_t) e * l.gub), l.gub},
+                                              std::pair<uintptr_t, size_t>{(uintptr_t) (pk.data(*l.t_dn) + (size_t) e * l.db), l.db}}) {
+                    const uintptr_t a0 = (base + 4095) & ~(uintptr_t) 4095, a1 = (base + n) & ~(uintptr_t) 4095;
+                    if (a1 > a0) madvise((void*) a0, a1 - a0, MADV_DONTNEED);
+                }
+            }
+#endif
+        l.cex.base = l.ram;
+        l.cex.blob = l.blob;
+        l.cex.tr_down = l.tr[2];
         return true;
+    }
+    // expert e of layer l from the files into dst in the blob layout (the gate | up rows at 0, down at tr[2])
+    void file_blob(const Layer& l, int e, uint8_t* dst) const { blob_copy(l, e, dst); }
+    // a gather of experts from the files into pinned memory, on up to 8 threads (the page cache's copies, or the
+    // disk's reads, side by side): (expert, destination) pairs
+    void file_gather(const Layer& l, const std::vector<std::pair<int, uint8_t*>>& jobs) const {
+        if (jobs.empty()) return;
+#if defined(__linux__)
+        for (const auto& j : jobs) {   // (the disk reads ahead what is not in the page cache)
+            const uintptr_t a = (uintptr_t) (pk.data(*l.t_gu) + (size_t) j.first * l.gub), b = (uintptr_t) (pk.data(*l.t_dn) + (size_t) j.first * l.db);
+            madvise((void*) (a & ~(uintptr_t) 4095), l.gub + (a & 4095), MADV_WILLNEED);
+            madvise((void*) (b & ~(uintptr_t) 4095), l.db + (b & 4095), MADV_WILLNEED);
+        }
+#endif
+        const int nt = (int) std::min<size_t>(8, jobs.size());
+        if (nt <= 1) {
+            for (const auto& j : jobs) file_blob(l, j.first, j.second);
+            return;
+        }
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> th;
+        for (int t = 0; t < nt; ++t)
+            th.emplace_back([&] {
+                for (size_t i; (i = next.fetch_add(1)) < jobs.size();) file_blob(l, jobs[i].first, jobs[i].second);
+            });
+        for (auto& x : th) x.join();
     }
     std::atomic<bool> ram_unlocked{false}, ram_unreg{false};
 
@@ -895,7 +1004,7 @@ struct Model::Impl {
             }
             CK(cudaFreeHost(back));
             for (int e = 0; e < g.n_expert; ++e)
-                if (l.ram_of[(size_t) e] >= 0) cmp(l.ram + (size_t) l.ram_of[(size_t) e] * l.blob, e, "RAM");
+                if (l.ram_of[(size_t) e] >= 0 && l.ram_of[(size_t) e] < l.n_copy) cmp(l.ram + (size_t) l.ram_of[(size_t) e] * l.blob, e, "RAM");
         }
         std::fprintf(stderr, "VERIFY: %ld experts differ from the file\n", bad);
         return true;
@@ -976,6 +1085,7 @@ struct Model::Impl {
             l.ram = G[(size_t) l.gpu].h_dummy;
             l.experts = G[(size_t) l.gpu].xstage[0];   // (never read: no expert is in a VRAM slot)
             std::fill(l.ram_of.begin(), l.ram_of.end(), 0);
+            l.n_copy = 1;   // (RAM slot 0, the zero blob, copied)
         }
         const std::vector<uint32_t> keep = prof_cnt;
         const Stats st0 = st;
@@ -997,6 +1107,7 @@ struct Model::Impl {
             l.ram = nullptr;
             l.experts = nullptr;
             std::fill(l.ram_of.begin(), l.ram_of.end(), -1);
+            l.n_copy = 0;
             l.use.assign((size_t) g.n_expert, 0.0f);
         }
         for (Gpu& gp : G) {
@@ -1173,6 +1284,12 @@ struct Model::Impl {
                         gp.note("after its experts");
                         CK(cudaFreeHost(gp.stage));
                         gp.stage = nullptr;
+                        bool files = false;   // (--mmap-experts: the prompt path's gather buffer, kStage blobs pinned)
+                        for (int il = gp.l0; il < gp.l1; ++il) files = files || !L[(size_t) il].cex.fgu.empty();
+                        if (files && Tc > 0) {
+                            CK(cudaMallocHost((void**) &gp.h_fst, (size_t) kStage * gp.blob_max));
+                            CK(cudaEventCreateWithFlags(&gp.ev_fst, cudaEventDisableTiming));
+                        }
                         return true;
                     };
                     oks[gi] = run() ? 1 : 0;
@@ -1214,7 +1331,7 @@ struct Model::Impl {
             if (o.verbose) std::fprintf(stderr, "RAM experts registered and streamed once in %.1f s\n", now_s() - tr);
         }
         notes("after the RAM experts' registration");
-        if (o.expert_cache && st.ram_gb > 0 && !ram_unreg.load())
+        if (o.expert_cache && st.ram_gb + st.file_gb > 0 && !ram_unreg.load())
             for (size_t gi = 0; gi < G.size(); ++gi) {
                 CK(cudaSetDevice(G[gi].dev));
                 G[gi].blob_max = std::max<size_t>(G[gi].blob_max, 1);
@@ -2607,16 +2724,39 @@ struct Model::Impl {
             for (int e = 0; e < ne; ++e) pm[e] = -1;
             int pmr = 0;
             if (pass >= 2) CK(cudaStreamWaitEvent(gp.s2, gp.ev_done[b], 0));   // (the buffer's earlier pass has run)
+            std::vector<std::pair<int, uint8_t*>> fj;   // (the pass's experts in the files: gathered, then copied)
             for (int i = 0; i < np;) {   // (runs of neighbours in RAM: a copy each)
+                const int r0 = l.ram_of[(size_t) u[q0 + i]];
                 int run = 1;
-                while (i + run < np && l.ram_of[(size_t) u[q0 + i + run]] == l.ram_of[(size_t) u[q0 + i]] + run) ++run;
-                CK(cudaMemcpyAsync(gp.xstage[b] + (size_t) i * l.blob, l.ram + (size_t) l.ram_of[(size_t) u[q0 + i]] * l.blob,
-                                   (size_t) run * l.blob, cudaMemcpyHostToDevice, gp.s2));
+                if (r0 < l.n_copy) {
+                    while (i + run < np && l.ram_of[(size_t) u[q0 + i + run]] == r0 + run && r0 + run < l.n_copy) ++run;
+                    CK(cudaMemcpyAsync(gp.xstage[b] + (size_t) i * l.blob, l.ram + (size_t) r0 * l.blob,
+                                       (size_t) run * l.blob, cudaMemcpyHostToDevice, gp.s2));
+                } else {
+                    fj.push_back({u[q0 + i], gp.h_fst + (size_t) i * l.blob});
+                }
                 for (int r = 0; r < run; ++r) {
                     pm[u[q0 + i + r]] = i + r;
                     pmr = std::max(pmr, cnt[(size_t) u[q0 + i + r]]);
                 }
                 i += run;
+            }
+            if (!fj.empty()) {
+                if (!gp.h_fst) {
+                    err = "layer " + std::to_string(l.il) + ": experts in the files without the gather buffer";
+                    return false;
+                }
+                if (gp.fst_busy) CK(cudaEventSynchronize(gp.ev_fst));   // (its last copy out has run)
+                file_gather(l, fj);
+                for (size_t j = 0; j < fj.size();) {   // (runs of neighbouring slots: a copy each)
+                    size_t run = 1;
+                    while (j + run < fj.size() && fj[j + run].second == fj[j].second + run * l.blob) ++run;
+                    const size_t i = (size_t) (fj[j].second - gp.h_fst) / l.blob;
+                    CK(cudaMemcpyAsync(gp.xstage[b] + i * l.blob, fj[j].second, run * l.blob, cudaMemcpyHostToDevice, gp.s2));
+                    j += run;
+                }
+                CK(cudaEventRecord(gp.ev_fst, gp.s2));
+                gp.fst_busy = true;
             }
             CK(cudaMemcpyAsync(gp.pmap[b], pm, sizeof(int) * ne, cudaMemcpyHostToDevice, gp.s2));
             CK(cudaEventRecord(gp.ev_copy[b], gp.s2));
@@ -2836,9 +2976,16 @@ struct Model::Impl {
                 for (const Gpu::Move& mv : gp.sw_jobs) {
                     Layer& l = L[(size_t) mv.il];
                     const int vs = l.slot_of[(size_t) mv.cold];
+                    uint8_t* bounce = gp.h_swap + q++ * gp.blob_max;
+                    if (mv.rs >= l.n_copy) {   // (in the files: in through the bounce; cold's bytes stay in the files)
+                        file_blob(l, mv.hot, bounce);
+                        ok = ok && cudaMemcpyAsync(l.experts + (size_t) l.spare * l.blob, bounce, l.blob,
+                                                   cudaMemcpyHostToDevice, gp.s3) == cudaSuccess;
+                        continue;
+                    }
                     ok = ok && cudaMemcpyAsync(l.experts + (size_t) l.spare * l.blob, l.ram + (size_t) mv.rs * l.blob, l.blob,
                                                cudaMemcpyHostToDevice, gp.s3) == cudaSuccess &&
-                         cudaMemcpyAsync(gp.h_swap + q++ * gp.blob_max, l.experts + (size_t) vs * l.blob, l.blob,
+                         cudaMemcpyAsync(bounce, l.experts + (size_t) vs * l.blob, l.blob,
                                          cudaMemcpyDeviceToHost, gp.s3) == cudaSuccess;
                 }
                 ok = ok && cudaStreamSynchronize(gp.s3) == cudaSuccess;
@@ -2848,7 +2995,12 @@ struct Model::Impl {
                 size_t q = 0;
                 for (const Gpu::Move& mv : gp.sw_jobs) {
                     Layer& l = L[(size_t) mv.il];
-                    std::memcpy(l.ram + (size_t) mv.rs * l.blob, gp.h_swap + q++ * gp.blob_max, l.blob);
+                    const uint8_t* bounce = gp.h_swap + q++ * gp.blob_max;
+                    if (mv.rs < l.n_copy) std::memcpy(l.ram + (size_t) mv.rs * l.blob, bounce, l.blob);
+                    else {   // (the RAM slot now names cold's place in the files)
+                        l.cex.fgu[(size_t) (mv.rs - l.n_copy)] = pk.data(*l.t_gu) + (size_t) mv.cold * l.gub;
+                        l.cex.fdn[(size_t) (mv.rs - l.n_copy)] = pk.data(*l.t_dn) + (size_t) mv.cold * l.db;
+                    }
                 }
                 std::lock_guard<std::mutex> lk(gp.sw_mu);
                 gp.sw_state = 4;
@@ -2856,7 +3008,7 @@ struct Model::Impl {
             gp.sw_cv.notify_all();
         }
     }
-    bool swap_on() const { return o.expert_cache && !tapf && !pick_hook && st.ram_gb > 0; }
+    bool swap_on() const { return o.expert_cache && !tapf && !pick_hook && st.ram_gb + st.file_gb > 0; }
     // the decode thread, between two steps (no layer runs): the finished copies' maps, the next move
     bool swap_poll(std::string& err, int batch = 0) {
         if (!swap_on()) return true;
@@ -2888,7 +3040,7 @@ struct Model::Impl {
                 std::vector<std::pair<float, Gpu::Move>> c;
                 for (int il = gp.l0; il < gp.l1; ++il) {
                     Layer& l = L[(size_t) il];
-                    if (!l.ram || l.n_res == 0) continue;
+                    if (l.n_res == 0 || l.n_res >= g.n_expert) continue;   // (no VRAM slot, or no expert outside)
                     int hot = -1, cold = -1;
                     for (int e = 0; e < g.n_expert; ++e) {
                         const float u = l.use[(size_t) e];
@@ -3133,10 +3285,11 @@ struct Model::Impl {
                           gp.expert_bytes / 1073741824.0, gp.free0 / 1073741824.0, gp.total / 1073741824.0);
             v.push_back(b);
         }
-        std::snprintf(b, sizeof b, "experts: %d of %d in VRAM (%.1f%%), the others in RAM (%.1f GiB%s), CPU lane %d threads",
+        std::snprintf(b, sizeof b, "experts: %d of %d in VRAM (%.1f%%), the others in RAM (%.1f GiB%s) and in place in the "
+                      "files (%.1f GiB), CPU lane %d threads",
                       st.experts_vram, st.experts_all, 100.0 * st.experts_vram / std::max(1, st.experts_all),
                       st.ram_gb * 1e9 / 1073741824.0, st.ram_gb > 0 ? (st.ram_locked ? ", page-locked" : ", not page-locked") : "",
-                      lane ? lane->threads() + 1 : 0);
+                      st.file_gb * 1e9 / 1073741824.0, lane ? lane->threads() + 1 : 0);
         v.push_back(b);
         return v;
     }

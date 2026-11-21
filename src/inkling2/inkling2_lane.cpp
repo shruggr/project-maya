@@ -54,7 +54,7 @@ void cpu_experts(hy4::Lane& lane, const CpuExperts& ex, const std::vector<CpuEnt
         const int i = it / h_chunks, r0 = (it % h_chunks) * kRowChunk, r1 = std::min(F, r0 + kRowChunk);
         const void* act = sc.act.data();
         float* o = sc.gu.data() + (size_t) i * 2 * F;
-        const uint8_t* gate = ex.base + (size_t) entries[(size_t) i].slot * ex.blob;
+        const uint8_t* gate = ex.gu(entries[(size_t) i].slot);
         iqc::iq_cpu_gate_up(f, gate, gate + (size_t) F * f.gu_row, &act, 1, &o, r0, r1, 0.0f);
     });
     lane.parallel_for(n, [&](int i) {
@@ -65,7 +65,7 @@ void cpu_experts(hy4::Lane& lane, const CpuExperts& ex, const std::vector<CpuEnt
         const int i = it / gu_chunks, r0 = (it % gu_chunks) * kRowChunk, r1 = std::min(2 * F, r0 + kRowChunk);
         const void* act = sc.act.data();
         float* o = sc.gu.data() + (size_t) i * 2 * F;
-        iqc::iq_cpu_rows(f.tg, ex.base + (size_t) entries[(size_t) i].slot * ex.blob, f.gu_row, E, &act, 1, &o, r0, r1);
+        iqc::iq_cpu_rows(f.tg, ex.gu(entries[(size_t) i].slot), f.gu_row, E, &act, 1, &o, r0, r1);
     });
     // SITU in place over the gate half, then h as the down's activation type
     lane.parallel_for(n, [&](int i) {
@@ -78,7 +78,7 @@ void cpu_experts(hy4::Lane& lane, const CpuExperts& ex, const std::vector<CpuEnt
         const int i = it / dn_chunks, r0 = (it % dn_chunks) * kRowChunk, r1 = std::min(E, r0 + kRowChunk);
         const void* hq = sc.hq.data() + (size_t) i * f.h_bytes;
         float* y = sc.y.data() + (size_t) i * E;
-        iqc::iq_cpu_down(f, ex.base + (size_t) entries[(size_t) i].slot * ex.blob + ex.tr_down, &hq, 1, &y, r0, r1);
+        iqc::iq_cpu_down(f, ex.dn(entries[(size_t) i].slot), &hq, 1, &y, r0, r1);
     });
     for (int i = 0; i < n; ++i) {
         const float w = entries[(size_t) i].w;
@@ -158,7 +158,7 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
     lane.parallel_for(U * h_chunks, [&](int it) {
         const int u = it / h_chunks, r0 = (it % h_chunks) * kRowChunk, r1 = std::min(F, r0 + kRowChunk);
         const int q0 = sc.ustart[(size_t) u], nt = sc.ustart[(size_t) u + 1] - q0;
-        const uint8_t* gate = ex.base + (size_t) sc.uslot[(size_t) u] * ex.blob;
+        const uint8_t* gate = ex.gu(sc.uslot[(size_t) u]);
         iqc::iq_cpu_gate_up(f, gate, gate + (size_t) F * f.gu_row, sc.ap.data() + q0, nt, sc.gp.data() + q0, r0, r1, 0.0f);
     });
     lane.parallel_for(n, [&](int i) {
@@ -167,7 +167,7 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
     lane.parallel_for(U * dn_chunks, [&](int it) {
         const int u = it / dn_chunks, r0 = (it % dn_chunks) * kRowChunk, r1 = std::min(E, r0 + kRowChunk);
         const int q0 = sc.ustart[(size_t) u], nt = sc.ustart[(size_t) u + 1] - q0;
-        iqc::iq_cpu_down(f, ex.base + (size_t) sc.uslot[(size_t) u] * ex.blob + ex.tr_down, sc.hp.data() + q0, nt,
+        iqc::iq_cpu_down(f, ex.dn(sc.uslot[(size_t) u]), sc.hp.data() + q0, nt,
                          sc.yp.data() + q0, r0, r1);
     });
     for (int i = 0; i < n; ++i) {   // (a row's sum in its picks' order, as the row alone)

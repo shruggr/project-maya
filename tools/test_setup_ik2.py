@@ -491,16 +491,23 @@ class Config(unittest.TestCase):
     def test_again_keeps_what_it_does_not_ask(self):
         old = {"exe": "/x/maya-inkling2", "args": ["--pack", "/old", "--max-context", "32768", "--reserve-mib", "900",
                                                    "--cpu-threads", "16", "--expert-profile", "/p.prof",
-                                                   "--dspark-cum", "0.4"],
+                                                   "--dspark-cum", "0.4", "--mmap-experts", "on"],
                "host": "0.0.0.0", "api_key": "k", "env": {"A": "1"}, "port": 9000, "reasoning_effort": "high"}
         (self.root / "maya-inkling2-hip.json").write_text(json.dumps(old), encoding="utf-8")
         cfg = self.write(args(env=["B=2"]))
         for f, v in (("--reserve-mib", "900"), ("--cpu-threads", "16"), ("--expert-profile", "/p.prof"),
-                     ("--dspark-cum", "0.4"), ("--max-context", "262144"),
+                     ("--dspark-cum", "0.4"), ("--mmap-experts", "on"), ("--max-context", "262144"),
                      ("--pack", str(self.lay.d / maya.IK2_PACK))):
             self.assertEqual(maya.flag_value(cfg["args"], f), v)
         self.assertEqual((cfg["host"], cfg["api_key"], cfg["env"]), ("0.0.0.0", "k", {"A": "1", "B": "2"}))
         self.assertEqual(cfg["reasoning_effort"], Q.MODEL_DEFAULTS["ik2"][1])   # (the model's own, every setup)
+
+    def test_mmap_experts_as_deepseeks(self):
+        """--mmap-experts (maya-ds4's flag): given to the setup, written - and a setup again keeps it; not given, not
+        written (auto, the engine's default)."""
+        self.assertIsNone(maya.flag_value(self.write()["args"], "--mmap-experts"))
+        self.assertEqual(maya.flag_value(self.write(args(mmap_experts="off"))["args"], "--mmap-experts"), "off")
+        self.assertEqual(maya.flag_value(self.write()["args"], "--mmap-experts"), "off")
 
     def test_the_vram_kept_free(self):
         """--reserve-mib (maya-ds4's flag): what DeepSeek's setup writes on AMD - --vram-reserve-mib, else
@@ -562,15 +569,15 @@ class SetUp(unittest.TestCase):
         self.assertIn("pack already built", out)
 
     def test_said_below_the_memory(self):
-        """As DeepSeek's setup: VRAM + RAM below the model's memory is said, and the setup goes on (here the engine
-        then stops at its start: it copies the experts VRAM does not hold into RAM)."""
+        """As DeepSeek's setup: VRAM + RAM below the model's memory is said, and the setup goes on (the engine then
+        reads the experts RAM does not hold from the model's files: --mmap-experts auto)."""
         lay = Layout(Path(self.t.name), pack=True)
         a = args(model=maya.IK2, models_dir=str(lay.models), gpus="0")
         with patch.dict(PC, gpus=AMD[:1]):
             path, out = self.run_setup(lay, a, ram=64)
         self.assertIsNotNone(path, out)
         self.assertIn(f"below the ~{maya.IK2_MEMORY_GB} GB", out)
-        self.assertIn("stop at its start", out)
+        self.assertIn("read in place from the model's files", out)
         self.assertEqual(self.built, ["maya-inkling2"])
 
     def test_drafting_as_deepseeks(self):

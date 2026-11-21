@@ -123,7 +123,8 @@ class Settings(unittest.TestCase):
         and written to maya-inkling2's flags as DeepSeek's are - empty: the flag dropped, the engine's own default."""
         cfg = amd(self.pack, "--dspark-index", str(self.index))
         got = models.settings_of(cfg)
-        self.assertEqual({k: got[k] for k in models.IK2_AMD_ONLY}, dict.fromkeys(models.IK2_AMD_ONLY))
+        self.assertEqual({k: got[k] for k in models.IK2_AMD_ONLY},
+                         {**dict.fromkeys(models.IK2_AMD_ONLY), "mmap": "auto"})   # (DeepSeek's: auto, the engine's own)
         out = models.apply(cfg, {"reserve_mib": 3072, "prefill_chunk": 1024, "cpu_threads": 16, "dspark_cum": 0.4})
         for f, v in (("--reserve-mib", "3072"), ("--prefill-chunk", "1024"), ("--cpu-threads", "16"),
                      ("--dspark-cum", "0.4")):
@@ -138,6 +139,22 @@ class Settings(unittest.TestCase):
         self.assertNotIn("reserve_mib", models.settings_of(cuda))
         with self.assertRaises(ValueError):
             models.apply(cuda, {"reserve_mib": 3072})
+
+    def test_mmap_as_deepseeks(self):
+        """mmap (DS4_KEYS'): --mmap-experts on | off written, auto (the engine's default) the flag dropped; anything
+        else refused; maya-ik2 has no such setting."""
+        cfg = amd(self.pack, "--dspark-index", str(self.index))
+        for v in ("on", "off"):
+            with self.subTest(mmap=v):
+                out = models.apply(cfg, {"mmap": v})
+                self.assertEqual(models.flag(out["args"], "--mmap-experts"), v)
+                self.assertEqual(models.settings_of(out)["mmap"], v)
+                self.assertEqual(models.apply(out, {"mmap": "auto"})["args"], models.apply(cfg, {})["args"])
+        self.assertEqual(models.settings_of(amd(self.pack, "--mmap-experts", "bogus"))["mmap"], "auto")
+        with self.assertRaises(ValueError):
+            models.apply(cfg, {"mmap": "maybe"})
+        with self.assertRaises(ValueError):
+            models.apply(dict(CUDA), {"mmap": "on"})
 
     def test_the_pages_figures(self):
         """maya-inkling2's entry carries its VRAM a position and the drafter's - the setup's figures (maya.py takes
@@ -230,8 +247,9 @@ class PageJs(unittest.TestCase):
     def test_amd_has_the_switch(self):
         f = rows_of(self.got["amd"])
         self.assertEqual(list(f), ["Context size", "Drafting", "Images", "Answers at once", "GPUs", "VRAM kept free",
-                                   "Prompt chunk", "CPU threads", "Draft confidence"])
-        for label, flag in (("VRAM kept free", "--reserve-mib"), ("Prompt chunk", "--prefill-chunk"),
+                                   "Experts VRAM does not hold", "Prompt chunk", "CPU threads", "Draft confidence"])
+        for label, flag in (("VRAM kept free", "--reserve-mib"), ("Experts VRAM does not hold", "--mmap-experts"),
+                            ("Prompt chunk", "--prefill-chunk"),
                             ("CPU threads", "--cpu-threads"), ("Draft confidence", "--dspark-cum")):
             self.assertEqual(f[label]["flag"], flag)
         self.assertIn("running product", f["Draft confidence"]["hint"])

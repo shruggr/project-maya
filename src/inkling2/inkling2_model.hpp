@@ -54,6 +54,11 @@ struct Options {
                                   // last GPU, fed every position's taps by the steps and the prompt path
     float dspark_cum = 0.5f;      // its cut on the running product of the drafts' probabilities (Model::set_draft_cum)
     bool expert_cache = true;     // experts move between VRAM and the CPU lane as they are used (maya-ds4's)
+    // --mmap-experts (maya-ds4's flag, values and default): the CPU lane's experts copied into RAM or read in place from
+    // the model's files (the page cache, the disk where it does not hold them).  1 on: none copied; 0 off: the most
+    // routed that fit the RAM beside ram_margin, the rest in place; -1 auto: as off here (maya-ds4's copies none
+    // unless all fit with 8 GiB to spare - measured slower on this engine: Impl::place_ram)
+    int mmap_experts = -1;
     bool verbose = false;
 };
 
@@ -68,6 +73,7 @@ struct Stats {
     int64_t swaps = 0;                       // experts the cache moved into VRAM (each for a colder one moved out)
     int64_t streamed = 0;                    // experts a prompt's chunks copied from RAM to the GPUs' staging slots
     bool ram_pinned = false;                 // the RAM experts are registered with the GPUs' driver (the prompt path's)
+    double file_gb = 0;                      // the CPU lane's experts read in place from the model's files
 };
 
 class Model {
