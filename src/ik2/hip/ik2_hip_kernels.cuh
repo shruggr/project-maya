@@ -171,6 +171,23 @@ void argmax_rows(const float* x, size_t ld, int rows, int n, float* out, cudaStr
 void scatter_rows(const float* y, const int* row_of, int n, int E, float* ent, cudaStream_t s);
 void combine_rows(const float* ent, const float* w, int T, int nu, int E, float* out, cudaStream_t s);
 
+// ---- the loop (Inkling-2-Mini): the CUDA build's message gates (src/ik2/ik2_loop.inc), its interface
+/// token: g = D [rms(x); rms(m)] (D [R][2 C]: x's columns first; the norms without a weight, eps),
+/// y = (1 - tanh(F g)) x + tanh(G g) m (F, G by rank: [R][C]).  x: the input, m: the message from the pass before,
+/// [T][C]; R <= 128; y may be x.  n <= 3 gates (a layer's q, k and v inputs) in two launches.
+/// sc: scratch, [n][T][2 R + 2] floats.
+struct LoopGate {
+    const float *x, *m, *D, *F, *G;
+    float* y;
+};
+void loop_gates(const LoopGate* gates, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s);
+/// The same gate over a chunk of tokens with its products taken as matrix products by the caller: loop_gate_mix
+/// gives g [T][R] = a1 / rms(x) + a2 / rms(m) of a1 = x D_x^T, a2 = m D_m^T ([T][R]); loop_gate_blend
+/// y = (1 - tanh f) x + tanh(gn) m of f = g F, gn = g G ([T][C]; n = T C; y may be x).
+void loop_gate_mix(const float* x, const float* m, const float* a1, const float* a2, int T, int C, int R, float eps,
+                   float* g, cudaStream_t s);
+void loop_gate_blend(const float* x, const float* m, const float* f, const float* gn, size_t n, float* y, cudaStream_t s);
+
 /// Launch failures since the last call (each printed); 0 none
 int errors();
 

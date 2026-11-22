@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace ik2hip::k {
 
@@ -1022,7 +1023,71 @@ __global__ void combine_rows_kernel(const float* __restrict__ ent, const float* 
 
 unsigned blocks_of(size_t n, int per = 256) { return (unsigned) ((n + (size_t) per - 1) / (size_t) per); }
 
+// ---- the CUDA build's loop gates (src/ik2/ik2_loop.inc), which both builds run, with the helpers it takes by those
+// names
+__device__ __forceinline__ float wsum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ float bsum(float v, float* sh) { return block_sum(v, sh); }
+constexpr int kBlk = 256;
+__host__ __device__ __forceinline__ float bits_to_float(uint32_t u) {
+#if defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__
+    return __uint_as_float(u);
+#else
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+#endif
+}
+__device__ __forceinline__ float2 u32_to_f2(uint32_t u) {
+    const __half2 h2 = __halves2half2(__ushort_as_half((uint16_t) (u & 0xFFFFu)), __ushort_as_half((uint16_t) (u >> 16)));
+    return __half22float2(h2);
+}
+#include "../ik2_loop.inc"
+
 }  // namespace
+
+// (the CUDA build's launchers of the same kernels, ik2_kernels.cu's; a failure is counted - errors() - not fatal)
+void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s) {
+    if (T <= 0 || n <= 0) return;
+    if (n > 3 || R > kLoopRankMax || T > 65535) {
+        std::fprintf(stderr, "maya-ik2 loop_gates: %d gates, rank %d, %d tokens\n", n, R, T);
+        g_err.fetch_add(1);
+        return;
+    }
+    LoopGateArgs a{};
+    for (int j = 0; j < n; ++j) {
+        a.x[j] = gt[j].x;
+        a.m[j] = gt[j].m;
+        a.y[j] = gt[j].y;
+        a.D[j] = gt[j].D;
+        a.F[j] = gt[j].F;
+        a.G[j] = gt[j].G;
+    }
+    loop_gate_dots_kernel<false><<<dim3((unsigned) R, (unsigned) n, (unsigned) T), 128, 0, s>>>(a, T, C, R, sc);
+    check("loop_gates (dots)");
+    loop_gate_apply_kernel<0, false><<<dim3(blocks_of((size_t) C), (unsigned) n, (unsigned) T), kBlk, 0, s>>>(a, T, C, R,
+                                                                                                         eps, sc);
+    check("loop_gates (apply)");
+}
+void loop_gate_mix(const float* x, const float* m, const float* a1, const float* a2, int T, int C, int R, float eps,
+                   float* g, cudaStream_t s) {
+    if (T <= 0) return;
+    if (R > kBlk) {
+        std::fprintf(stderr, "maya-ik2 loop_gate_mix: rank %d\n", R);
+        g_err.fetch_add(1);
+        return;
+    }
+    loop_gate_mix_kernel<<<(unsigned) T, kBlk, 0, s>>>(x, m, a1, a2, C, R, eps, g);
+    check("loop_gate_mix");
+}
+void loop_gate_blend(const float* x, const float* m, const float* f, const float* gn, size_t n, float* y, cudaStream_t s) {
+    if (!n) return;
+    loop_gate_blend_kernel<<<blocks_of(n), kBlk, 0, s>>>(x, m, f, gn, n, y);
+    check("loop_gate_blend");
+}
 
 void mix(const float* blocks, int nb, const float* cur, int E, const float* query, int nq, float eps, float* stat,
          float* out, cudaStream_t s) {
