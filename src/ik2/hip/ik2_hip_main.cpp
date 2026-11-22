@@ -48,6 +48,12 @@ std::vector<int> int_list(const std::string& s) {
     for (int i; is >> i;) v.push_back(i);
     return v;
 }
+// a STAT line's expert tiers (the Monitor's "Where the experts live": serve/web/server.js tierShares): the routed
+// experts in VRAM and copied into RAM - the others in place in the model's files, on the SSD - and each tier's GB
+void stat_tiers(const ik2hip::Stats& st) {
+    std::printf(" vram_used=%d ram_used=%d vram_gb=%.2f ram_gb=%.2f disk_gb=%.2f", st.experts_vram, st.experts_ram,
+                st.experts_vram_gb, st.ram_gb, st.file_gb);
+}
 
 // One tensor of a reference dump (index.jsonl: step, name, file, type, ne)
 struct RefT {
@@ -627,6 +633,7 @@ int serve(ik2hip::Model& m, const std::vector<int>& stops, int short_n, bool spe
                 const double share = (double) (st.cpu_experts - cpu0) / (double) std::max<int64_t>(1, st.experts - ex0);
                 std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f cpu_share=%.4f swaps=%lld", 1e3 * (double) produced / ms,
                             ms / (double) produced, 1.0 - share, 0.0, share, (long long) st.swaps);
+                stat_tiers(st);
                 if (dr.on) {
                     std::printf(" draft_rounds=%lld draft_ms=%.3f verify_ms=%.3f", dr.drafted - d0.drafted,
                                 dr.draft_ms - d0.draft_ms, dr.verify_ms - d0.verify_ms);
@@ -793,9 +800,11 @@ int serve_multi(ik2hip::Model& m, const std::vector<int>& stops, int short_n, bo
         if (a.produced % 8 == 0) {
             const double ms = (now_s() - a.t1) * 1e3;
             const double share = (double) (st.cpu_experts - a.cpu0) / (double) std::max<int64_t>(1, st.experts - a.ex0);
-            std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f cpu_share=%.4f swaps=%lld\n",
+            std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f cpu_share=%.4f swaps=%lld",
                         1e3 * (double) a.produced / ms, ms / (double) a.produced, 1.0 - share, 0.0, share,
                         (long long) st.swaps);
+            stat_tiers(st);
+            std::printf("\n");
         }
         std::fflush(stdout);
         return true;

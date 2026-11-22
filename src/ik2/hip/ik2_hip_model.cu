@@ -742,6 +742,7 @@ struct Model::Impl {
                 gp.n_res += ns;
                 gp.expert_bytes += l.blob * (size_t) ns;
                 st.experts_vram += ns;
+                st.experts_vram_gb += (double) (l.blob * (size_t) ns) / 1e9;
             }
         }
         return place_ram();
@@ -788,12 +789,14 @@ struct Model::Impl {
             used += b;
             cp[(size_t) x.il * g.n_expert + x.e] = 1;
         }
+        st.experts_ram = 0;
         for (int il = 0; il < NL; ++il) {
             Layer& l = L[(size_t) il];
             int nr = 0;
             for (int e = 0; e < g.n_expert; ++e)
                 if (l.slot_of[(size_t) e] < 0 && cp[(size_t) il * g.n_expert + e]) l.ram_of[(size_t) e] = nr++;
             l.n_copy = nr;
+            st.experts_ram += nr;
             for (int e = 0; e < g.n_expert; ++e)
                 if (l.slot_of[(size_t) e] < 0 && !cp[(size_t) il * g.n_expert + e]) l.ram_of[(size_t) e] = nr++;
         }

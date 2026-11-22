@@ -71,6 +71,8 @@ struct Stats {
     bool ram_locked = false;                 // ... page-locked (mlock took them all)
     int64_t tokens = 0;
     int experts_vram = 0, experts_all = 0;   // the routed experts in VRAM, all of them
+    int experts_ram = 0;                     // ... copied into RAM (the others outside VRAM: in place in the files)
+    double experts_vram_gb = 0;              // the VRAM experts' bytes (the Monitor's "Where the experts live")
     int64_t experts = 0, cpu_experts = 0;    // routed experts run, and how many on the CPU lane
     double cpu_ms = 0;                       // the CPU lane's time
     int64_t swaps = 0;                       // experts the cache moved into VRAM (each for a colder one moved out)
