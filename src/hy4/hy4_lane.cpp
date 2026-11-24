@@ -105,6 +105,23 @@ std::vector<std::vector<int>> node_cores() {
         }
         if (!cores.empty()) nodes.push_back(cores);
     }
+    // HY4_LANE_L3=1 on a host of one NUMA node: the cores grouped by their L3 instead (a Zen CCD each) - parallel_for's
+    // node_of then keeps an item's reads in one L3, where an earlier job of the same items left them
+    if (nodes.size() == 1 && std::getenv("HY4_LANE_L3") && std::atoi(std::getenv("HY4_LANE_L3")) != 0) {
+        std::vector<std::vector<int>> by_l3;
+        std::vector<std::string> ids;
+        for (int c : nodes[0]) {
+            const std::string id = read_file("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/cache/index3/id");
+            size_t q = 0;
+            while (q < ids.size() && ids[q] != id) ++q;
+            if (q == ids.size()) {
+                ids.push_back(id);
+                by_l3.emplace_back();
+            }
+            by_l3[q].push_back(c);
+        }
+        if (by_l3.size() > 1) nodes = by_l3;
+    }
 #endif
     if (nodes.empty()) {
         std::vector<int> all = strata::kernels::cpu::physical_cores(false);

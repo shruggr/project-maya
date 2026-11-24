@@ -61,6 +61,15 @@ bool quant_splits(int k, size_t bytes) {
     static const bool old = std::getenv("IK2_HIP_LANE_OLD") != nullptr;
     return !old && k % 256 == 0 && bytes % (size_t) (k / 256) == 0;
 }
+// A lane of several L3 groups (hy4's HY4_LANE_L3=1): each 128-row piece of an expert - a gate | up piece c, a down
+// piece h_chunks + c - goes to the group piece_group gives it, the same in cpu_experts_prefetch and in the compute, so
+// the compute finds what the prefetch read in its own L3 (IK2_HIP_LANE_AFFINE=0: the pieces to any thread, as before).
+// Which thread does a piece never changes its arithmetic.
+inline int piece_group(int slot, int c, int groups) { return (slot + c) % groups; }
+bool lane_affine(const hy4::Lane& lane) {
+    static const bool off = std::getenv("IK2_HIP_LANE_AFFINE") && std::atoi(std::getenv("IK2_HIP_LANE_AFFINE")) == 0;
+    return !off && lane.nodes() > 1;
+}
 inline double lp_now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 constexpr int kRowChunk = 128;   // rows a work item
 struct Scratch {
@@ -163,7 +172,7 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
     struct RowScratch {
         std::vector<float> gu, y;
         std::vector<uint8_t> act, hq;
-        std::vector<int> uslot, ustart, uent;
+        std::vector<int> uslot, ustart, uent, nof_gu, nof_dn;
         std::vector<const void*> ap, hp;
         std::vector<float*> gp, yp;
     };
@@ -235,12 +244,23 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
     }
     lap(0);
     const int h_chunks = (F + kRowChunk - 1) / kRowChunk, dn_chunks = (E + kRowChunk - 1) / kRowChunk;
+    const bool aff = lane_affine(lane);
+    if (aff) {
+        const int G = lane.nodes();
+        sc.nof_gu.resize((size_t) U * h_chunks);
+        sc.nof_dn.resize((size_t) U * dn_chunks);
+        for (int u = 0; u < U; ++u) {
+            for (int c = 0; c < h_chunks; ++c) sc.nof_gu[(size_t) (u * h_chunks + c)] = piece_group(sc.uslot[(size_t) u], c, G);
+            for (int c = 0; c < dn_chunks; ++c)
+                sc.nof_dn[(size_t) (u * dn_chunks + c)] = piece_group(sc.uslot[(size_t) u], h_chunks + c, G);
+        }
+    }
     lane.parallel_for(U * h_chunks, [&](int it) {
         const int u = it / h_chunks, r0 = (it % h_chunks) * kRowChunk, r1 = std::min(F, r0 + kRowChunk);
         const int q0 = sc.ustart[(size_t) u], nt = sc.ustart[(size_t) u + 1] - q0;
         const uint8_t* gate = ex.gu(sc.uslot[(size_t) u]);
         iqc::iq_cpu_gate_up(f, gate, gate + (size_t) F * f.gu_row, sc.ap.data() + q0, nt, sc.gp.data() + q0, r0, r1, 0.0f);
-    });
+    }, aff ? &sc.nof_gu : nullptr);
     lap(1);
     if (quant_splits(F, f.h_bytes) && n <= 256) {
         const float* src[256];
@@ -261,7 +281,7 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
         const int q0 = sc.ustart[(size_t) u], nt = sc.ustart[(size_t) u + 1] - q0;
         iqc::iq_cpu_down(f, ex.dn(sc.uslot[(size_t) u]), sc.hp.data() + q0, nt,
                          sc.yp.data() + q0, r0, r1);
-    });
+    }, aff ? &sc.nof_dn : nullptr);
     lap(3);
     for (int i = 0; i < n; ++i) {   // (a row's sum in its picks' order, as the row alone)
         const float w = entries[(size_t) i].w;
@@ -273,5 +293,50 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
 #endif
 }
 
+void cpu_experts_prefetch(hy4::Lane& lane, const CpuExperts& ex, const int* slots, int n, const volatile unsigned* flag,
+                          unsigned v) {
+    if (n <= 0) return;
+    const iqc::IqCpu& f = ex.f;
+    const int E = f.n_embd, F = f.n_ff;
+    const int h_chunks = (F + kRowChunk - 1) / kRowChunk, dn_chunks = (E + kRowChunk - 1) / kRowChunk, per = h_chunks + dn_chunks;
+    static thread_local std::vector<int> nof;
+    const bool aff = lane_affine(lane);
+    if (aff) {
+        nof.resize((size_t) n * per);
+        for (int u = 0; u < n; ++u)
+            for (int c = 0; c < per; ++c) nof[(size_t) (u * per + c)] = piece_group(slots[u], c, lane.nodes());
+    }
+    std::atomic<bool> stop{false};
+    lane.parallel_for(n * per, [&](int it) {
+        const int u = it / per, c = it % per;
+        auto stopped = [&] {
+            if (stop.load(std::memory_order_relaxed)) return true;
+            if (flag && *flag == v) {
+                stop.store(true, std::memory_order_relaxed);
+                return true;
+            }
+            return false;
+        };
+        auto touch = [&](const uint8_t* p, size_t bytes) {
+            uint64_t acc = 0;
+            for (size_t o = 0; o < bytes; o += 64) {
+                if ((o & 16383) == 0 && stopped()) break;
+                acc ^= *(const volatile uint64_t*) (p + o);
+            }
+            static thread_local volatile uint64_t sink;
+            sink = acc;
+        };
+        if (stopped()) return;
+        if (c < h_chunks) {
+            const int r0 = c * kRowChunk, r1 = std::min(F, r0 + kRowChunk);
+            const uint8_t* g = ex.gu(slots[u]);
+            touch(g + (size_t) r0 * f.gu_row, (size_t) (r1 - r0) * f.gu_row);
+            touch(g + (size_t) (F + r0) * f.gu_row, (size_t) (r1 - r0) * f.gu_row);
+        } else {
+            const int r0 = (c - h_chunks) * kRowChunk, r1 = std::min(E, r0 + kRowChunk);
+            touch(ex.dn(slots[u]) + (size_t) r0 * f.d_row, (size_t) (r1 - r0) * f.d_row);
+        }
+    }, aff ? &nof : nullptr);
+}
 
 }  // namespace ik2hip

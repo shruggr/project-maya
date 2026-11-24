@@ -96,6 +96,8 @@ struct Mat {
 struct Layer {
     int il = 0, gpu = -1;
     std::vector<int> lp_prev[2];   // (IK2_HIP_LANE_PROF: the RAM experts the lane computed the last two times)
+    std::vector<int> pf_hist[2], pf_list;   // (IK2_HIP_LANE_PREFETCH: the RAM experts the lane computed here the last two
+                                            //  times; the list prefetched: the last time's, then the time before's)
     bool swa = true;
     float *attn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr, *v_norm = nullptr;
     float *attn_res = nullptr, *ffn_res = nullptr, *ffn_norm = nullptr;
@@ -418,6 +420,11 @@ struct Model::Impl {
                                  "within its last two (the last time: %.2f a layer)\n", lp_reuse[2],
                          100.0 * lp_reuse[0] / lp_reuse[2], 100.0 * lp_reuse[1] / lp_reuse[2],
                          (double) lp_reuse[3] / (double) std::max<long long>(1, lp_n));
+        if (lane_pf && fast_n > 0)
+            std::fprintf(stderr, "LANE_PREFETCH %lld prefetches, %.2f experts each, %.1f us each (%.2f ms a token), %.1f%% "
+                                 "of the RAM experts computed prefetched; %lld prefetches with the routes out already\n",
+                         pf_n, (double) pf_experts / std::max<long long>(1, pf_n), 1e6 * lane_pf_s / std::max<long long>(1, pf_n),
+                         1e3 * lane_pf_s / fast_n, 100.0 * pf_hit / std::max<long long>(1, pf_cur), pf_late);
         if (phases && fast_n > 0) {
             static const char* nm[10] = {"", "mix + rms", "input projections", "convs + clips + cache rows", "attention",
                                          "gate + output + residual", "mix + rms + router + publish + plan", "GPU experts + sum",
@@ -1926,6 +1933,16 @@ struct Model::Impl {
     double fast_s = 0, fast_enq_s = 0, lane_work_s = 0, lane_wait_s = 0;
     const bool lane_prof = std::getenv("IK2_HIP_LANE_PROF") != nullptr;
     long long lp_reuse[4] = {0, 0, 0, 0}, lp_n = 0;
+    // IK2_HIP_LANE_PREFETCH=N (N experts at most, 1: 6): while the lane waits for a layer's routes, the RAM experts it
+    // computed at that layer the last time (then the time before, up to N) read into its caches (cpu_experts_prefetch; best with HY4_LANE_L3=1) - an
+    // expert the routes pick again then comes from cache.  The arithmetic is the same: the bits do not change.
+    const int lane_pf = [] {
+        const char* e = std::getenv("IK2_HIP_LANE_PREFETCH");
+        const int n = e ? std::atoi(e) : 0;
+        return n == 1 ? 6 : std::max(0, n);
+    }();
+    double lane_pf_s = 0;
+    long long pf_n = 0, pf_experts = 0, pf_hit = 0, pf_cur = 0, pf_late = 0;
     int64_t fast_n = 0;
     bool fast_ready = false;
     // IK2_HIP_PHASES=1 (tests): device-side marks between a layer's phases in the host-free step (events on the
@@ -2053,6 +2070,21 @@ struct Model::Impl {
                         l.lp_prev[1] = std::move(l.lp_prev[0]);
                         l.lp_prev[0] = std::move(cur);
                     }
+                    if (lane_pf) {   // (this layer's RAM experts: the next pass's prefetch here)
+                        std::vector<int> cur;
+                        for (const CpuRowEntry& e : rent)
+                            if (std::find(cur.begin(), cur.end(), e.slot) == cur.end()) cur.push_back(e.slot);
+                        for (int e : cur) pf_hit += std::find(l.pf_list.begin(), l.pf_list.end(), e) != l.pf_list.end();
+                        pf_cur += (long long) cur.size();
+                        l.pf_hist[1] = std::move(l.pf_hist[0]);
+                        l.pf_hist[0] = std::move(cur);
+                        l.pf_list = l.pf_hist[0];
+                        for (int e : l.pf_hist[1])
+                            if ((int) l.pf_list.size() < lane_pf &&
+                                std::find(l.pf_list.begin(), l.pf_list.end(), e) == l.pf_list.end())
+                                l.pf_list.push_back(e);
+                        if ((int) l.pf_list.size() > lane_pf) l.pf_list.resize((size_t) lane_pf);
+                    }
                     if (rent.empty()) std::memset(l.m_cpu, 0, sizeof(float) * (size_t) E * (size_t) Tn);
                     else if (dbg & 4) {   // (tests: a row at a time)
                         std::vector<CpuRowEntry> one;
@@ -2070,6 +2102,20 @@ struct Model::Impl {
                     const double t1 = now_s();
                     lane_work_s += t1 - t0;
                     if (!ent.empty()) st.cpu_ms += (t1 - t0) * 1e3;
+                    if (lane_pf && il + 1 < NL) {   // (the next layer's last RAM experts, until its routes come)
+                        Layer& ln = L[(size_t) il + 1];
+                        const volatile unsigned* fn = f_pub + (size_t) (il + 1) * kLine;
+                        if (!ln.pf_list.empty() && ln.cex.base) {
+                            if (*fn == v) ++pf_late;
+                            else {
+                                const int n = (int) ln.pf_list.size();
+                                cpu_experts_prefetch(*lane, ln.cex, ln.pf_list.data(), n, fn, v);
+                                ++pf_n;
+                                pf_experts += n;
+                                lane_pf_s += now_s() - t1;
+                            }
+                        }
+                    }
                 }
             }
         next:
