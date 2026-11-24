@@ -44,6 +44,20 @@
 #include <thread>
 
 namespace ik2hip {
+// decode attention: the chunked form (k::attention_chunk_rows, own runtime 2026-11-24) unless IK2_HIP_ATTN_TILES is set
+// (the 16-key tiles of k::attention_split_rows, as before); the tiles also when the chunks are refused
+static bool attn_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
+                      const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
+                      int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
+                      cudaStream_t s) {
+    static const bool tiles = std::getenv("IK2_HIP_ATTN_TILES") != nullptr;
+    if (!tiles && k::attention_chunk_rows(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, K, V, ring, p0, lo0, window,
+                                          scale, S, S_floats, gate, out, s))
+        return true;
+    return k::attention_split_rows(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, K, V, ring, p0, lo0, window, scale,
+                                   S, S_floats, gate, out, s);
+}
+
 
 namespace iq = strata::ds4::gguf::iq;
 namespace hk = hy4::k;
@@ -2265,7 +2279,7 @@ struct Model::Impl {
             for (int t = 0; t < T; ++t) {
                 const SeqLayer& q = seqs[(size_t) mrows[t].seq].L[(size_t) l.il];
                 const int64_t pf = mrows[t].p, lo = l.swa ? std::max<int64_t>(0, pf - (g.n_swa - 1)) : 0;
-                if (!k::attention_split_rows(gp.w_q + (size_t) t * HD, gp.w_rel + (size_t) t * H * g.d_rel,
+                if (!attn_rows(gp.w_q + (size_t) t * HD, gp.w_rel + (size_t) t * H * g.d_rel,
                                              gp.w_sink + (size_t) t * H, 1, H, Hkv, D, g.d_rel, l.rel_bias,
                                              l.swa ? g.n_swa : g.rel_extent, q.K, q.V, l.ring, pf, lo, l.swa ? g.n_swa : 0,
                                              1.0f / std::sqrt((float) D), gp.S, gp.S_floats, gp.w_gate + (size_t) t * HD,
@@ -2282,7 +2296,7 @@ struct Model::Impl {
             for (int t0 = 0; t0 < T; t0 += fit) {
                 const int tn = std::min(fit, T - t0);
                 const int64_t pf = p0 + t0, lo = l.swa ? std::max<int64_t>(0, pf - (g.n_swa - 1)) : 0;
-                if (!k::attention_split_rows(gp.w_q + (size_t) t0 * HD, gp.w_rel + (size_t) t0 * H * g.d_rel,
+                if (!attn_rows(gp.w_q + (size_t) t0 * HD, gp.w_rel + (size_t) t0 * H * g.d_rel,
                                              gp.w_sink + (size_t) t0 * H, tn, H, Hkv, D, g.d_rel, l.rel_bias,
                                              l.swa ? g.n_swa : g.rel_extent, l.K, l.V, l.ring, pf, lo, l.swa ? g.n_swa : 0,
                                              1.0f / std::sqrt((float) D), gp.S, gp.S_floats, gp.w_gate + (size_t) t0 * HD,

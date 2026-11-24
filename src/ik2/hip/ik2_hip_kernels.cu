@@ -592,6 +592,112 @@ __global__ void attn_combine_seq_big_kernel(const float* __restrict__ st, const 
     if (gate) v *= 1.0f / (1.0f + expf(-gate[(size_t) h * D + tid]));
     out[(size_t) h * D + tid] = v;
 }
+// ---- decode attention in chunks (own runtime, 2026-11-24): the same results as attention_split_rows (within float
+// rounding: its tiles are 16 keys, these kACK), with every thread of a block busy. A block = (a chunk of kACK keys, a kv
+// head): the chunk's keys read once (F16, rows padded so the score threads don't share banks) for all T x (H / Hkv)
+// query rows, the rows' queries in shared memory. Each (row, key) dot is summed in the dimensions' order and each
+// row's chunk maximum, sum and partial values in the keys' order, at chunk boundaries that are multiples of kACK
+// positions whatever the first key is: a row's result does not depend on T (the token step and a verify window give the
+// same bits). The chunks' parts go through the same combine as attention_split_rows.
+template <int CK, int RU>
+__global__ void attn_chunk_rows_kernel(const float* __restrict__ q, const float* __restrict__ rel,
+                                       const float* __restrict__ sink, int T, int H, int Hkv, int D, int n_rel,
+                                       const float* __restrict__ rel_bias, int extent, const __half* __restrict__ K,
+                                       const __half* __restrict__ V, int ring, long long base, int d0, int window, int nk,
+                                       float scale, int rpb, float* __restrict__ st, float* __restrict__ part) {
+    extern __shared__ float sm[];   // [TP][D] queries, [TP][CK] scores / weights, [TP] maxima, [CK][D + 2] F16 keys / values
+    const int g = blockIdx.y, tile = blockIdx.x, ntile = gridDim.x, j0 = tile * CK, per = H / Hkv, tid = threadIdx.x;
+    // (blockIdx.z: a slice of rpb of the T x per query rows - fewer rows a block, more blocks a CU)
+    const int rz = blockIdx.z * rpb, TP = min(rpb, T * per - rz), nt = blockDim.x, DP = D + 2;
+    float* sq = sm;
+    float* sw = sq + (size_t) TP * D;
+    float* smx = sw + (size_t) TP * CK;
+    __half* skv = (__half*) (smx + ((TP + 3) & ~3));
+    for (int i = tid; i < TP * D; i += nt) {
+        const int tr = rz + i / D, t = tr / per, h = g * per + tr % per;
+        sq[i] = q[((size_t) t * H + h) * D + i % D];
+    }
+    const int n = min(CK, nk - j0);
+    for (int i = tid; i < CK * (D / 2); i += nt) {
+        const int jj = i / (D / 2), c = (i % (D / 2)) * 2;
+        __half2 v = __floats2half2_rn(0.0f, 0.0f);
+        if (jj < n) {
+            long long sl = base + j0 + jj;
+            if (ring > 0 && sl >= ring) sl -= ring;
+            v = *(const __half2*) (K + ((size_t) sl * Hkv + g) * D + c);
+        }
+        *(__half2*) (skv + (size_t) jj * DP + c) = v;
+    }
+    __syncthreads();
+    // (a thread: a key and RU consecutive rows - the key's values read once for the RU dots, each dot summed in the
+    //  dimensions' order whatever RU is, so the instances give the same bits)
+    for (int e = tid; e < (TP / RU) * CK; e += nt) {
+        const int r0 = (e / CK) * RU, jj = e % CK, j = j0 + jj;
+        const __half* kr = skv + (size_t) jj * DP;
+        float acc[RU];
+        for (int r = 0; r < RU; ++r) acc[r] = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            const float kv = __half2float(kr[i]);
+            for (int r = 0; r < RU; ++r) acc[r] += sq[(size_t) (r0 + r) * D + i] * kv;
+        }
+        for (int r = 0; r < RU; ++r) {
+            const int tl = r0 + r, tr = rz + tl, t = tr / per, h = g * per + tr % per, d = d0 + t - j;
+            float a = -INFINITY;
+            if (jj < n && d >= 0 && (window == 0 || d < window)) {
+                a = acc[r] * scale;
+                if (d < extent) {
+                    const float* bb = rel_bias + (size_t) d * n_rel;
+                    const float* rr = rel + ((size_t) t * H + h) * n_rel;
+                    float bs = 0.0f;
+                    for (int i = 0; i < n_rel; ++i) bs += rr[i] * bb[i];
+                    a += bs;
+                }
+                a -= sink[(size_t) t * H + h];
+            }
+            sw[(size_t) tl * CK + jj] = a;
+        }
+    }
+    __syncthreads();
+    if (tid < TP) {
+        float m = -INFINITY;
+        for (int jj = 0; jj < CK; ++jj) m = fmaxf(m, sw[(size_t) tid * CK + jj]);
+        smx[tid] = m;
+    }
+    __syncthreads();
+    for (int e = tid; e < TP * CK; e += nt) sw[e] = sw[e] > -INFINITY ? expf(sw[e] - smx[e / CK]) : 0.0f;
+    for (int i = tid; i < CK * (D / 2); i += nt) {   // (the keys are done with: the chunk's values in their place)
+        const int jj = i / (D / 2), c = (i % (D / 2)) * 2;
+        __half2 v = __floats2half2_rn(0.0f, 0.0f);
+        if (jj < n) {
+            long long sl = base + j0 + jj;
+            if (ring > 0 && sl >= ring) sl -= ring;
+            v = *(const __half2*) (V + ((size_t) sl * Hkv + g) * D + c);
+        }
+        *(__half2*) (skv + (size_t) jj * DP + c) = v;
+    }
+    __syncthreads();
+    if (tid < TP) {
+        float sum = 0.0f;
+        for (int jj = 0; jj < CK; ++jj) sum += sw[(size_t) tid * CK + jj];
+        const int tr = rz + tid;
+        float* o = st + (((size_t) (tr / per) * H + g * per + tr % per) * ntile + tile) * 2;
+        o[0] = smx[tid];
+        o[1] = sum;
+    }
+    for (int e = tid; e < (TP / RU) * D; e += nt) {   // (a thread: a dimension and RU rows, the value read once)
+        const int r0 = (e / D) * RU, dd = e % D;
+        float v[RU];
+        for (int r = 0; r < RU; ++r) v[r] = 0.0f;
+        for (int jj = 0; jj < CK; ++jj) {
+            const float x = __half2float(skv[(size_t) jj * DP + dd]);
+            for (int r = 0; r < RU; ++r) v[r] += sw[(size_t) (r0 + r) * CK + jj] * x;
+        }
+        for (int r = 0; r < RU; ++r) {
+            const int tr = rz + r0 + r;
+            part[(((size_t) (tr / per) * H + g * per + tr % per) * ntile + tile) * D + dd] = v[r];
+        }
+    }
+}
 // ---- the window step's fused forms: the decode step's launches over T rows (T 1: a token) --------------------------
 // block = (a kv head, K or V, a row): the row's conv from the window's inputs and the histories before it, the clip /
 // the norm, the F16 cache row; the last row's blocks write the histories after the window into h1
@@ -1147,6 +1253,67 @@ bool attention_split_rows(const float* q, const float* rel, const float* sink, i
     else   // (more factors than a block's shared memory holds: a chunk of them at a time)
         attn_combine_seq_big_kernel<<<(unsigned) (T * H), 256, 0, s>>>(S, part, ntile, D, gate, out);
     check("attention_split_rows");
+    return true;
+}
+int attention_chunk_keys() {
+    static const int ck = [] {
+        const char* e = std::getenv("IK2_HIP_ATTN_CK");
+        const int v = e ? std::atoi(e) : 64;
+        return v == 32 || v == 64 || v == 128 ? v : 64;
+    }();
+    return ck;
+}
+bool attention_chunk_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
+                          const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
+                          int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
+                          cudaStream_t s) {
+    const int CK = attention_chunk_keys();
+    lo0 -= lo0 % CK;
+    const int nk = (int) (p0 + T - lo0), per = H / Hkv, ntile = (nk + CK - 1) / CK, TP = T * per;
+    if (TP > 256 || D > 256 || (D & 1) || (size_t) T * H * ntile * (size_t) (D + 2) > S_floats) return false;
+    float* part = S + (size_t) T * H * ntile * 2;
+    // rows a block (IK2_HIP_ATTN_RPB, default 24: four tokens' rows of a kv head; measured best of 6 / 12 / 24 / all with
+    // 64-key chunks, tests/ik2_hip_attn_bench), the rest in more blocks
+    int rpb = 24;
+    if (const char* e = std::getenv("IK2_HIP_ATTN_RPB")) rpb = std::max(1, std::atoi(e));
+    rpb = std::min(rpb, TP);
+    const size_t shb = ((size_t) rpb * D + (size_t) rpb * CK + (size_t) ((rpb + 3) & ~3)) * sizeof(float) +
+                       (size_t) CK * (D + 2) * sizeof(__half);
+    if (shb > 64 * 1024) return false;
+    const dim3 grid((unsigned) ntile, (unsigned) Hkv, (unsigned) ((TP + rpb - 1) / rpb));
+    const long long base = (long long) (ring > 0 ? lo0 % ring : lo0);
+    // rows a thread: enough (key, row-group) items for the block's 256 threads, the most rows that leaves
+    // (IK2_HIP_ATTN_RU: 1, 2, 3 or 6 forces it, when it divides the rows)
+    // (a block's rows: rpb, and the last block's the rest - RU must divide both)
+    const int last = TP - (TP - 1) / rpb * rpb;
+    int ru = 1;
+    for (int c : { 6, 3, 2 })
+        if (rpb % c == 0 && last % c == 0 && (rpb / c) * CK >= 256) { ru = c; break; }
+    if (const char* e = std::getenv("IK2_HIP_ATTN_RU")) {
+        const int v = std::atoi(e);
+        if ((v == 1 || v == 2 || v == 3 || v == 6) && rpb % v == 0 && last % v == 0) ru = v;
+    }
+#define IK2_ATTN_CHUNK(ck, r)                                                                                           \
+    attn_chunk_rows_kernel<ck, r><<<grid, 256, shb, s>>>(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent,           \
+                                                        (const __half*) K, (const __half*) V, ring, base,               \
+                                                        (int) (p0 - lo0), window, nk, scale, rpb, S, part)
+#define IK2_ATTN_RU(ck)                                                                                                 \
+    switch (ru) {                                                                                                       \
+        case 6: IK2_ATTN_CHUNK(ck, 6); break;                                                                           \
+        case 3: IK2_ATTN_CHUNK(ck, 3); break;                                                                           \
+        case 2: IK2_ATTN_CHUNK(ck, 2); break;                                                                           \
+        default: IK2_ATTN_CHUNK(ck, 1); break;                                                                          \
+    }
+    if (CK == 32) { IK2_ATTN_RU(32) }
+    else if (CK == 128) { IK2_ATTN_RU(128) }
+    else { IK2_ATTN_RU(64) }
+#undef IK2_ATTN_RU
+#undef IK2_ATTN_CHUNK
+    if (ntile <= kCombTiles)
+        attn_combine_seq_kernel<<<(unsigned) (T * H), 256, (256 + (size_t) ntile) * sizeof(float), s>>>(S, part, ntile, D, gate, out);
+    else
+        attn_combine_seq_big_kernel<<<(unsigned) (T * H), 256, 0, s>>>(S, part, ntile, D, gate, out);
+    check("attention_chunk_rows");
     return true;
 }
 void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s) {

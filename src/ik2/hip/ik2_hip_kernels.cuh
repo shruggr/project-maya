@@ -61,6 +61,14 @@ bool attention_split_rows(const float* q, const float* rel, const float* sink, i
                           const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
                           int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
                           cudaStream_t s);
+/// attention_split_rows' results (within float rounding) from chunks of attention_chunk_keys() keys (IK2_HIP_ATTN_CK:
+/// 32, 64 (the default) or 128) instead of 16-key tiles, every thread of a block busy (own runtime, 2026-11-24). Same
+/// arguments and the same false (nothing launched) when the scratch does not hold the chunks' parts.
+bool attention_chunk_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
+                          const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
+                          int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
+                          cudaStream_t s);
+int attention_chunk_keys();
 
 /// x *= sigmoid(g), n values
 void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s);
