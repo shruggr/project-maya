@@ -442,6 +442,71 @@ __global__ void pick_kernel(const float* __restrict__ bmax, const int* __restric
     }
 }
 
+// ---- the block's Q8_0 matrices split (IK2_HIP_DSPARK_Q8S, on by default; 0: the GGUF's 34-byte blocks through
+// ds4_iq): the int8 values [n][k] (32-byte aligned blocks: two 16-byte loads a lane) and the F16 steps [n][k / 32]
+// apart - the same values, read at more of the card's bandwidth than 2-byte-aligned 34-byte blocks (measured with
+// rocprofv3: ds4_iq's 8-column Q8_0 GEMV 340-375 GB/s on an R9700)
+__global__ void q8_split_kernel(const uint8_t* __restrict__ w, size_t nb, int8_t* __restrict__ q, __half* __restrict__ d) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;   // (a thread a value)
+    if (i >= nb * 32) return;
+    const uint8_t* b = w + (i / 32) * 34;
+    q[i] = ((const int8_t*) b)[2 + i % 32];
+    if (i % 32 == 0) d[i / 32] = *(const __half*) b;
+}
+struct Q8sJob {
+    const int8_t* q;
+    const __half* d;
+    int k, n, row0;   // (row0: the job's first row in the launch's rows)
+    float* y;
+    size_t ycs;
+};
+struct Q8sJobs {
+    Q8sJob j[3];
+    int nj;
+};
+// a warp a row, a lane a 32-value block at a time; NC activation columns (int8 rows of k, a scale a 32-value block)
+template <int NC>
+__global__ void __launch_bounds__(256) q8s_mv_kernel(const Q8sJobs J, const int8_t* __restrict__ xq, const float* __restrict__ xd) {
+    const int grow = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    int ji = 0;
+    while (ji + 1 < J.nj && grow >= J.j[ji + 1].row0) ++ji;
+    const Q8sJob& b = J.j[ji];
+    const int row = grow - b.row0;
+    if (row >= b.n) return;
+    const int k = b.k, nsb = k / 32;
+    const int8_t* wr = b.q + (size_t) row * k;
+    const __half* dr = b.d + (size_t) row * nsb;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        const int4* wp = (const int4*) (wr + (size_t) kb * 32);
+        const int4 wa = wp[0], wb = wp[1];
+        const float d = __half2float(dr[kb]);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const int4* xp = (const int4*) (xq + (size_t) c * k + (size_t) kb * 32);
+            const int4 xa = xp[0], xb = xp[1];
+            int dot = __dp4a(wa.x, xa.x, 0);
+            dot = __dp4a(wa.y, xa.y, dot);
+            dot = __dp4a(wa.z, xa.z, dot);
+            dot = __dp4a(wa.w, xa.w, dot);
+            dot = __dp4a(wb.x, xb.x, dot);
+            dot = __dp4a(wb.y, xb.y, dot);
+            dot = __dp4a(wb.z, xb.z, dot);
+            dot = __dp4a(wb.w, xb.w, dot);
+            acc[c] = fmaf(xd[(size_t) c * nsb + kb] * d, (float) dot, acc[c]);
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        float v = acc[c];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (lane == 0) b.y[(size_t) c * b.ycs + row] = v;
+    }
+}
+
 // ---- the block's fused row kernels (IK2_HIP_DSPARK_FUSE, on by default; 0: the separate launches) -----------------
 __device__ __forceinline__ float warp_max32(float v) {
 #pragma unroll
@@ -780,6 +845,8 @@ struct Mat {
     const uint8_t* w = nullptr;
     size_t ld = 0;
     int type = 0, k = 0, n = 0;
+    int8_t* sq = nullptr;   // (split Q8_0: the values and the steps apart - w is then null)
+    __half* sd = nullptr;
 };
 
 struct DLayer {
@@ -844,6 +911,7 @@ struct Dspark::Impl {
     int64_t end = 0, hi = -1;   // the context's end; the furthest position ever fed (what the rings have overwritten)
     float cum_min = 0.5f;
     bool fuse = !(std::getenv("IK2_HIP_DSPARK_FUSE") && std::atoi(std::getenv("IK2_HIP_DSPARK_FUSE")) == 0);
+    bool q8s = !(std::getenv("IK2_HIP_DSPARK_Q8S") && std::atoi(std::getenv("IK2_HIP_DSPARK_Q8S")) == 0);
     // (--parallel) a conversation's state each: every layer's K / V rows, the context ring, end and hi - the bound
     // one's in the fields above, the others' here (state 0's too while another is bound)
     struct State {
@@ -997,7 +1065,7 @@ struct Dspark::Impl {
         return true;
     }
     // a block-type matrix on the device as it is in the file
-    bool mat(const std::string& n, Mat& m2, int kk, int nn, std::string& err) {
+    bool mat(const std::string& n, Mat& m2, int kk, int nn, std::string& err, bool split = false) {
         const Tensor* t = need(ix, n, err, {kk, nn});
         if (!t) return false;
         if (t->type != "Q8_0" || kk % 32 != 0 || t->bytes != iq::row_bytes(iq::kQ8_0, kk) * (size_t) nn) {
@@ -1008,6 +1076,16 @@ struct Dspark::Impl {
         uint8_t* d = nullptr;
         if (!alloc(d, t->bytes, err) || !h2d(d, ix.data(*t), t->bytes, err)) return false;
         m2.w = d;
+        if (split && q8s && B == 8) {
+            const size_t nb = t->bytes / 34;
+            if (!alloc(m2.sq, nb * 32, err) || !alloc(m2.sd, nb, err)) return false;
+            q8_split_kernel<<<blocks_of(nb * 32), 256, 0, s>>>(d, nb, m2.sq, m2.sd);
+            check("q8_split");
+            if (!sync(err)) return false;
+            release(d);
+            used -= t->bytes;
+            m2.w = nullptr;
+        }
         m2.type = iq::kQ8_0;
         m2.k = kk;
         m2.n = nn;
@@ -1034,6 +1112,46 @@ struct Dspark::Impl {
             err = "dspark: a GEMV ds4_iq does not take";
             return false;
         }
+        return true;
+    }
+    // the block's 8 rows (int8 in xq / xd) through up to 3 matrices: the split form's kernel when they are split, else
+    // mv8 (ds4_iq's GEMV or this file's 8-column kernel)
+    struct G8 {
+        const Mat* m;
+        float* y;
+        size_t ycs;
+    };
+    bool gemv8(std::initializer_list<G8> gs, std::string& err) {
+        if (gs.size() <= 3 && gs.begin()->m->sq != nullptr) {
+            Q8sJobs J{};
+            int rows = 0;
+            for (const G8& g : gs) {
+                Q8sJob& j = J.j[J.nj++];
+                j.q = g.m->sq;
+                j.d = g.m->sd;
+                j.k = g.m->k;
+                j.n = g.m->n;
+                j.row0 = rows;
+                j.y = g.y;
+                j.ycs = g.ycs;
+                rows += (g.m->n + 7) / 8 * 8;   // (a block's 8 warps within one job)
+            }
+            q8s_mv_kernel<8><<<(unsigned) (rows / 8), 256, 0, s>>>(J, xq, xd);
+            check("q8s_mv");
+            return true;
+        }
+        if (!o.own_gemv || B != 8) {   // (as before: the jobs in one ds4_iq launch)
+            iq::MvJob js[3];
+            int n = 0;
+            for (const G8& g : gs) js[n++] = job(*g.m, xq, xd, B, g.y, g.ycs);
+            if (!iq::mv(js, n, s)) {
+                err = "dspark: a GEMV ds4_iq does not take";
+                return false;
+            }
+            return true;
+        }
+        for (const G8& g : gs)
+            if (!mv8({job(*g.m, xq, xd, B, g.y, g.ycs)}, err)) return false;
         return true;
     }
     // the block's 8 rows through a Q8_0 matrix: this file's 8-column kernel, or ds4_iq's
@@ -1179,11 +1297,11 @@ struct Dspark::Impl {
             l.swa = swa[(size_t) il] != 0;
             if (!vec(p + "attn_norm.weight", l.attn_norm, E, err) || !vec(p + "ffn_norm.weight", l.ffn_norm, E, err) ||
                 !vec(p + "attn_q_norm.weight", l.qn, D, err) || !vec(p + "attn_k_norm.weight", l.kn, D, err) ||
-                !vec(p + "attn_k_ctx_norm.weight", l.kcn, D, err) || !mat(p + "attn_q.weight", l.q, E, HD, err) ||
-                !mat(p + "attn_k.weight", l.kk, E, KD, err) || !mat(p + "attn_v.weight", l.v, E, KD, err) ||
-                !mat(p + "attn_output.weight", l.o, HD, E, err) || !mat(p + "attn_k_ctx.weight", l.kc, E, KD, err) ||
-                !mat(p + "attn_v_ctx.weight", l.vc, E, KD, err) || !mat(p + "ffn_gate.weight", l.gate, E, FF, err) ||
-                !mat(p + "ffn_up.weight", l.up, E, FF, err) || !mat(p + "ffn_down.weight", l.down, FF, E, err))
+                !vec(p + "attn_k_ctx_norm.weight", l.kcn, D, err) || !mat(p + "attn_q.weight", l.q, E, HD, err, true) ||
+                !mat(p + "attn_k.weight", l.kk, E, KD, err, true) || !mat(p + "attn_v.weight", l.v, E, KD, err, true) ||
+                !mat(p + "attn_output.weight", l.o, HD, E, err, true) || !mat(p + "attn_k_ctx.weight", l.kc, E, KD, err) ||
+                !mat(p + "attn_v_ctx.weight", l.vc, E, KD, err) || !mat(p + "ffn_gate.weight", l.gate, E, FF, err, true) ||
+                !mat(p + "ffn_up.weight", l.up, E, FF, err, true) || !mat(p + "ffn_down.weight", l.down, FF, E, err, true))
                 return false;
             l.ring = l.swa ? n_swa + std::max(0, o.rewind) + kFeed : 0;
             const size_t rows = l.swa ? (size_t) l.ring : (size_t) o.max_ctx;
@@ -1468,9 +1586,7 @@ struct Dspark::Impl {
                 ik2hip::k::rms(x, (size_t) E, B, E, l.attn_norm, eps, a, (size_t) E, s);
                 hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
             }
-            if (!mv8({job(l.q, xq, xd, B, qv, (size_t) HD), job(l.kk, xq, xd, B, kv, (size_t) KD),
-                     job(l.v, xq, xd, B, vv, (size_t) KD)}, err))
-                return false;
+            if (!gemv8({{&l.q, qv, (size_t) HD}, {&l.kk, kv, (size_t) KD}, {&l.v, vv, (size_t) KD}}, err)) return false;
             if (fz8) {
                 qk_norm_rope_kernel<<<(unsigned) (B * (H + Hkv)), (unsigned) (D / 2), 0, s>>>(qv, kv, B, H, Hkv, D, l.qn, l.kn, eps,
                                                                                           (long long) n, log_base);
@@ -1501,7 +1617,7 @@ struct Dspark::Impl {
             check("attention");
             if (!phase(st.attn_ms)) return false;
             hk::q8_rows(ao, (size_t) HD, B, HD, xq, xd, s);
-            if (!mv8({job(l.o, xq, xd, B, ob, (size_t) E)}, err)) return false;
+            if (!gemv8({{&l.o, ob, (size_t) E}}, err)) return false;
             if (fz8) {
                 add_rms_q8_kernel<<<(unsigned) B, 256, 0, s>>>(x, ob, l.ffn_norm, eps, E, nullptr, xq, xd);
                 if (!phase(st.o_ms)) return false;
@@ -1511,15 +1627,14 @@ struct Dspark::Impl {
                 ik2hip::k::rms(x, (size_t) E, B, E, l.ffn_norm, eps, a, (size_t) E, s);
                 hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
             }
-            if (!mv8({job(l.gate, xq, xd, B, gu, (size_t) FF), job(l.up, xq, xd, B, gu + (size_t) B * FF, (size_t) FF)}, err))
-                return false;
+            if (!gemv8({{&l.gate, gu, (size_t) FF}, {&l.up, gu + (size_t) B * FF, (size_t) FF}}, err)) return false;
             if (fz8) {
                 swiglu_q8_kernel<<<dim3((unsigned) (FF / 256), (unsigned) B), 256, 0, s>>>(gu, gu + (size_t) B * FF, FF, xq, xd);
             } else {
                 hk::swiglu(gu, gu + (size_t) B * FF, (size_t) FF, B, FF, hh, (size_t) FF, s);
                 hk::q8_rows(hh, (size_t) FF, B, FF, xq, xd, s);
             }
-            if (!mv8({job(l.down, xq, xd, B, ob, (size_t) E)}, err)) return false;
+            if (!gemv8({{&l.down, ob, (size_t) E}}, err)) return false;
             if (fz8) pend = ob;
             else ik2hip::k::add(x, ob, (size_t) B * E, s);
             if (!phase(st.ffn_ms)) return false;
