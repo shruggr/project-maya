@@ -232,7 +232,8 @@ bool parse_gen(const std::string& line, mm3::sample::Req& r, float& cum, std::ve
     return !r.ids.empty();
 }
 
-// ---- plain sampling's row work in parallel (IK2_HIP_SAMPLE_THREADS, default 8; 0 or 1: one thread as before).  A
+// ---- plain sampling's row work in parallel (IK2_HIP_SAMPLE_THREADS, default 1: one thread as before; N > 1: N
+// threads - measured on ripper, 5d81a673, temperature 1: host 1.94 ms a round with 8 against 1.80 with 1, no gain).  A
 // sampled round's host time is mostly the vocabulary-wide loops (measured on a laptop CPU: a sample and a target
 // distribution over 200,058 logits 2.6 ms).  The row splits into kRowChunks fixed chunks: the argmax and the weights
 // are the one-thread loop's values exactly (the first of equal maxima); the total sums the chunks' sums in order, and
@@ -291,7 +292,7 @@ struct RowPool {
     }
 };
 RowPool* row_pool() {
-    static const int nt = std::getenv("IK2_HIP_SAMPLE_THREADS") ? std::atoi(std::getenv("IK2_HIP_SAMPLE_THREADS")) : 8;
+    static const int nt = std::getenv("IK2_HIP_SAMPLE_THREADS") ? std::atoi(std::getenv("IK2_HIP_SAMPLE_THREADS")) : 1;
     static RowPool* p = nt > 1 ? new RowPool(nt) : nullptr;
     return p;
 }
@@ -465,8 +466,9 @@ struct Drafting {
     // IK2_HIP_DRAFT_LOOKUP=N (N >= 1): prompt lookup first - when the context's last N+ tokens occurred before
     // (strata::spec::SuffixDrafter over the prompt and the answer), what followed them is the round's drafts (up to the
     // window's 8) and the drafter is not asked; each such draft's probability IK2_HIP_DRAFT_LOOKUP_P (0.7) under the
-    // lookup's own calibration (mode 3, always on).  0 (the default): no lookup
-    int lookup_min = (int) env_d("IK2_HIP_DRAFT_LOOKUP", 0);
+    // lookup's own calibration (mode 3, always on).  Default 8 (measured, 5d81a673, temperature 0: copy 107.5 vs
+    // 94.6 tok/s, typical / gsm / long within run-to-run noise; greedy --ab output identical); 0: no lookup
+    int lookup_min = (int) env_d("IK2_HIP_DRAFT_LOOKUP", 8);
     float lookup_p = (float) env_d("IK2_HIP_DRAFT_LOOKUP_P", 0.7);
     double look_ema = env_d("IK2_HIP_DRAFT_LOOKUP_EMA", 0.98);   // (the lookup's calibration a draft: quicker than the drafter's)
     std::shared_ptr<strata::spec::SuffixDrafter> sdp = std::make_shared<strata::spec::SuffixDrafter>(3, 64);   // (shared: a Drafting's copy is cheap)
