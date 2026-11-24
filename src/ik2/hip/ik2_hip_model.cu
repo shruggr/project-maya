@@ -1932,6 +1932,7 @@ struct Model::Impl {
         d.output_type = head.type;
         d.output_ld = head.ld;
         d.verbose = o.verbose;
+        d.profile = std::getenv("IK2_HIP_DSPARK_PROFILE") != nullptr;   // (tests: a sync after each phase of a draft)
         ds.reset(new Dspark);
         if (!ds->load(d, err)) {
             ds.reset();
@@ -4130,6 +4131,23 @@ bool Model::draft(int anchor, int max_n, std::vector<int>& toks, std::vector<flo
     if (!m->taps_flush(err)) return false;
     if (m->ds->end() != m->n_end) return true;   // (the drafter missed rows - a step with a tap or a hook: none until a rewind)
     return m->ds->draft(anchor, max_n, toks, probs, err);
+}
+bool Model::draft_drawn(int anchor, int max_n, float temp, unsigned long long seed, std::vector<int>& toks,
+                        std::vector<float>& probs, std::vector<float>& qd, std::string& err) {
+    toks.clear();
+    probs.clear();
+    qd.clear();
+    if (!m->taps_on || !m->fast_on()) return true;
+    if (!m->taps_flush(err)) return false;
+    if (m->ds->end() != m->n_end) return true;
+    return m->ds->draft_drawn(anchor, max_n, temp, seed, toks, probs, qd, err);
+}
+bool Model::draft_logits(int i, float* out, std::string& err) {
+    if (!m->ds) {
+        err = "no drafter";
+        return false;
+    }
+    return m->ds->draft_logits(i, out, err);
 }
 void Model::set_draft_cum(float c) {
     if (m->ds) m->ds->set_cum_min(c);

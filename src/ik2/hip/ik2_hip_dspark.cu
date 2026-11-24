@@ -442,6 +442,368 @@ __global__ void pick_kernel(const float* __restrict__ bmax, const int* __restric
     }
 }
 
+// ---- the block's Q8_0 matrices split (IK2_HIP_DSPARK_Q8S, on by default; 0: the GGUF's 34-byte blocks through
+// ds4_iq): the int8 values [n][k] (32-byte aligned blocks: two 16-byte loads a lane) and the F16 steps [n][k / 32]
+// apart - the same values, read at more of the card's bandwidth than 2-byte-aligned 34-byte blocks (measured with
+// rocprofv3: ds4_iq's 8-column Q8_0 GEMV 340-375 GB/s on an R9700)
+__global__ void q8_split_kernel(const uint8_t* __restrict__ w, size_t nb, int8_t* __restrict__ q, __half* __restrict__ d) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;   // (a thread a value)
+    if (i >= nb * 32) return;
+    const uint8_t* b = w + (i / 32) * 34;
+    q[i] = ((const int8_t*) b)[2 + i % 32];
+    if (i % 32 == 0) d[i / 32] = *(const __half*) b;
+}
+struct Q8sJob {
+    const int8_t* q;
+    const __half* d;
+    int k, n, row0;   // (row0: the job's first row in the launch's rows)
+    float* y;
+    size_t ycs;
+};
+struct Q8sJobs {
+    Q8sJob j[3];
+    int nj;
+};
+// a warp R rows (an activation block read once for them), a lane a 32-value block at a time; NC activation columns
+// (int8 rows of k, a scale a 32-value block).  Jobs' row0 are multiples of 8 R (a block within one job)
+__device__ __forceinline__ int dot32(const int4 wa, const int4 wb, const int4 xa, const int4 xb) {
+    int dot = __dp4a(wa.x, xa.x, 0);
+    dot = __dp4a(wa.y, xa.y, dot);
+    dot = __dp4a(wa.z, xa.z, dot);
+    dot = __dp4a(wa.w, xa.w, dot);
+    dot = __dp4a(wb.x, xb.x, dot);
+    dot = __dp4a(wb.y, xb.y, dot);
+    dot = __dp4a(wb.z, xb.z, dot);
+    return __dp4a(wb.w, xb.w, dot);
+}
+template <int NC, int R>
+__global__ void __launch_bounds__(256) q8s_mv_kernel(const Q8sJobs J, const int8_t* __restrict__ xq, const float* __restrict__ xd) {
+    const int grow = (blockIdx.x * 8 + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    int ji = 0;
+    while (ji + 1 < J.nj && grow >= J.j[ji + 1].row0) ++ji;
+    const Q8sJob& b = J.j[ji];
+    const int row = grow - b.row0;
+    if (row >= b.n) return;
+    const int k = b.k, nsb = k / 32, nr = min(R, b.n - row);
+    float acc[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        int4 wa[R], wb[R];
+        float d[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int rr = r < nr ? r : 0;
+            const int4* wp = (const int4*) (b.q + (size_t) (row + rr) * k + (size_t) kb * 32);
+            wa[r] = wp[0];
+            wb[r] = wp[1];
+            d[r] = __half2float(b.d[(size_t) (row + rr) * nsb + kb]);
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const int4* xp = (const int4*) (xq + (size_t) c * k + (size_t) kb * 32);
+            const int4 xa = xp[0], xb = xp[1];
+            const float s = xd[(size_t) c * nsb + kb];
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[r][c] = fmaf(s * d[r], (float) dot32(wa[r], wb[r], xa, xb), acc[r][c]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            float v = acc[r][c];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0 && r < nr) b.y[(size_t) c * b.ycs + row + r] = v;
+        }
+}
+
+// q8s_mv_kernel with the NC activation columns in LDS (copied once a block), the blocks' warps taking R-row groups
+// gridDim.x * warps apart: a lane's blocks, the fmaf order and the sums are q8s_mv_kernel's (the same bits).  The jobs
+// share k (their activations are the same rows)
+template <int NC, int R>
+__global__ void __launch_bounds__(1024) q8s_mv_lds_kernel(const Q8sJobs J, int groups, const int8_t* __restrict__ xq,
+                                                          const float* __restrict__ xd) {
+    extern __shared__ __align__(16) uint8_t lds_q8s[];
+    const int k = J.j[0].k, nsb = k / 32;
+    int8_t* sx = (int8_t*) lds_q8s;
+    float* sd = (float*) (lds_q8s + (size_t) NC * k);
+    for (int i = threadIdx.x; i < NC * k / 16; i += blockDim.x) ((int4*) sx)[i] = ((const int4*) xq)[i];
+    for (int i = threadIdx.x; i < NC * nsb; i += blockDim.x) sd[i] = xd[i];
+    __syncthreads();
+    const int nw = blockDim.x >> 5, lane = threadIdx.x & 31;
+    for (int g = blockIdx.x * nw + (threadIdx.x >> 5); g < groups; g += gridDim.x * nw) {
+        const int grow = g * R;
+        int ji = 0;
+        while (ji + 1 < J.nj && grow >= J.j[ji + 1].row0) ++ji;
+        const Q8sJob& b = J.j[ji];
+        const int row = grow - b.row0;
+        if (row >= b.n) continue;
+        const int nr = min(R, b.n - row);
+        float acc[R][NC];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
+        for (int kb = lane; kb < nsb; kb += 32) {
+            int4 wa[R], wb[R];
+            float d[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int rr = r < nr ? r : 0;
+                const int4* wp = (const int4*) (b.q + (size_t) (row + rr) * k + (size_t) kb * 32);
+                wa[r] = wp[0];
+                wb[r] = wp[1];
+                d[r] = __half2float(b.d[(size_t) (row + rr) * nsb + kb]);
+            }
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const int4* xp = (const int4*) (sx + (size_t) c * k + (size_t) kb * 32);
+                const int4 xa = xp[0], xb = xp[1];
+                const float sc = sd[(size_t) c * nsb + kb];
+#pragma unroll
+                for (int r = 0; r < R; ++r) acc[r][c] = fmaf(sc * d[r], (float) dot32(wa[r], wb[r], xa, xb), acc[r][c]);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                float v = acc[r][c];
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+                if (lane == 0 && r < nr) b.y[(size_t) c * b.ycs + row + r] = v;
+            }
+    }
+}
+
+// ---- the block's fused row kernels (IK2_HIP_DSPARK_FUSE, on by default; 0: the separate launches) -----------------
+__device__ __forceinline__ float warp_max32(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+// block r (256 threads): x[r] += ob[r] (ob null: nothing), then y = rms(x[r]) gain (into yo too when not null) as int8
+// blocks of 32 with a scale each (hy4's q8_rows layout: q [rows][E], d [rows][E / 32])
+__global__ void add_rms_q8_kernel(float* __restrict__ x, const float* __restrict__ ob, const float* __restrict__ gain,
+                                  float eps, int E, float* __restrict__ yo, int8_t* __restrict__ q, float* __restrict__ d) {
+    __shared__ float sh[256];
+    __shared__ float inv_s;
+    float* xr = x + (size_t) blockIdx.x * E;
+    const float* br = ob ? ob + (size_t) blockIdx.x * E : nullptr;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < E; i += blockDim.x) {
+        float v = xr[i];
+        if (br) xr[i] = v = v + br[i];
+        ss += v * v;
+    }
+    sh[threadIdx.x] = ss;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) sh[threadIdx.x] += sh[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) inv_s = rsqrtf(sh[0] / (float) E + eps);
+    __syncthreads();
+    const float inv = inv_s;
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5, nb = E / 32;
+    for (int b = wid; b < nb; b += nw) {
+        const int i = b * 32 + lane;
+        const float v = xr[i] * inv * gain[i];
+        if (yo) yo[(size_t) blockIdx.x * E + i] = v;
+        const float am = warp_max32(fabsf(v));
+        const float sc = am / 127.0f;
+        q[(size_t) blockIdx.x * E + i] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+        if (lane == 0) d[(size_t) blockIdx.x * nb + b] = sc;
+    }
+}
+// block = one head of one row (D / 2 threads, a rotary pair each): rms over its D values with the gain (one vector
+// for every head), then NEOX RoPE at pos0 + row; heads [rows][Hq] of q, then [rows][Hk] of k
+__global__ void qk_norm_rope_kernel(float* __restrict__ q, float* __restrict__ k, int rows, int Hq, int Hk, int D,
+                                    const float* __restrict__ gq, const float* __restrict__ gk, float eps, long long pos0,
+                                    double log_base) {
+    __shared__ float sh[64];
+    const int nq = rows * Hq, bi = blockIdx.x, half = D / 2, j = threadIdx.x;
+    const bool isq = bi < nq;
+    const int hb = isq ? bi : bi - nq, H = isq ? Hq : Hk, t = hb / H;
+    float* v = (isq ? q : k) + (size_t) hb * D;
+    const float* g = isq ? gq : gk;
+    const float a = v[j], b = v[j + half];
+    sh[j] = a * a + b * b;
+    __syncthreads();
+    for (int o = half / 2; o > 0; o >>= 1) {
+        if (j < o) sh[j] += sh[j + o];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(sh[0] / (float) D + eps);
+    const float an = a * inv * g[j], bn = b * inv * g[j + half];
+    const double th = (double) (pos0 + t) * exp(-(double) j / (double) half * log_base);
+    const float c = (float) cos(th), sn = (float) sin(th);
+    v[j] = an * c - bn * sn;
+    v[j + half] = an * sn + bn * c;
+}
+// block (y = row): h = silu(g) u for 8 blocks of 32 (a warp each) straight to int8 + scales (q8_rows' layout)
+__global__ void swiglu_q8_kernel(const float* __restrict__ g, const float* __restrict__ u, int F,
+                                 int8_t* __restrict__ q, float* __restrict__ d) {
+    const int r = blockIdx.y, b = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (b * 32 >= F) return;
+    const size_t i = (size_t) r * F + (size_t) b * 32 + lane;
+    const float gv = g[i];
+    const float v = gv / (1.0f + expf(-gv)) * u[i];
+    const float am = warp_max32(fabsf(v));
+    const float sc = am / 127.0f;
+    q[i] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+    if (lane == 0) d[(size_t) r * (F / 32) + b] = sc;
+}
+
+// ---- drawn drafts (Dspark::draft with a temperature: speculative sampling's q, IK2_HIP_DRAFT_DRAW) -------------------
+// a Gumbel(0, 1) value from (seed, v): splitmix64, the top 24 bits as a uniform in (0, 1)
+__device__ __forceinline__ float gumbel01(unsigned long long seed, unsigned v) {
+    unsigned long long z = seed + (unsigned long long) (v + 1) * 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    const float u = ((float) (z >> 40) + 0.5f) * (1.0f / 16777216.0f);
+    return -logf(-logf(u));
+}
+// logits_kernel's logits, and over s = lg / temp: each block's largest s (bmax, where: bidx), sum exp(s - bmax) (bsum),
+// and its largest s + Gumbel noise (where: gidx, that token's s: gval) - the draw from softmax(s) by the Gumbel-max rule
+__global__ void logits_draw_kernel(const float* __restrict__ base, const int8_t* __restrict__ Mq, const float* __restrict__ sc,
+                                   const float* __restrict__ m0, const float* __restrict__ z, int R, int V, int Vs, float cap,
+                                   float itemp, unsigned long long seed, float* __restrict__ lg, float* __restrict__ bmax,
+                                   int* __restrict__ bidx, float* __restrict__ bsum, float* __restrict__ gmax,
+                                   int* __restrict__ gidx, float* __restrict__ gval, const float* __restrict__ cum, float cmin) {
+    if (*cum < cmin) return;
+    __shared__ int us[256];
+    __shared__ float sv[256], sg[256], sgv[256];
+    __shared__ int si[256], sgi[256];
+    for (int i = threadIdx.x; i < R; i += blockDim.x) us[i] = (int) lrintf(tanhf(z[2 * R + i]) * 32767.0f);
+    __syncthreads();
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    float val = -INFINITY, nz = -INFINITY;
+    if (v < V) {
+        const uint32_t* mw = (const uint32_t*) Mq;
+        int acc = 0;
+        for (int c = 0; c < R / 4; ++c) {
+            const uint32_t w = mw[(size_t) c * Vs + v];
+            acc += (int) (int8_t) (w & 255) * us[4 * c] + (int) (int8_t) ((w >> 8) & 255) * us[4 * c + 1] +
+                   (int) (int8_t) ((w >> 16) & 255) * us[4 * c + 2] + (int) (int8_t) (w >> 24) * us[4 * c + 3];
+        }
+        const float l = cap * tanhf((base[v] + (float) acc * (sc[v] * (1.0f / 32767.0f)) + m0[v]) / cap);
+        lg[v] = l;
+        val = l * itemp;
+        nz = val + gumbel01(seed, (unsigned) v);
+    }
+    sv[threadIdx.x] = val;
+    si[threadIdx.x] = v;
+    sg[threadIdx.x] = nz;
+    sgi[threadIdx.x] = v;
+    sgv[threadIdx.x] = val;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) {
+            const int t = threadIdx.x, u = t + o;
+            if (sv[u] > sv[t] || (sv[u] == sv[t] && si[u] < si[t])) {
+                sv[t] = sv[u];
+                si[t] = si[u];
+            }
+            if (sg[u] > sg[t] || (sg[u] == sg[t] && sgi[u] < sgi[t])) {
+                sg[t] = sg[u];
+                sgi[t] = sgi[u];
+                sgv[t] = sgv[u];
+            }
+        }
+        __syncthreads();
+    }
+    const float mx = sv[0];
+    const int at = si[0];
+    const float g0 = sg[0], gv0 = sgv[0];
+    const int gi0 = sgi[0];
+    __syncthreads();
+    sv[threadIdx.x] = v < V ? expf(val - mx) : 0.0f;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) sv[threadIdx.x] += sv[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        bmax[blockIdx.x] = mx;
+        bidx[blockIdx.x] = at;
+        bsum[blockIdx.x] = sv[0];
+        gmax[blockIdx.x] = g0;
+        gidx[blockIdx.x] = gi0;
+        gval[blockIdx.x] = gv0;
+    }
+}
+// pick_kernel for a drawn draft: *tok = the Gumbel-max token, *prob = the largest probability of softmax(s) (the
+// window's confidence, as the argmax draft's), *qd = the drawn token's probability (the verdict's q(d)); the state update
+__global__ void pick_draw_kernel(const float* __restrict__ bmax, const float* __restrict__ bsum, const float* __restrict__ gmax,
+                                 const int* __restrict__ gidx, const float* __restrict__ gval, int nb, int* __restrict__ tok,
+                                 float* __restrict__ prob, float* __restrict__ qd, const float* __restrict__ z, int R,
+                                 float* __restrict__ state, float* __restrict__ cum, float cmin) {
+    if (*cum < cmin) {
+        if (threadIdx.x == 0) {
+            *tok = -1;
+            *prob = 0.0f;
+            *qd = 0.0f;
+        }
+        return;
+    }
+    for (int i = threadIdx.x; i < R; i += blockDim.x) {
+        const float gt = 1.0f / (1.0f + expf(-z[i])), c = tanhf(z[R + i]);
+        state[i] = c + gt * (state[i] - c);
+    }
+    __shared__ float bv[1024], gv[1024], gs[1024];
+    __shared__ int gi[1024];
+    float m = -INFINITY, g = -INFINITY, gsv = -INFINITY;
+    int at = 0x7fffffff;
+    for (int i = threadIdx.x; i < nb; i += blockDim.x) {
+        m = fmaxf(m, bmax[i]);
+        if (gmax[i] > g || (gmax[i] == g && gidx[i] < at)) {
+            g = gmax[i];
+            at = gidx[i];
+            gsv = gval[i];
+        }
+    }
+    bv[threadIdx.x] = m;
+    gv[threadIdx.x] = g;
+    gi[threadIdx.x] = at;
+    gs[threadIdx.x] = gsv;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) {
+            const int t = threadIdx.x, u = t + o;
+            bv[t] = fmaxf(bv[t], bv[u]);
+            if (gv[u] > gv[t] || (gv[u] == gv[t] && gi[u] < gi[t])) {
+                gv[t] = gv[u];
+                gi[t] = gi[u];
+                gs[t] = gs[u];
+            }
+        }
+        __syncthreads();
+    }
+    const float mx = bv[0], dval = gs[0];
+    const int best = gi[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < nb; i += blockDim.x) sum += bsum[i] * expf(bmax[i] - mx);
+    bv[threadIdx.x] = sum;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) bv[threadIdx.x] += bv[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *tok = best;
+        *prob = 1.0f / bv[0];
+        *qd = expf(dval - mx) / bv[0];
+        *cum *= 1.0f / bv[0];
+    }
+}
+
 float half_to_float(uint16_t h) {
     const uint32_t s = (uint32_t) (h >> 15) << 31, e = (h >> 10) & 31, f = h & 1023;
     uint32_t u;
@@ -556,6 +918,8 @@ struct Mat {
     const uint8_t* w = nullptr;
     size_t ld = 0;
     int type = 0, k = 0, n = 0;
+    int8_t* sq = nullptr;   // (split Q8_0: the values and the steps apart - w is then null)
+    __half* sd = nullptr;
 };
 
 struct DLayer {
@@ -606,6 +970,8 @@ struct Dspark::Impl {
     int8_t* xq = nullptr;
     int *tok = nullptr, *bidx = nullptr;
     float *bmax = nullptr, *bsum = nullptr, *x0 = nullptr, *cumd = nullptr;
+    float *gmax = nullptr, *gval = nullptr, *qdd = nullptr;   // (drawn drafts: the blocks' Gumbel maxima, the drawn q(d))
+    int* gidx = nullptr;
     int max_tiles = 0, tile = 16;
     cublasHandle_t blas = nullptr;
     float *Sg = nullptr, *qp = nullptr, *op = nullptr;
@@ -615,8 +981,69 @@ struct Dspark::Impl {
     size_t tok_row = 0;
     int tok_type = 0;
     std::vector<float> h_x;
+    // IK2_HIP_DSPARK_PINNED (default 1; 0: pageable as before): a draft's host copies (the anchor's embedding row, the
+    // anchor, the running probability's 1, the picks back) through pinned buffers - pageable ones are staged by the
+    // runtime and hold the host until done
+    bool pinned_on = !(std::getenv("IK2_HIP_DSPARK_PINNED") && std::atoi(std::getenv("IK2_HIP_DSPARK_PINNED")) == 0);
+    float* pin_x = nullptr;   // E floats, then the anchor (as int bits) and 1.0f
+    int* pin_out = nullptr;   // the picks: tok [kBlock], prob [kBlock], qd [kBlock] (float bits)
     int64_t end = 0, hi = -1;   // the context's end; the furthest position ever fed (what the rings have overwritten)
     float cum_min = 0.5f;
+    bool fuse = !(std::getenv("IK2_HIP_DSPARK_FUSE") && std::atoi(std::getenv("IK2_HIP_DSPARK_FUSE")) == 0);
+    bool q8s = !(std::getenv("IK2_HIP_DSPARK_Q8S") && std::atoi(std::getenv("IK2_HIP_DSPARK_Q8S")) == 0);
+    int q8s_rows = 0;   // rows a warp (1, 2, 4): IK2_HIP_DSPARK_Q8S_ROWS, else the fastest measured at the load
+    // IK2_HIP_DSPARK_HEAD_LDS (default 1; 0: iq::mv as before): the head's GEMV (the target's output matrix, up to 7
+    // draft rows) through iq::mv_lds - its activation columns in LDS, the same bits - when the load's check finds the
+    // same bits and a faster time; the blocks a launch from the same check (IK2_HIP_DSPARK_HEAD_GRID to fix them)
+    bool head_lds_on = !(std::getenv("IK2_HIP_DSPARK_HEAD_LDS") && std::atoi(std::getenv("IK2_HIP_DSPARK_HEAD_LDS")) == 0);
+    int head_grid = 0, head_threads = 1024;
+    // IK2_HIP_DSPARK_Q8S_LDS (default 1; 0: as before): the split GEMVs whose 8 columns fit in 64 KiB of LDS (q / k /
+    // v, o, gate / up - not down) through q8s_mv_lds_kernel when the load's check finds the same bits and a better
+    // time; q8s_lds_grid blocks of 1024 threads (0: off)
+    bool q8s_lds_on = !(std::getenv("IK2_HIP_DSPARK_Q8S_LDS") && std::atoi(std::getenv("IK2_HIP_DSPARK_Q8S_LDS")) == 0);
+    int q8s_lds_grid = 0;
+    static size_t q8s_lds_bytes(int k) { return (size_t) 8 * k + (size_t) 8 * (k / 32) * 4; }
+    bool q8s_launch_lds(const Q8sJobs& J0, int R, int grid) {
+        for (int i = 1; i < J0.nj; ++i)
+            if (J0.j[i].k != J0.j[0].k) return false;
+        if (q8s_lds_bytes(J0.j[0].k) > 65536) return false;
+        Q8sJobs J = J0;
+        int rows = 0;
+        for (int i = 0; i < J.nj; ++i) {
+            J.j[i].row0 = rows;
+            rows += (J.j[i].n + 8 * R - 1) / (8 * R) * (8 * R);
+        }
+        const size_t smem = q8s_lds_bytes(J.j[0].k);
+        static bool attr[5] = {};
+        auto go = [&](auto kern) {
+            if (!attr[R]) {
+                if (cudaFuncSetAttribute((const void*) kern, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    return false;
+                }
+                attr[R] = true;
+            }
+            kern<<<(unsigned) grid, 1024, smem, s>>>(J, rows / R, xq, xd);
+            return true;
+        };
+        const bool ok = R == 4 ? go(q8s_mv_lds_kernel<8, 4>) : R == 2 ? go(q8s_mv_lds_kernel<8, 2>) : go(q8s_mv_lds_kernel<8, 1>);
+        if (ok) check("q8s_mv_lds");
+        return ok;
+    }
+    void q8s_launch(const Q8sJobs& J0, int R) {
+        if (q8s_lds_grid > 0 && q8s_launch_lds(J0, R, q8s_lds_grid)) return;
+        Q8sJobs J = J0;
+        int rows = 0;
+        for (int i = 0; i < J.nj; ++i) {
+            J.j[i].row0 = rows;
+            rows += (J.j[i].n + 8 * R - 1) / (8 * R) * (8 * R);
+        }
+        const unsigned nb = (unsigned) (rows / (8 * R));
+        if (R == 4) q8s_mv_kernel<8, 4><<<nb, 256, 0, s>>>(J, xq, xd);
+        else if (R == 2) q8s_mv_kernel<8, 2><<<nb, 256, 0, s>>>(J, xq, xd);
+        else q8s_mv_kernel<8, 1><<<nb, 256, 0, s>>>(J, xq, xd);
+        check("q8s_mv");
+    }
     // (--parallel) a conversation's state each: every layer's K / V rows, the context ring, end and hi - the bound
     // one's in the fields above, the others' here (state 0's too while another is bound)
     struct State {
@@ -678,6 +1105,8 @@ struct Dspark::Impl {
         if (s != nullptr || !allocs.empty()) {
             (void) cudaSetDevice(dev);
             for (void* p : allocs) (void) cudaFree(p);
+            if (pin_x != nullptr) (void) cudaFreeHost(pin_x);
+            if (pin_out != nullptr) (void) cudaFreeHost(pin_out);
             if (blas != nullptr) (void) cublasDestroy(blas);
             if (s != nullptr) (void) cudaStreamDestroy(s);
         }
@@ -770,7 +1199,7 @@ struct Dspark::Impl {
         return true;
     }
     // a block-type matrix on the device as it is in the file
-    bool mat(const std::string& n, Mat& m2, int kk, int nn, std::string& err) {
+    bool mat(const std::string& n, Mat& m2, int kk, int nn, std::string& err, bool split = false) {
         const Tensor* t = need(ix, n, err, {kk, nn});
         if (!t) return false;
         if (t->type != "Q8_0" || kk % 32 != 0 || t->bytes != iq::row_bytes(iq::kQ8_0, kk) * (size_t) nn) {
@@ -781,6 +1210,16 @@ struct Dspark::Impl {
         uint8_t* d = nullptr;
         if (!alloc(d, t->bytes, err) || !h2d(d, ix.data(*t), t->bytes, err)) return false;
         m2.w = d;
+        if (split && q8s && B == 8) {
+            const size_t nb = t->bytes / 34;
+            if (!alloc(m2.sq, nb * 32, err) || !alloc(m2.sd, nb, err)) return false;
+            q8_split_kernel<<<blocks_of(nb * 32), 256, 0, s>>>(d, nb, m2.sq, m2.sd);
+            check("q8_split");
+            if (!sync(err)) return false;
+            release(d);
+            used -= t->bytes;
+            m2.w = nullptr;
+        }
         m2.type = iq::kQ8_0;
         m2.k = kk;
         m2.n = nn;
@@ -802,11 +1241,221 @@ struct Dspark::Impl {
         j.ycs = ycs;
         return j;
     }
+    // the load's check of the split GEMVs in LDS: layer 0's q / k / v, o and gate / up both ways on made-up int8 rows
+    // (the same bits?), then 10 layers' worth of those launches timed each way; q8s_lds_grid stays 0 (off) unless the
+    // bits are the same and LDS is faster.  One line on stderr
+    bool q8s_lds_check(std::string& err) {
+        if (!q8s || !q8s_lds_on || B != 8 || L.empty() || L[0].gate.sq == nullptr) return true;
+        const int R = q8s_rows > 0 ? q8s_rows : 1;
+        const int HD = H * D, KD = Hkv * D;
+        std::vector<int8_t> hq((size_t) B * FF);
+        std::vector<float> hd((size_t) B * FF / 32);
+        uint32_t r = 777u;
+        for (auto& v : hq) v = (int8_t) ((r = r * 1664525u + 1013904223u) >> 25) - 64;
+        for (auto& v : hd) v = 1e-3f * (float) (1 + ((r = r * 1664525u + 1013904223u) >> 28));
+        CK(cudaMemcpy(xq, hq.data(), hq.size(), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(xd, hd.data(), hd.size() * 4, cudaMemcpyHostToDevice));
+        auto layer = [&](const DLayer& l) {
+            Q8sJobs J{};
+            const Mat* m3[3] = {&l.q, &l.kk, &l.v};
+            float* ys[3] = {qv, kv, vv};
+            const size_t ycs[3] = {(size_t) HD, (size_t) KD, (size_t) KD};
+            for (int j = 0; j < 3; ++j) J.j[J.nj++] = {m3[j]->sq, m3[j]->sd, m3[j]->k, m3[j]->n, 0, ys[j], ycs[j]};
+            q8s_launch(J, R);
+            J = {};
+            J.j[J.nj++] = {l.o.sq, l.o.sd, l.o.k, l.o.n, 0, ob, (size_t) E};
+            q8s_launch(J, R);
+            J = {};
+            J.j[J.nj++] = {l.gate.sq, l.gate.sd, l.gate.k, l.gate.n, 0, gu, (size_t) FF};
+            J.j[J.nj++] = {l.up.sq, l.up.sd, l.up.k, l.up.n, 0, gu + (size_t) B * FF, (size_t) FF};
+            q8s_launch(J, R);
+        };
+        struct Out {
+            float* p;
+            size_t n;
+        };
+        const Out outs[5] = {{qv, (size_t) B * HD}, {kv, (size_t) B * KD}, {vv, (size_t) B * KD}, {ob, (size_t) B * E},
+                             {gu, (size_t) 2 * B * FF}};
+        auto grab = [&](std::vector<float>& h) -> bool {
+            h.clear();
+            for (const Out& o2 : outs) {
+                const size_t at = h.size();
+                h.resize(at + o2.n);
+                CK(cudaMemcpy(h.data() + at, o2.p, o2.n * 4, cudaMemcpyDeviceToHost));
+            }
+            return true;
+        };
+        cudaEvent_t e0, e1;
+        CK(cudaEventCreate(&e0));
+        CK(cudaEventCreate(&e1));
+        auto timed = [&](double& us) -> bool {
+            for (int rep = 0; rep < 2; ++rep) {
+                CK(cudaEventRecord(e0, s));
+                for (int it = 0; it < 10; ++it) layer(L[(size_t) (it % NL)]);
+                CK(cudaEventRecord(e1, s));
+                CK(cudaEventSynchronize(e1));
+                float ms = 0;
+                CK(cudaEventElapsedTime(&ms, e0, e1));
+                us = ms * 1e3 / 10;
+            }
+            return true;
+        };
+        q8s_lds_grid = 0;
+        std::vector<float> ref, got;
+        layer(L[0]);
+        CK(cudaStreamSynchronize(s));   // (the copies below are on the null stream)
+        if (!grab(ref)) return false;
+        double t0 = 0, best = 0;
+        if (!timed(t0)) return false;
+        best = t0;
+        char line[320];
+        int at = std::snprintf(line, sizeof line, "dspark: split GEMVs q/k/v + o + gate/up (us a layer, %d rows a warp): global %.0f; "
+                                                  "LDS by blocks:", R, t0);
+        int cus = 0, pick = 0;
+        (void) cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, dev);
+        const char* ev = std::getenv("IK2_HIP_DSPARK_Q8S_LDS_GRID");
+        std::vector<int> grids;
+        if (ev) grids.push_back(std::atoi(ev));
+        else for (int m : {1, 2, 4}) grids.push_back(std::max(1, cus) * m);
+        for (int g : grids) {
+            q8s_lds_grid = g;
+            layer(L[0]);
+            if (cudaStreamSynchronize(s) != cudaSuccess) {
+                (void) cudaGetLastError();
+                at += std::snprintf(line + at, sizeof line - (size_t) at, " %d: failed", g);
+                continue;
+            }
+            if (!grab(got)) return false;
+            const bool same = got.size() == ref.size() && std::memcmp(got.data(), ref.data(), ref.size() * 4) == 0;
+            double us = 0;
+            if (!timed(us)) return false;
+            at += std::snprintf(line + at, sizeof line - (size_t) at, " %d: %.0f%s", g, us, same ? "" : " (bits differ)");
+            if (same && us < best) {
+                best = us;
+                pick = g;
+            }
+        }
+        q8s_lds_grid = pick;
+        (void) cudaEventDestroy(e0);
+        (void) cudaEventDestroy(e1);
+        std::fprintf(stderr, "%s -> %s\n", line, pick ? std::to_string(pick).c_str() : "global");
+        return true;
+    }
+    bool head_mv(const iq::MvJob& j, std::string& err) {
+        if (head_grid > 0 && iq::mv_lds(j, head_grid, head_threads, s)) {
+            check("head mv_lds");
+            return true;
+        }
+        return mv({j}, err);
+    }
+    // the load's check of the head's GEMV: iq::mv against iq::mv_lds at a few grids on the real matrix, 7 columns of
+    // made-up int8 rows; mv_lds is taken only with the same bits and a better time.  One line on stderr
+    bool head_check(std::string& err) {
+        if (!head_lds_on || B < 2) return true;
+        const int nc = B - 1;
+        std::vector<int8_t> hq((size_t) nc * E);
+        std::vector<float> hd((size_t) nc * E / 32);
+        uint32_t r = 12345u;
+        for (auto& v : hq) v = (int8_t) ((r = r * 1664525u + 1013904223u) >> 25) - 64;
+        for (auto& v : hd) v = 1e-3f * (float) (1 + ((r = r * 1664525u + 1013904223u) >> 28));
+        CK(cudaMemcpy(xq, hq.data(), hq.size(), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(xd, hd.data(), hd.size() * 4, cudaMemcpyHostToDevice));
+        const iq::MvJob j = job(out, xq, xd, nc, base, (size_t) Vp);
+        std::vector<float> ref((size_t) nc * Vp), got((size_t) nc * Vp);
+        cudaEvent_t e0, e1;
+        CK(cudaEventCreate(&e0));
+        CK(cudaEventCreate(&e1));
+        auto timed = [&](int grid, double& us) -> bool {
+            for (int rep = 0; rep < 2; ++rep) {   // (the first warms up)
+                CK(cudaEventRecord(e0, s));
+                for (int it = 0; it < 5; ++it)
+                    if (grid == 0 ? !mv({j}, err) : !iq::mv_lds(j, grid, head_threads, s)) return false;
+                CK(cudaEventRecord(e1, s));
+                CK(cudaEventSynchronize(e1));
+                float ms = 0;
+                CK(cudaEventElapsedTime(&ms, e0, e1));
+                us = ms * 1e3 / 5;
+            }
+            return true;
+        };
+        double t_mv = 0;
+        if (!timed(0, t_mv)) return false;
+        CK(cudaMemcpy(ref.data(), base, ref.size() * 4, cudaMemcpyDeviceToHost));
+        char line[320];
+        int at = std::snprintf(line, sizeof line, "dspark: the head's GEMV (%d rows): mv %.0f us; mv_lds by blocks:", nc, t_mv);
+        const char* ev = std::getenv("IK2_HIP_DSPARK_HEAD_GRID");
+        int cus = 0;
+        (void) cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, dev);
+        std::vector<int> grids;
+        if (ev) grids.push_back(std::atoi(ev));
+        else for (int m : {1, 2, 4, 8}) grids.push_back(std::max(1, cus) * m);
+        double best = t_mv;
+        int pick = 0;
+        for (int g : grids) {
+            double us = 0;
+            if (!iq::mv_lds(j, g, head_threads, s)) {
+                at += std::snprintf(line + at, sizeof line - (size_t) at, " %d: refused", g);
+                (void) cudaGetLastError();
+                continue;
+            }
+            if (!timed(g, us)) return false;
+            CK(cudaMemcpy(got.data(), base, got.size() * 4, cudaMemcpyDeviceToHost));
+            size_t diff = 0;
+            for (int c = 0; c < nc; ++c)
+                diff += std::memcmp(ref.data() + (size_t) c * Vp, got.data() + (size_t) c * Vp, (size_t) Vu * 4) != 0;
+            at += std::snprintf(line + at, sizeof line - (size_t) at, " %d: %.0f%s", g, us, diff ? " (bits differ)" : "");
+            if (!diff && us < best) {
+                best = us;
+                pick = g;
+            }
+        }
+        (void) cudaEventDestroy(e0);
+        (void) cudaEventDestroy(e1);
+        head_grid = pick;
+        std::fprintf(stderr, "%s -> %s\n", line, pick ? std::to_string(pick).c_str() : "mv");
+        return true;
+    }
     bool mv(std::initializer_list<iq::MvJob> jobs, std::string& err) {
         if (!iq::mv(jobs.begin(), (int) jobs.size(), s)) {
             err = "dspark: a GEMV ds4_iq does not take";
             return false;
         }
+        return true;
+    }
+    // the block's 8 rows (int8 in xq / xd) through up to 3 matrices: the split form's kernel when they are split, else
+    // mv8 (ds4_iq's GEMV or this file's 8-column kernel)
+    struct G8 {
+        const Mat* m;
+        float* y;
+        size_t ycs;
+    };
+    bool gemv8(std::initializer_list<G8> gs, std::string& err) {
+        if (gs.size() <= 3 && gs.begin()->m->sq != nullptr) {
+            Q8sJobs J{};
+            for (const G8& g : gs) {
+                Q8sJob& j = J.j[J.nj++];
+                j.q = g.m->sq;
+                j.d = g.m->sd;
+                j.k = g.m->k;
+                j.n = g.m->n;
+                j.y = g.y;
+                j.ycs = g.ycs;
+            }
+            q8s_launch(J, q8s_rows > 0 ? q8s_rows : 1);
+            return true;
+        }
+        if (!o.own_gemv || B != 8) {   // (as before: the jobs in one ds4_iq launch)
+            iq::MvJob js[3];
+            int n = 0;
+            for (const G8& g : gs) js[n++] = job(*g.m, xq, xd, B, g.y, g.ycs);
+            if (!iq::mv(js, n, s)) {
+                err = "dspark: a GEMV ds4_iq does not take";
+                return false;
+            }
+            return true;
+        }
+        for (const G8& g : gs)
+            if (!mv8({job(*g.m, xq, xd, B, g.y, g.ycs)}, err)) return false;
         return true;
     }
     // the block's 8 rows through a Q8_0 matrix: this file's 8-column kernel, or ds4_iq's
@@ -914,6 +1563,13 @@ struct Dspark::Impl {
             tok_embd = tp.data(*t);
             tok_row = (size_t) t->bytes / (size_t) Vp;
             h_x.resize((size_t) E);
+            if (pinned_on && (cudaMallocHost((void**) &pin_x, ((size_t) E + 2) * 4) != cudaSuccess ||
+                              cudaMallocHost((void**) &pin_out, (size_t) 3 * Dspark::kBlock * 4) != cudaSuccess)) {
+                (void) cudaGetLastError();
+                if (pin_x) (void) cudaFreeHost(pin_x);
+                pin_x = nullptr;
+                pin_out = nullptr;
+            }
             if (!alloc(tok_norm, (size_t) E, err) || !h2d(tok_norm, tp.data(*tn), tn->bytes, err)) return false;
             if (o.output_dev != nullptr) {
                 out.w = o.output_dev;
@@ -952,11 +1608,11 @@ struct Dspark::Impl {
             l.swa = swa[(size_t) il] != 0;
             if (!vec(p + "attn_norm.weight", l.attn_norm, E, err) || !vec(p + "ffn_norm.weight", l.ffn_norm, E, err) ||
                 !vec(p + "attn_q_norm.weight", l.qn, D, err) || !vec(p + "attn_k_norm.weight", l.kn, D, err) ||
-                !vec(p + "attn_k_ctx_norm.weight", l.kcn, D, err) || !mat(p + "attn_q.weight", l.q, E, HD, err) ||
-                !mat(p + "attn_k.weight", l.kk, E, KD, err) || !mat(p + "attn_v.weight", l.v, E, KD, err) ||
-                !mat(p + "attn_output.weight", l.o, HD, E, err) || !mat(p + "attn_k_ctx.weight", l.kc, E, KD, err) ||
-                !mat(p + "attn_v_ctx.weight", l.vc, E, KD, err) || !mat(p + "ffn_gate.weight", l.gate, E, FF, err) ||
-                !mat(p + "ffn_up.weight", l.up, E, FF, err) || !mat(p + "ffn_down.weight", l.down, FF, E, err))
+                !vec(p + "attn_k_ctx_norm.weight", l.kcn, D, err) || !mat(p + "attn_q.weight", l.q, E, HD, err, true) ||
+                !mat(p + "attn_k.weight", l.kk, E, KD, err, true) || !mat(p + "attn_v.weight", l.v, E, KD, err, true) ||
+                !mat(p + "attn_output.weight", l.o, HD, E, err, true) || !mat(p + "attn_k_ctx.weight", l.kc, E, KD, err) ||
+                !mat(p + "attn_v_ctx.weight", l.vc, E, KD, err) || !mat(p + "ffn_gate.weight", l.gate, E, FF, err, true) ||
+                !mat(p + "ffn_up.weight", l.up, E, FF, err, true) || !mat(p + "ffn_down.weight", l.down, FF, E, err, true))
                 return false;
             l.ring = l.swa ? n_swa + std::max(0, o.rewind) + kFeed : 0;
             const size_t rows = l.swa ? (size_t) l.ring : (size_t) o.max_ctx;
@@ -1006,11 +1662,13 @@ struct Dspark::Impl {
             !alloc(ao, (size_t) B * HD, err) || !alloc(ob, (size_t) B * E, err) || !alloc(gu, (size_t) 2 * B * FF, err) ||
             !alloc(hh, (size_t) B * FF, err) || !alloc(ast, (size_t) B * H * max_tiles * 2, err) ||
             !alloc(apart, (size_t) B * H * max_tiles * D, err) || !alloc(hN, (size_t) B * E, err) ||
-            !alloc(base, (size_t) (B - 1) * Vp, err) || !alloc(lg, (size_t) Vp, err) || !alloc(z, (size_t) 3 * R, err) ||
+            !alloc(base, (size_t) (B - 1) * Vp, err) || !alloc(lg, (size_t) B * Vp, err) || !alloc(z, (size_t) 3 * R, err) ||
             !alloc(state, (size_t) R, err) || !alloc(ctx, (size_t) E, err) ||
             !alloc(prob, (size_t) B, err) || !alloc(tok, (size_t) B, err) ||
             !alloc(bmax, (size_t) blocks_of((size_t) Vp), err) || !alloc(bidx, (size_t) blocks_of((size_t) Vp), err) ||
             !alloc(bsum, (size_t) blocks_of((size_t) Vp), err) || !alloc(x0, (size_t) B * E, err) || !alloc(cumd, 4, err) ||
+            !alloc(gmax, (size_t) blocks_of((size_t) Vp), err) || !alloc(gidx, (size_t) blocks_of((size_t) Vp), err) ||
+            !alloc(gval, (size_t) blocks_of((size_t) Vp), err) || !alloc(qdd, (size_t) B, err) ||
             !alloc(taps, (size_t) kFeed * NT * E, err) || !alloc(fz, (size_t) (NL + 1) * kFeed * E, err) ||
             !alloc(kc, (size_t) kFeed * KD, err) || !alloc(vc, (size_t) kFeed * KD, err) ||
             !alloc(xq, (size_t) kFeed * qk, err) || !alloc(xd, (size_t) kFeed * qk / 32, err))
@@ -1132,6 +1790,59 @@ struct Dspark::Impl {
             release(dxd);
             used -= X.size() * 4 + ybytes + (size_t) (R + 1) * E + (size_t) (R + 1) * E / 32 * 4;
         }
+        if (q8s && L[0].gate.sq != nullptr) {   // (rows a warp: the env's, else the fastest on layer 0's matrices)
+            const char* ev = std::getenv("IK2_HIP_DSPARK_Q8S_ROWS");
+            q8s_rows = ev ? std::atoi(ev) : 0;
+            if (q8s_rows != 1 && q8s_rows != 2 && q8s_rows != 4) {
+                CK(cudaMemsetAsync(xq, 1, (size_t) B * FF, s));
+                std::vector<float> one((size_t) B * FF / 32, 1e-3f);
+                CK(cudaMemcpy(xd, one.data(), one.size() * 4, cudaMemcpyHostToDevice));
+                cudaEvent_t e0, e1;
+                CK(cudaEventCreate(&e0));
+                CK(cudaEventCreate(&e1));
+                double best = 1e30;
+                char line[256];
+                int at = std::snprintf(line, sizeof line, "dspark: split Q8_0 GEMVs, a layer's (us) by rows a warp:");
+                for (int R : {1, 2, 4}) {
+                    float ms = 0;
+                    for (int rep = 0; rep < 2; ++rep) {   // (the first round warms up)
+                        CK(cudaEventRecord(e0, s));
+                        for (int it = 0; it < 10; ++it) {
+                            const DLayer& l = L[(size_t) (it % NL)];
+                            Q8sJobs J{};
+                            const Mat* ms3[4] = {&l.q, &l.kk, &l.v, nullptr};
+                            float* ys[3] = {qv, kv, vv};
+                            const size_t ycs[3] = {(size_t) H * D, (size_t) Hkv * D, (size_t) Hkv * D};
+                            for (int j = 0; j < 3; ++j) J.j[J.nj++] = {ms3[j]->sq, ms3[j]->sd, ms3[j]->k, ms3[j]->n, 0, ys[j], ycs[j]};
+                            q8s_launch(J, R);
+                            J = {};
+                            J.j[J.nj++] = {l.o.sq, l.o.sd, l.o.k, l.o.n, 0, ob, (size_t) E};
+                            q8s_launch(J, R);
+                            J = {};
+                            J.j[J.nj++] = {l.gate.sq, l.gate.sd, l.gate.k, l.gate.n, 0, gu, (size_t) FF};
+                            J.j[J.nj++] = {l.up.sq, l.up.sd, l.up.k, l.up.n, 0, gu + (size_t) B * FF, (size_t) FF};
+                            q8s_launch(J, R);
+                            J = {};
+                            J.j[J.nj++] = {l.down.sq, l.down.sd, l.down.k, l.down.n, 0, ob, (size_t) E};
+                            q8s_launch(J, R);
+                        }
+                        CK(cudaEventRecord(e1, s));
+                        CK(cudaEventSynchronize(e1));
+                        CK(cudaEventElapsedTime(&ms, e0, e1));
+                    }
+                    const double us = ms * 1e3 / 10;
+                    at += std::snprintf(line + at, sizeof line - (size_t) at, " %d: %.0f", R, us);
+                    if (us < best) {
+                        best = us;
+                        q8s_rows = R;
+                    }
+                }
+                (void) cudaEventDestroy(e0);
+                (void) cudaEventDestroy(e1);
+                std::fprintf(stderr, "%s -> %d\n", line, q8s_rows);
+            }
+        }
+        if (!q8s_lds_check(err) || !head_check(err)) return false;
         st.vram_gb = (double) used / 1e9;
         st.load_s = (now_ms() - t0) / 1e3;
         if (o.verbose)
@@ -1183,9 +1894,12 @@ struct Dspark::Impl {
         return true;
     }
 
-    bool draft(int anchor, int max_n, std::vector<int>& toks, std::vector<float>& probs, std::string& err) {
+    bool draft(int anchor, int max_n, float temp, unsigned long long seed, std::vector<int>& toks, std::vector<float>& probs,
+               std::vector<float>* qds, std::string& err) {
         toks.clear();
         probs.clear();
+        if (qds) qds->clear();
+        const bool drawn = temp > 0.0f && qds != nullptr;
         const int64_t n = end;
         max_n = std::min(max_n, B - 1);
         if (max_n < 1 || n < 1 || n + B > o.max_ctx || anchor < 0 || anchor >= Vu) return true;
@@ -1196,6 +1910,18 @@ struct Dspark::Impl {
             if (l.swa && lo_swa <= hi - l.ring) return true;
         const double t0 = now_ms();
         double tp0 = t0;
+        // IK2_HIP_DSPARK_WALL=1 (measurements): events at the first and the last of a draft's GPU work - a line every 200
+        // drafts: the wall time a draft, the GPU's span, the host's time before its first enqueue and after the GPU's end
+        static const bool wall = std::getenv("IK2_HIP_DSPARK_WALL") != nullptr;
+        static cudaEvent_t wev0 = nullptr, wev1 = nullptr;
+        static double w_wall = 0, w_gpu = 0, w_pre = 0;
+        static long long w_n = 0;
+        double t_pre = 0;
+        if (wall && wev0 == nullptr) {
+            (void) cudaSetDevice(dev);
+            (void) cudaEventCreate(&wev0);
+            (void) cudaEventCreate(&wev1);
+        }
         auto phase = [&](double& acc) -> bool {
             if (!o.profile) return true;
             if (!sync(err)) return false;
@@ -1207,35 +1933,59 @@ struct Dspark::Impl {
         CK(cudaSetDevice(dev));
         const int HD = H * D, KD = Hkv * D;
         const float one = 1.0f;
+        const bool pin = pin_x != nullptr && pin_out != nullptr;
         // ---- the rows: the anchor's normed embedding, then the mask embedding
         {
             const uint8_t* row = tok_embd + (size_t) anchor * tok_row;
-            if (tok_type == kQ5K) dequantize_row_q5_K(row, h_x.data(), E);
-            else if (tok_type == iq::kQ6_K) dequantize_row_q6_K(row, h_x.data(), E);
-            else std::memcpy(h_x.data(), row, (size_t) E * 4);
-            CK(cudaMemcpyAsync(emb, h_x.data(), (size_t) E * 4, cudaMemcpyHostToDevice, s));
+            float* hx = pin ? pin_x : h_x.data();   // (pinned: the last draft's copies are done - it synced at its end)
+            if (tok_type == kQ5K) dequantize_row_q5_K(row, hx, E);
+            else if (tok_type == iq::kQ6_K) dequantize_row_q6_K(row, hx, E);
+            else std::memcpy(hx, row, (size_t) E * 4);
+            if (wall) {
+                t_pre = now_ms() - t0;
+                CK(cudaEventRecord(wev0, s));
+            }
+            const int* h_anchor = &anchor;
+            const float* h_one = &one;
+            if (pin) {
+                std::memcpy(pin_x + E, &anchor, 4);
+                pin_x[E + 1] = 1.0f;
+                h_anchor = (const int*) (pin_x + E);
+                h_one = pin_x + E + 1;
+            }
+            CK(cudaMemcpyAsync(emb, hx, (size_t) E * 4, cudaMemcpyHostToDevice, s));
             CK(cudaMemcpyAsync(x, x0, (size_t) B * E * 4, cudaMemcpyDeviceToDevice, s));
             ik2hip::k::rms(emb, (size_t) E, 1, E, tok_norm, eps, x, (size_t) E, s);
-            CK(cudaMemcpyAsync(tok, &anchor, sizeof(int), cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(tok, h_anchor, sizeof(int), cudaMemcpyHostToDevice, s));
             CK(cudaMemsetAsync(state, 0, (size_t) R * 4, s));
-            CK(cudaMemcpyAsync(cumd, &one, 4, cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(cumd, h_one, 4, cudaMemcpyHostToDevice, s));
             half_to_float_kernel<<<blocks_of((size_t) E), 256, 0, s>>>((const __half*) fring + (size_t) ((n - 1) % FR) * E, E, ctx);
             check("ctx");
         }
         if (!phase(st.embed_ms)) return false;
         // ---- the layers
         const float scale = 1.0f / std::sqrt((float) D);
+        const bool fz8 = fuse && E % 32 == 0 && FF % 256 == 0 && D <= 128 && (D / 2 & (D / 2 - 1)) == 0;
+        const float* pend = nullptr;   // (fused: the last FFN's output, added at the next norm)
         for (int il = 0; il < NL; ++il) {
             DLayer& l = L[(size_t) il];
-            ik2hip::k::rms(x, (size_t) E, B, E, l.attn_norm, eps, a, (size_t) E, s);
-            hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
-            if (!mv8({job(l.q, xq, xd, B, qv, (size_t) HD), job(l.kk, xq, xd, B, kv, (size_t) KD),
-                     job(l.v, xq, xd, B, vv, (size_t) KD)}, err))
-                return false;
-            ik2hip::k::rms(qv, (size_t) D, B * H, D, l.qn, eps, qv, (size_t) D, s);
-            ik2hip::k::rms(kv, (size_t) D, B * Hkv, D, l.kn, eps, kv, (size_t) D, s);
-            rope_neox_kernel<<<blocks_of((size_t) B * H * D / 2), 256, 0, s>>>(qv, B, H, D, (long long) n, log_base);
-            rope_neox_kernel<<<blocks_of((size_t) B * Hkv * D / 2), 256, 0, s>>>(kv, B, Hkv, D, (long long) n, log_base);
+            if (fz8) {
+                add_rms_q8_kernel<<<(unsigned) B, 256, 0, s>>>(x, pend, l.attn_norm, eps, E, nullptr, xq, xd);
+                pend = nullptr;
+            } else {
+                ik2hip::k::rms(x, (size_t) E, B, E, l.attn_norm, eps, a, (size_t) E, s);
+                hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
+            }
+            if (!gemv8({{&l.q, qv, (size_t) HD}, {&l.kk, kv, (size_t) KD}, {&l.v, vv, (size_t) KD}}, err)) return false;
+            if (fz8) {
+                qk_norm_rope_kernel<<<(unsigned) (B * (H + Hkv)), (unsigned) (D / 2), 0, s>>>(qv, kv, B, H, Hkv, D, l.qn, l.kn, eps,
+                                                                                          (long long) n, log_base);
+            } else {
+                ik2hip::k::rms(qv, (size_t) D, B * H, D, l.qn, eps, qv, (size_t) D, s);
+                ik2hip::k::rms(kv, (size_t) D, B * Hkv, D, l.kn, eps, kv, (size_t) D, s);
+                rope_neox_kernel<<<blocks_of((size_t) B * H * D / 2), 256, 0, s>>>(qv, B, H, D, (long long) n, log_base);
+                rope_neox_kernel<<<blocks_of((size_t) B * Hkv * D / 2), 256, 0, s>>>(kv, B, Hkv, D, (long long) n, log_base);
+            }
             if (!phase(st.qkv_ms)) return false;
             const int64_t lo = l.swa ? lo_swa : 0;
             const int nctx = (int) (n - lo);
@@ -1257,51 +2007,100 @@ struct Dspark::Impl {
             check("attention");
             if (!phase(st.attn_ms)) return false;
             hk::q8_rows(ao, (size_t) HD, B, HD, xq, xd, s);
-            if (!mv8({job(l.o, xq, xd, B, ob, (size_t) E)}, err)) return false;
-            ik2hip::k::add(x, ob, (size_t) B * E, s);
-            if (!phase(st.o_ms)) return false;
-            ik2hip::k::rms(x, (size_t) E, B, E, l.ffn_norm, eps, a, (size_t) E, s);
-            hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
-            if (!mv8({job(l.gate, xq, xd, B, gu, (size_t) FF), job(l.up, xq, xd, B, gu + (size_t) B * FF, (size_t) FF)}, err))
-                return false;
-            hk::swiglu(gu, gu + (size_t) B * FF, (size_t) FF, B, FF, hh, (size_t) FF, s);
-            hk::q8_rows(hh, (size_t) FF, B, FF, xq, xd, s);
-            if (!mv8({job(l.down, xq, xd, B, ob, (size_t) E)}, err)) return false;
-            ik2hip::k::add(x, ob, (size_t) B * E, s);
+            if (!gemv8({{&l.o, ob, (size_t) E}}, err)) return false;
+            if (fz8) {
+                add_rms_q8_kernel<<<(unsigned) B, 256, 0, s>>>(x, ob, l.ffn_norm, eps, E, nullptr, xq, xd);
+                if (!phase(st.o_ms)) return false;
+            } else {
+                ik2hip::k::add(x, ob, (size_t) B * E, s);
+                if (!phase(st.o_ms)) return false;
+                ik2hip::k::rms(x, (size_t) E, B, E, l.ffn_norm, eps, a, (size_t) E, s);
+                hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
+            }
+            if (!gemv8({{&l.gate, gu, (size_t) FF}, {&l.up, gu + (size_t) B * FF, (size_t) FF}}, err)) return false;
+            if (fz8) {
+                swiglu_q8_kernel<<<dim3((unsigned) (FF / 256), (unsigned) B), 256, 0, s>>>(gu, gu + (size_t) B * FF, FF, xq, xd);
+            } else {
+                hk::swiglu(gu, gu + (size_t) B * FF, (size_t) FF, B, FF, hh, (size_t) FF, s);
+                hk::q8_rows(hh, (size_t) FF, B, FF, xq, xd, s);
+            }
+            if (!gemv8({{&l.down, ob, (size_t) E}}, err)) return false;
+            if (fz8) pend = ob;
+            else ik2hip::k::add(x, ob, (size_t) B * E, s);
             if (!phase(st.ffn_ms)) return false;
         }
-        ik2hip::k::rms(x, (size_t) E, B, E, out_norm, eps, hN, (size_t) E, s);
-        if (!phase(st.layers_ms)) return false;
-        if (o.profile) st.layers_ms = st.qkv_ms + st.attn_ms + st.o_ms + st.ffn_ms;
+        if (fz8) add_rms_q8_kernel<<<(unsigned) B, 256, 0, s>>>(x, pend, out_norm, eps, E, hN, xq, xd);
+        else ik2hip::k::rms(x, (size_t) E, B, E, out_norm, eps, hN, (size_t) E, s);
+        if (!phase(st.norm_ms)) return false;
+        if (o.profile) st.layers_ms = st.qkv_ms + st.attn_ms + st.o_ms + st.ffn_ms + st.norm_ms;
         // ---- the base logits of the draft rows (the target's output matrix, read once)
-        hk::q8_rows(hN + (size_t) E, (size_t) E, max_n, E, xq, xd, s);
-        if (!mv({job(out, xq, xd, max_n, base, (size_t) Vp)}, err)) return false;
+        if (fz8) {   // (the final norm's kernel made every row's int8 form: rows 1 .. max_n are the drafts')
+            if (!head_mv(job(out, xq + (size_t) E, xd + (size_t) E / 32, max_n, base, (size_t) Vp), err)) return false;
+        } else {
+            hk::q8_rows(hN + (size_t) E, (size_t) E, max_n, E, xq, xd, s);
+            if (!head_mv(job(out, xq, xd, max_n, base, (size_t) Vp), err)) return false;
+        }
         if (!phase(st.base_ms)) return false;
         // ---- the markov head, a step a draft: all on the device
         for (int i = 1; i <= max_n; ++i) {
             joint_kernel<<<(unsigned) (3 * R), 256, 0, s>>>((const __half*) Wj, bj, state, (const __half*) w1, tok + (i - 1),
                                                         hN + (size_t) i * E, ctx, R, E, z, cumd, cum_min);
-            logits_kernel<<<blocks_of((size_t) Vu), 256, 0, s>>>(base + (size_t) (i - 1) * Vp, Mq, msc, m0, z, R, Vu, Vp, cap, lg,
-                                                              bmax, bidx, bsum, cumd, cum_min);
-            pick_kernel<<<1, 1024, 0, s>>>(bmax, bidx, bsum, (int) blocks_of((size_t) Vu), tok + i, prob + i, z, R, state, cumd,
-                                           cum_min);
+            float* lgi = lg + (size_t) (i - 1) * Vp;   // (each draft's logits kept: a drawn draft's q for the verdict)
+            if (!drawn) {
+                logits_kernel<<<blocks_of((size_t) Vu), 256, 0, s>>>(base + (size_t) (i - 1) * Vp, Mq, msc, m0, z, R, Vu, Vp, cap,
+                                                                  lgi, bmax, bidx, bsum, cumd, cum_min);
+                pick_kernel<<<1, 1024, 0, s>>>(bmax, bidx, bsum, (int) blocks_of((size_t) Vu), tok + i, prob + i, z, R, state,
+                                               cumd, cum_min);
+            } else {
+                logits_draw_kernel<<<blocks_of((size_t) Vu), 256, 0, s>>>(
+                    base + (size_t) (i - 1) * Vp, Mq, msc, m0, z, R, Vu, Vp, cap, 1.0f / temp,
+                    seed ^ (0xD1B54A32D192ED03ull * (unsigned long long) i), lgi, bmax, bidx, bsum, gmax, gidx, gval, cumd, cum_min);
+                pick_draw_kernel<<<1, 1024, 0, s>>>(bmax, bsum, gmax, gidx, gval, (int) blocks_of((size_t) Vu), tok + i, prob + i,
+                                                    qdd + i, z, R, state, cumd, cum_min);
+            }
         }
         check("head");
-        int h_tok[Dspark::kBlock];
-        float h_prob[Dspark::kBlock];
+        int h_tok_s[Dspark::kBlock];
+        float h_prob_s[Dspark::kBlock], h_qd_s[Dspark::kBlock];
+        int* h_tok = pin ? pin_out : h_tok_s;
+        float* h_prob = pin ? (float*) (pin_out + Dspark::kBlock) : h_prob_s;
+        float* h_qd = pin ? (float*) (pin_out + 2 * Dspark::kBlock) : h_qd_s;
         CK(cudaMemcpyAsync(h_tok, tok, sizeof(int) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_prob, prob, sizeof(float) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
+        if (drawn) CK(cudaMemcpyAsync(h_qd, qdd, sizeof(float) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
+        if (wall) CK(cudaEventRecord(wev1, s));
         if (!sync(err)) return false;
         if (o.profile) st.head_ms += now_ms() - tp0;
+        if (wall) {
+            float g = 0;
+            (void) cudaEventElapsedTime(&g, wev0, wev1);
+            const double tw = now_ms() - t0;
+            w_wall += tw;
+            w_gpu += g;
+            w_pre += t_pre;
+            ++w_n;
+            if (w_n % 200 == 0)
+                std::fprintf(stderr, "DSPARK WALL %lld drafts: a draft %.3f ms wall, GPU %.3f (first to last enqueued op), host "
+                                     "before the first %.3f, the rest (launches ahead of the GPU, copies, sync) %.3f\n",
+                             w_n, w_wall / w_n, w_gpu / w_n, w_pre / w_n, (w_wall - w_gpu - w_pre) / w_n);
+        }
         float cum = 1.0f;
         for (int i = 1; i <= max_n; ++i) {
             cum *= h_prob[i];
             if (h_tok[i] < 0 || cum < cum_min) break;
             toks.push_back(h_tok[i]);
             probs.push_back(h_prob[i]);
+            if (drawn) qds->push_back(h_qd[i]);
         }
         ++st.drafts;
         st.draft_ms += now_ms() - t0;
+        if (o.profile && st.drafts % 100 == 0) {   // (IK2_HIP_DSPARK_PROFILE=1: a line every 100 drafts, ms a draft)
+            const double nd = (double) st.drafts;
+            std::fprintf(stderr, "DSPARK PROFILE %lld drafts at %lld positions: a draft %.2f ms = embed %.2f + layers %.2f "
+                                 "(qkv %.2f attn %.2f o %.2f ffn %.2f) + base %.2f + head %.2f\n",
+                         (long long) st.drafts, (long long) n, st.draft_ms / nd, st.embed_ms / nd, st.layers_ms / nd,
+                         st.qkv_ms / nd, st.attn_ms / nd, st.o_ms / nd, st.ffn_ms / nd, st.base_ms / nd, st.head_ms / nd);
+        }
         return true;
     }
 };
@@ -1321,7 +2120,58 @@ bool Dspark::feed_dev(const float* d_taps, size_t ld, int n, int64_t pos0, std::
     return true;
 }
 bool Dspark::draft(int anchor, int max_n, std::vector<int>& toks, std::vector<float>& probs, std::string& err) {
-    return m->draft(anchor, max_n, toks, probs, err);
+    static const bool check = std::getenv("IK2_HIP_DSPARK_FUSE_CHECK") != nullptr;   // (tests: fused against separate)
+    if (check && m->fuse) {
+        std::vector<int> t0;
+        std::vector<float> p0;
+        m->fuse = false;
+        const float c = m->cum_min;
+        m->cum_min = 0.0f;
+        const bool ok = m->draft(anchor, max_n, 0.0f, 0, t0, p0, nullptr, err);
+        m->fuse = true;
+        if (!ok || !m->draft(anchor, max_n, 0.0f, 0, toks, probs, nullptr, err)) return false;
+        m->cum_min = c;
+        static long long n = 0, same = 0, first_same = 0, cmp = 0;
+        static double worst = 0;
+        ++n;
+        bool all = toks.size() == t0.size();
+        for (size_t i = 0; i < std::min(toks.size(), t0.size()); ++i) {
+            all = all && toks[i] == t0[i];
+            worst = std::max(worst, (double) std::fabs(probs[i] - p0[i]));
+            ++cmp;
+        }
+        same += all;
+        first_same += !toks.empty() && !t0.empty() && toks[0] == t0[0];
+        if (n % 100 == 0)
+            std::fprintf(stderr, "DSPARK FUSE CHECK %lld drafts: all 7 the same %lld, the first the same %lld; worst prob "
+                                 "difference %.2e over %lld\n", n, same, first_same, worst, cmp);
+        // (the window's cut as the request's, on the fused drafts)
+        float cum = 1.0f;
+        size_t keep = 0;
+        while (keep < toks.size() && (cum *= probs[keep]) >= c) ++keep;
+        toks.resize(keep);
+        probs.resize(keep);
+        return true;
+    }
+    return m->draft(anchor, max_n, 0.0f, 0, toks, probs, nullptr, err);
+}
+bool Dspark::draft_drawn(int anchor, int max_n, float temp, unsigned long long seed, std::vector<int>& toks,
+                         std::vector<float>& probs, std::vector<float>& qd, std::string& err) {
+    return m->draft(anchor, max_n, temp, seed, toks, probs, &qd, err);
+}
+bool Dspark::draft_logits(int i, float* out, std::string& err) {
+    std::string& e = err;
+    if (i < 1 || i >= kBlock) {
+        e = "dspark: no draft " + std::to_string(i);
+        return false;
+    }
+    if (cudaSetDevice(m->dev) != cudaSuccess ||
+        cudaMemcpyAsync(out, m->lg + (size_t) (i - 1) * m->Vp, (size_t) m->Vu * 4, cudaMemcpyDeviceToHost, m->s) != cudaSuccess ||
+        cudaStreamSynchronize(m->s) != cudaSuccess) {
+        e = std::string("dspark: a draft's logits: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
 }
 void Dspark::rollback(int64_t pos) { m->end = std::max<int64_t>(0, std::min(m->end, pos)); }
 bool Dspark::add_states(int n, std::string& err) { return m->add_states(n, err); }

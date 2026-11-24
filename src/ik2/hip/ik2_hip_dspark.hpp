@@ -56,7 +56,7 @@ struct DsparkStats {
     int64_t fed = 0, drafts = 0;             // positions fed, draft() calls
     double feed_ms = 0, draft_ms = 0;        // host time in feed() / draft() (draft: to its tokens on the host)
     double embed_ms = 0, layers_ms = 0, base_ms = 0, head_ms = 0;   // (profile) draft()'s phases
-    double qkv_ms = 0, attn_ms = 0, o_ms = 0, ffn_ms = 0;           // (profile) layers_ms' parts: Q / K / V, the
+    double qkv_ms = 0, attn_ms = 0, o_ms = 0, ffn_ms = 0, norm_ms = 0;          // (profile) layers_ms' parts: Q / K / V, the
                                                                     // attention, its output matrix, the FFN
 };
 
@@ -90,6 +90,13 @@ public:
     /// running product of the probabilities falls below cum_min (toks may come back empty).  Needs end() >= 1 and the
     /// context row of end() - 1 still in its ring (else no drafts, true).  The state does not change.
     bool draft(int anchor, int max_n, std::vector<int>& toks, std::vector<float>& probs, std::string& err);
+    /// The same with drawn drafts (speculative sampling's q): draft i is a draw from q_i = softmax(lg_i / temp) over the
+    /// whole vocabulary (the Gumbel-max rule, noise from seed), the head's chain going on from the drawn token; qd[i]
+    /// its probability under q_i.  probs stay each row's largest probability under q_i (the window's confidence).
+    bool draft_drawn(int anchor, int max_n, float temp, unsigned long long seed, std::vector<int>& toks,
+                     std::vector<float>& probs, std::vector<float>& qd, std::string& err);
+    /// The last draft()'s capped logits lg_i of draft i (1 .. 7) over the unpadded vocabulary, to the host (vocab() floats)
+    bool draft_logits(int i, float* out, std::string& err);
 
     /// The context ends at pos (<= end()): the rows past it are dead and written again when those positions are fed
     void rollback(int64_t pos);
