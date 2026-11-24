@@ -319,10 +319,10 @@ struct Drafting {
     // [0.25, 4].  0 (the default): the drafter's own probabilities as before
     bool cal = env_d("IK2_HIP_DRAFT_CAL", 0) != 0;
     double cal_ema = env_d("IK2_HIP_DRAFT_CAL_EMA", 0.995);
-    double cal_pm[4] = {20, 20, 20, 20}, cal_om[4] = {20, 20, 20, 20};   // (a prior of 20 misses predicted and seen: m = 1)
+    double cal_pm[4] = {20, 20, 20, 4}, cal_om[4] = {20, 20, 20, 4};   // (a prior of 20 misses predicted and seen: m = 1; lookup 4)
     int mode = 0;                                                // (the round's: draft_round sets it; 3 prompt lookup)
     double miss_scale() const {
-        return cal || mode == 3 ? std::min(4.0, std::max(0.25, cal_om[mode] / cal_pm[mode])) : 1.0;
+        return cal || mode == 3 ? std::min(4.0, std::max(mode == 3 ? 0.05 : 0.25, cal_om[mode] / cal_pm[mode])) : 1.0;
     }
     // IK2_HIP_DRAFT_LOOKUP=N (N >= 1): prompt lookup first - when the context's last N+ tokens occurred before
     // (strata::spec::SuffixDrafter over the prompt and the answer), what followed them is the round's drafts (up to the
@@ -330,13 +330,15 @@ struct Drafting {
     // lookup's own calibration (mode 3, always on).  0 (the default): no lookup
     int lookup_min = (int) env_d("IK2_HIP_DRAFT_LOOKUP", 0);
     float lookup_p = (float) env_d("IK2_HIP_DRAFT_LOOKUP_P", 0.7);
+    double look_ema = env_d("IK2_HIP_DRAFT_LOOKUP_EMA", 0.98);   // (the lookup's calibration a draft: quicker than the drafter's)
     std::shared_ptr<strata::spec::SuffixDrafter> sdp = std::make_shared<strata::spec::SuffixDrafter>(3, 64);   // (shared: a Drafting's copy is cheap)
     bool sd_fresh = true;
     long long looked = 0, look_off = 0, look_kept = 0;
     void cal_observe(const std::vector<float>& p, int k, int kept) {
+        const double e = mode == 3 ? look_ema : cal_ema;
         for (int i = 0; i < k && i <= kept; ++i) {
-            cal_pm[mode] = cal_ema * cal_pm[mode] + (1.0 - std::min(1.0, std::max(0.0, (double) p[(size_t) i])));
-            cal_om[mode] = cal_ema * cal_om[mode] + (i == kept ? 1.0 : 0.0);
+            cal_pm[mode] = e * cal_pm[mode] + (1.0 - std::min(1.0, std::max(0.0, (double) p[(size_t) i])));
+            cal_om[mode] = e * cal_om[mode] + (i == kept ? 1.0 : 0.0);
         }
     }
 
@@ -349,7 +351,7 @@ struct Drafting {
         const double ms = miss_scale();
         for (int k = 1; k <= n; ++k) {
             const double pk = std::min(1.0, std::max(0.0, (double) p[(size_t) k - 1]));
-            cum *= cal ? std::max(0.0, 1.0 - ms * (1.0 - pk)) : pk;
+            cum *= cal || mode == 3 ? std::max(0.0, 1.0 - ms * (1.0 - pk)) : pk;
             exp_tok += cum;
             const double rate = exp_tok / (cost(k + 1) + td);
             if (rate > best_rate) {
