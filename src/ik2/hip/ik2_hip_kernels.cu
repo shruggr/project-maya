@@ -1455,6 +1455,176 @@ __global__ void __launch_bounds__(128) attn_flash_kernel(const uint16_t* __restr
 #endif
 }
 
+// attn_flash's second form (IK2_HIP_FLASH_V=2): S^T = K Q^T and O^T = V^T P^T, so a lane holds one query (column
+// l % 16) and 8 keys / dimensions (rows 8 (l / 16) ..): its 8 probabilities a 16-key step are the second product's B
+// operand as they stand (no trip through LDS), the row's max and sum one shuffle across the halves, the rescale one
+// number a lane; the query's F16 values in registers; V transposed 8 x 8 in registers and stored 16 bytes at a time
+template <int NW>
+__global__ void __launch_bounds__(NW * 32) attn_flash2_kernel(const uint16_t* __restrict__ qh16, int Q, int per, int Hkv,
+                                                          const uint16_t* __restrict__ K16, const uint16_t* __restrict__ V16,
+                                                          int ring, long long klo, int nk, long long pf, int window,
+                                                          int extent, const float* __restrict__ tbl,
+                                                          const float* __restrict__ sink, float scale,
+                                                          float* __restrict__ out) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX12__)
+    using h8 = _Float16 __attribute__((ext_vector_type(8)));
+    using f8 = float __attribute__((ext_vector_type(8)));
+    const _Float16* qh = (const _Float16*) qh16;
+    const _Float16* K = (const _Float16*) K16;
+    const _Float16* V = (const _Float16*) V16;
+    using fl::D;
+    using fl::KT;
+    using fl::KS;
+    using fl::VS;
+    __shared__ __align__(16) _Float16 ks[KT * KS];   // K: a key's 128 values a row
+    __shared__ __align__(16) _Float16 vs[D * VS];    // V transposed: a dimension's 64 keys a row
+    const int g = blockIdx.y, lt = threadIdx.x, lane = lt & 31, wp = lt >> 5, m16 = lane & 15, hi = lane >> 4;
+    const int k0 = 8 * hi;
+    constexpr int RB = NW * 16;   // (the block's query rows: NW waves of 16)
+    const int H = Hkv * per, qb = blockIdx.x * RB, q = qb + wp * 16 + m16;
+    const bool qok = q < Q;
+    const int qq = qok ? q : Q - 1, t = qq / per, h = g * per + qq % per;
+    h8 qa[D / 16];
+    {
+        const h8* qr = (const h8*) (qh + ((size_t) g * Q + qq) * D);
+#pragma unroll
+        for (int kk = 0; kk < D / 16; ++kk) qa[kk] = qok ? qr[kk * 2 + hi] : h8{};
+    }
+    const int rp = qok ? (int) (pf + t - klo) : -1;   // (a row past Q: no keys)
+    const long long lo = window > 0 ? pf + t - (window - 1) : 0;
+    const int rlo = lo < klo ? 0 : (int) (lo - klo), rto = (t * H + h) * extent;
+    const float rs = sink[(size_t) t * H + h];
+    float m_run = 0.0f, den = 1.0f;
+    f8 acc[D / 16];
+#pragma unroll
+    for (int nt = 0; nt < D / 16; ++nt) acc[nt] = f8{};
+    const int qlast = min(qb + RB, Q) - 1;
+    const long long p_lo = pf + qb / per, p_hi = pf + qlast / per;
+    long long k_lo = window > 0 ? p_lo - (window - 1) : 0;
+    if (k_lo < klo) k_lo = klo;
+    const int j_begin = (int) (k_lo - klo), j_end = (int) min((long long) nk, p_hi - klo + 1);
+    const int vp = (lt & 127) >> 3, vk = (lt & 7) * 8;
+    for (int j0 = j_begin; j0 < j_end; j0 += KT) {
+        // (the tile: 64 keys' K rows, 1024 uint4s, and V's 8 x 8 blocks, 128; NW 4: each thread 8 of K's and a block
+        //  of V, NW 8: threads 0 .. 127 a block of V each, 128 .. 255 8 of K's)
+        if (NW == 4 || lt >= 128) {
+            const int lk = NW == 4 ? lt : lt - 128;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {   // (K: key rows (lk / 16) + 8 k, a uint4 each)
+                const int rr = (lk >> 4) + 8 * k, j = j0 + rr;
+                uint4 kv = make_uint4(0u, 0u, 0u, 0u);
+                if (j < j_end) {
+                    const long long kp = klo + j;
+                    const size_t slot = (size_t) (ring > 0 ? kp % ring : kp);
+                    kv = ((const uint4*) (K + (slot * Hkv + g) * D))[lk & 15];
+                }
+                *(uint4*) (ks + rr * KS + (lk & 15) * 8) = kv;
+            }
+        }
+        if (NW == 4 || lt < 128) {   // (V: keys vk .. + 7, dimensions vp 8 .. + 7, transposed in registers)
+            uint32_t a[8][4];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int j = j0 + vk + k;
+                uint4 vv = make_uint4(0u, 0u, 0u, 0u);
+                if (j < j_end) {
+                    const long long kp = klo + j;
+                    const size_t slot = (size_t) (ring > 0 ? kp % ring : kp);
+                    vv = ((const uint4*) (V + (slot * Hkv + g) * D))[vp];
+                }
+                a[k][0] = vv.x;
+                a[k][1] = vv.y;
+                a[k][2] = vv.z;
+                a[k][3] = vv.w;
+            }
+#pragma unroll
+            for (int x = 0; x < 8; ++x) {
+                const int p = x >> 1;
+                uint32_t o[4];
+#pragma unroll
+                for (int m = 0; m < 4; ++m)
+                    o[m] = (x & 1) ? ((a[2 * m][p] >> 16) | (a[2 * m + 1][p] & 0xffff0000u))
+                                   : ((a[2 * m][p] & 0xffffu) | (a[2 * m + 1][p] << 16));
+                *(uint4*) (vs + (vp * 8 + x) * VS + vk) = make_uint4(o[0], o[1], o[2], o[3]);
+            }
+        }
+        __syncthreads();
+        // S^T = K Q^T: 4 sub-tiles of 16 keys; lane: query m16, keys st 16 + k0 + i
+        f8 s[4];
+#pragma unroll
+        for (int st = 0; st < 4; ++st) s[st] = f8{};
+#pragma unroll
+        for (int kk = 0; kk < D / 16; ++kk)
+#pragma unroll
+            for (int st = 0; st < 4; ++st) {
+                const h8 ka = *(const h8*) (ks + (st * 16 + m16) * KS + kk * 16 + k0);
+                s[st] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ka, qa[kk], s[st]);
+            }
+        float mx = -INFINITY;
+        const bool fast = __all(j0 >= rlo && j0 + KT - 1 <= rp && rp - (j0 + KT - 1) >= extent && j0 + KT <= j_end);
+        if (fast) {
+#pragma unroll
+            for (int st = 0; st < 4; ++st)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float v = s[st][i] * scale + 0.0f - rs;
+                    s[st][i] = v;
+                    mx = fmaxf(mx, v);
+                }
+        } else {
+#pragma unroll
+            for (int st = 0; st < 4; ++st)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int j = j0 + st * 16 + k0 + i;
+                    float v = -INFINITY;
+                    if (j < j_end && j >= rlo && j <= rp) {
+                        const int d = rp - j;
+                        v = s[st][i] * scale + (d < extent ? tbl[rto + d] : 0.0f) - rs;
+                    }
+                    s[st][i] = v;
+                    mx = fmaxf(mx, v);
+                }
+        }
+        mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+        const float m_new = fmaxf(m_run, mx), tsc = fl_exp(m_run - m_new);
+        float sum = 0.0f;
+        h8 pb[4];
+#pragma unroll
+        for (int st = 0; st < 4; ++st)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float p = s[st][i] == -INFINITY ? 0.0f : fl_exp(s[st][i] - m_new);
+                sum += p;
+                pb[st][i] = (_Float16) p;
+            }
+        sum += __shfl_xor(sum, 16, 32);
+        den = den * tsc + sum;
+        m_run = m_new;
+#pragma unroll
+        for (int nt = 0; nt < D / 16; ++nt) acc[nt] *= tsc;
+        // O^T += V^T P^T: A = V^T (dimension nt 16 + m16, keys kk 16 + k0 ..), B = the lane's probabilities
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk)
+#pragma unroll
+            for (int nt = 0; nt < D / 16; ++nt) {
+                const h8 va = *(const h8*) (vs + (nt * 16 + m16) * VS + kk * 16 + k0);
+                acc[nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(va, pb[kk], acc[nt]);
+            }
+        __syncthreads();
+    }
+    if (qok) {
+        float* o = out + ((size_t) g * Q + q) * D;
+#pragma unroll
+        for (int nt = 0; nt < D / 16; ++nt) {
+            float4* o4 = (float4*) (o + nt * 16 + k0);
+            o4[0] = make_float4(acc[nt][0] / den, acc[nt][1] / den, acc[nt][2] / den, acc[nt][3] / den);
+            o4[1] = make_float4(acc[nt][4] / den, acc[nt][5] / den, acc[nt][6] / den, acc[nt][7] / den);
+        }
+    }
+#endif
+}
+
 __global__ void scatter_rows_kernel(const float* __restrict__ y, const int* __restrict__ row_of, int E,
                                     float* __restrict__ ent) {
     const int e = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x, r = row_of[e];
@@ -1731,8 +1901,16 @@ bool attn_flash(const uint16_t* qh, int Q, int per, int Hkv, int D, const uint16
                 float* out, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
     if (D != fl::D) return false;
-    attn_flash_kernel<<<dim3((unsigned) ((Q + fl::RB - 1) / fl::RB), (unsigned) Hkv), 128, 0, s>>>(
-        qh, Q, per, Hkv, K, V, ring, (long long) klo, nk, (long long) pf, window, extent, tbl, sink, scale, out);
+    static const int ver = std::getenv("IK2_HIP_FLASH_V") ? std::atoi(std::getenv("IK2_HIP_FLASH_V")) : 3;
+    if (ver == 2)
+        attn_flash2_kernel<4><<<dim3((unsigned) ((Q + 63) / 64), (unsigned) Hkv), 128, 0, s>>>(
+            qh, Q, per, Hkv, K, V, ring, (long long) klo, nk, (long long) pf, window, extent, tbl, sink, scale, out);
+    else if (ver == 3)
+        attn_flash2_kernel<8><<<dim3((unsigned) ((Q + 127) / 128), (unsigned) Hkv), 256, 0, s>>>(
+            qh, Q, per, Hkv, K, V, ring, (long long) klo, nk, (long long) pf, window, extent, tbl, sink, scale, out);
+    else
+        attn_flash_kernel<<<dim3((unsigned) ((Q + fl::RB - 1) / fl::RB), (unsigned) Hkv), 128, 0, s>>>(
+            qh, Q, per, Hkv, K, V, ring, (long long) klo, nk, (long long) pf, window, extent, tbl, sink, scale, out);
     check("attn_flash");
     return true;
 #else
