@@ -19,3 +19,13 @@ file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4/ds4_iq.cuh _ink_situ REGEX "kAc
 if(_ink_situ)
   target_compile_definitions(maya-ik2 PRIVATE IK2_HIP_IQ_SITU=1)
 endif()
+# the CPU lane alone (no GPU, no model): a call's time with its experts cold against after cpu_experts_prefetch, on
+# synthetic experts of the model's shape (built by name)
+add_executable(ik2_lane_l3_bench EXCLUDE_FROM_ALL tests/ik2_lane_l3_bench.cpp src/ik2/hip/ik2_hip_lane.cpp
+                                 src/hy4/hy4_lane.cpp src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
+target_include_directories(ik2_lane_l3_bench PRIVATE include src/ik2/hip src/hy4 third_party/ggml)
+target_link_libraries(ik2_lane_l3_bench PRIVATE strata_kernels_cpu Threads::Threads)
+target_compile_definitions(ik2_lane_l3_bench PRIVATE MAYA_DS4_IQ_ONLY)
+if(_ink_situ)
+  target_compile_definitions(ik2_lane_l3_bench PRIVATE IK2_HIP_IQ_SITU=1)
+endif()

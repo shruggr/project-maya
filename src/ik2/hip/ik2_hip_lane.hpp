@@ -47,4 +47,9 @@ struct CpuRowEntry {
 void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<CpuRowEntry>& entries, const float* x, int T,
                       float* out);
 
+/// These RAM slots' gate | up and down rows read into the lane's caches (the pieces by the L3 groups cpu_experts_rows
+/// gives them, hy4's HY4_LANE_L3=1): what a following cpu_experts_rows of them then reads from cache.  Returns early
+/// once *flag == v (flag null: never) - the next routes are out and the lane's work comes first.
+void cpu_experts_prefetch(hy4::Lane& lane, const CpuExperts& ex, const int* slots, int n, const volatile unsigned* flag,
+                          unsigned v);
 }  // namespace ik2hip

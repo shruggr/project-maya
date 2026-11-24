@@ -49,11 +49,14 @@ namespace ik2hip {
 static bool attn_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
                       const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
                       int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
-                      cudaStream_t s) {
+                      cudaStream_t s, int8_t* q8 = nullptr, float* d8 = nullptr, bool* q8_done = nullptr) {
     static const bool tiles = std::getenv("IK2_HIP_ATTN_TILES") != nullptr;
+    if (q8_done) *q8_done = false;
     if (!tiles && k::attention_chunk_rows(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, K, V, ring, p0, lo0, window,
-                                          scale, S, S_floats, gate, out, s))
+                                          scale, S, S_floats, gate, out, s, q8, d8)) {
+        if (q8_done) *q8_done = q8 != nullptr;   // (out's int8 rows made too)
         return true;
+    }
     return k::attention_split_rows(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, K, V, ring, p0, lo0, window, scale,
                                    S, S_floats, gate, out, s);
 }
@@ -92,6 +95,9 @@ struct Mat {
 
 struct Layer {
     int il = 0, gpu = -1;
+    std::vector<int> lp_prev[2];   // (IK2_HIP_LANE_PROF: the RAM experts the lane computed the last two times)
+    std::vector<int> pf_hist[2], pf_list;   // (IK2_HIP_LANE_PREFETCH: the RAM experts the lane computed here the last two
+                                            //  times; the list prefetched: the last time's, then the time before's)
     bool swa = true;
     float *attn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr, *v_norm = nullptr;
     float *attn_res = nullptr, *ffn_res = nullptr, *ffn_norm = nullptr;
@@ -212,6 +218,16 @@ struct Gpu {
     cudaEvent_t ev_tap[2] = {nullptr, nullptr};
     float *c_taps = nullptr, *c_tapl = nullptr, *c_tapr = nullptr;
     int8_t *w_xq = nullptr, *w_x2q = nullptr, *w_ehq = nullptr;
+    // (the window step in fewer launches: the layer start's int8 inputs, [3][kWin][E]; the last layer's residual conv
+    //  left for the next layer's mix to do first - y null: none)
+    int8_t* w_xq3 = nullptr;
+    float* w_xd3 = nullptr;
+    struct PendConv {
+        const float* y = nullptr;
+        const float* h0 = nullptr;
+        float* h1 = nullptr;
+        const float* w = nullptr;
+    } pend;
     int *w_ids = nullptr, *w_gstart = nullptr, *w_gent = nullptr, *w_ng = nullptr;
     unsigned long long* w_gptr = nullptr;
     float *pub = nullptr, *m_hand = nullptr;   // (the routing packed; mapped host memory: the hand-off into this GPU)
@@ -432,6 +448,16 @@ struct Model::Impl {
                                  "the lane's work %.2f ms, the lane waiting for routes %.2f ms\n", 1e3 * fast_s / fast_n,
                          1e3 * fast_enq_s / fast_n / std::max<size_t>(1, G.size()), 1e3 * lane_work_s / fast_n,
                          1e3 * lane_wait_s / fast_n);
+        if (lane_prof && lp_reuse[2] > 0)
+            std::fprintf(stderr, "LANE_REUSE %lld RAM experts computed; %.1f%% of them the same layer's last time, %.1f%% "
+                                 "within its last two (the last time: %.2f a layer)\n", lp_reuse[2],
+                         100.0 * lp_reuse[0] / lp_reuse[2], 100.0 * lp_reuse[1] / lp_reuse[2],
+                         (double) lp_reuse[3] / (double) std::max<long long>(1, lp_n));
+        if (lane_pf && fast_n > 0)
+            std::fprintf(stderr, "LANE_PREFETCH %lld prefetches, %.2f experts each, %.1f us each (%.2f ms a token), %.1f%% "
+                                 "of the RAM experts computed prefetched; %lld prefetches with the routes out already\n",
+                         pf_n, (double) pf_experts / std::max<long long>(1, pf_n), 1e6 * lane_pf_s / std::max<long long>(1, pf_n),
+                         1e3 * lane_pf_s / fast_n, 100.0 * pf_hit / std::max<long long>(1, pf_cur), pf_late);
         if (phases && fast_n > 0) {
             static const char* nm[10] = {"", "mix + rms", "input projections", "convs + clips + cache rows", "attention",
                                          "gate + output + residual", "mix + rms + router + publish + plan", "GPU experts + sum",
@@ -1952,6 +1978,18 @@ struct Model::Impl {
     unsigned *f_pub = nullptr, *f_cpu = nullptr, *f_hand = nullptr;   // (mapped host memory: a line a flag)
     static constexpr int kLine = 16;   // (16 unsigned = 64 bytes, a cache line: each flag on its own line)
     double fast_s = 0, fast_enq_s = 0, lane_work_s = 0, lane_wait_s = 0;
+    const bool lane_prof = std::getenv("IK2_HIP_LANE_PROF") != nullptr;
+    long long lp_reuse[4] = {0, 0, 0, 0}, lp_n = 0;
+    // IK2_HIP_LANE_PREFETCH=N (N experts at most, 1: 6): while the lane waits for a layer's routes, the RAM experts it
+    // computed at that layer the last time (then the time before, up to N) read into its caches (cpu_experts_prefetch; best with HY4_LANE_L3=1) - an
+    // expert the routes pick again then comes from cache.  The arithmetic is the same: the bits do not change.
+    const int lane_pf = [] {
+        const char* e = std::getenv("IK2_HIP_LANE_PREFETCH");
+        const int n = e ? std::atoi(e) : 0;
+        return n == 1 ? 6 : std::max(0, n);
+    }();
+    double lane_pf_s = 0;
+    long long pf_n = 0, pf_experts = 0, pf_hit = 0, pf_cur = 0, pf_late = 0;
     int64_t fast_n = 0;
     bool fast_ready = false;
     // IK2_HIP_PHASES=1 (tests): device-side marks between a layer's phases in the host-free step (events on the
@@ -2063,6 +2101,37 @@ struct Model::Impl {
                     }
                     // (the rows' RAM picks together: an expert several rows picked is read once for them)
                     n_ent = rent.size();
+                    if (lane_prof) {   // (how many of these RAM experts the lane computed at this layer the last time / two)
+                        std::vector<int> cur;
+                        for (const CpuRowEntry& e : rent)
+                            if (std::find(cur.begin(), cur.end(), e.slot) == cur.end()) cur.push_back(e.slot);
+                        for (int e : cur) {
+                            const bool h1 = std::find(l.lp_prev[0].begin(), l.lp_prev[0].end(), e) != l.lp_prev[0].end();
+                            const bool h2 = h1 || std::find(l.lp_prev[1].begin(), l.lp_prev[1].end(), e) != l.lp_prev[1].end();
+                            lp_reuse[0] += h1;
+                            lp_reuse[1] += h2;
+                        }
+                        lp_reuse[2] += (long long) cur.size();
+                        ++lp_n;
+                        lp_reuse[3] += (long long) l.lp_prev[0].size();
+                        l.lp_prev[1] = std::move(l.lp_prev[0]);
+                        l.lp_prev[0] = std::move(cur);
+                    }
+                    if (lane_pf) {   // (this layer's RAM experts: the next pass's prefetch here)
+                        std::vector<int> cur;
+                        for (const CpuRowEntry& e : rent)
+                            if (std::find(cur.begin(), cur.end(), e.slot) == cur.end()) cur.push_back(e.slot);
+                        for (int e : cur) pf_hit += std::find(l.pf_list.begin(), l.pf_list.end(), e) != l.pf_list.end();
+                        pf_cur += (long long) cur.size();
+                        l.pf_hist[1] = std::move(l.pf_hist[0]);
+                        l.pf_hist[0] = std::move(cur);
+                        l.pf_list = l.pf_hist[0];
+                        for (int e : l.pf_hist[1])
+                            if ((int) l.pf_list.size() < lane_pf &&
+                                std::find(l.pf_list.begin(), l.pf_list.end(), e) == l.pf_list.end())
+                                l.pf_list.push_back(e);
+                        if ((int) l.pf_list.size() > lane_pf) l.pf_list.resize((size_t) lane_pf);
+                    }
                     if (rent.empty()) std::memset(l.m_cpu, 0, sizeof(float) * (size_t) E * (size_t) Tn);
                     else if (dbg & 4) {   // (tests: a row at a time)
                         std::vector<CpuRowEntry> one;
@@ -2080,6 +2149,20 @@ struct Model::Impl {
                     const double t1 = now_s();
                     lane_work_s += t1 - t0;
                     if (!ent.empty()) st.cpu_ms += (t1 - t0) * 1e3;
+                    if (lane_pf && il + 1 < NL) {   // (the next layer's last RAM experts, until its routes come)
+                        Layer& ln = L[(size_t) il + 1];
+                        const volatile unsigned* fn = f_pub + (size_t) (il + 1) * kLine;
+                        if (!ln.pf_list.empty() && ln.cex.base) {
+                            if (*fn == v) ++pf_late;
+                            else {
+                                const int n = (int) ln.pf_list.size();
+                                cpu_experts_prefetch(*lane, ln.cex, ln.pf_list.data(), n, fn, v);
+                                ++pf_n;
+                                pf_experts += n;
+                                lane_pf_s += now_s() - t1;
+                            }
+                        }
+                    }
                 }
             }
         next:
@@ -2200,6 +2283,7 @@ struct Model::Impl {
                gp.alloc(gp.w_dk, W * 32, err) && gp.alloc(gp.w_dv, W * 32, err) && gp.alloc(gp.w_xf, W * E, err) &&
                gp.alloc(gp.w_rl, W * (size_t) g.n_expert, err) && gp.alloc(gp.w_rw, W * 16, err) &&
                gp.alloc(gp.w_ids, W * 16, err) && gp.alloc(gp.w_xq, W * qmax, err) &&
+               gp.alloc(gp.w_xq3, 3 * W * E, err) && gp.alloc(gp.w_xd3, 3 * W * E / 32, err) &&
                gp.alloc(gp.w_xd, W * qmax / 32, err) && gp.alloc(gp.w_x2q, 2 * W * E, err) &&
                gp.alloc(gp.w_x2d, 2 * W * E / 32, err) && gp.alloc(gp.w_eh, 16 * W * ff, err) &&
                gp.alloc(gp.w_ehq, 16 * W * ff, err) && gp.alloc(gp.w_ehd, 16 * W * ff / 32, err) &&
@@ -2212,6 +2296,19 @@ struct Model::Impl {
     //  GEMVs a column a launch, 2: the experts' plan form a row at a time, 4: the lane a row at a time, 8: the F32
     //  GEMVs a column a launch)
     int dbg = 0;
+    const int step_hash = std::getenv("IK2_HIP_STEP_HASH") ? std::atoi(std::getenv("IK2_HIP_STEP_HASH")) : 0;
+    uint64_t step_h = 1469598103934665603ull;
+    const bool fz_old = std::getenv("IK2_HIP_FUSE_OLD") != nullptr;
+    const bool fz_mix = !fz_old && std::getenv("IK2_HIP_FUSE_MIX_OLD") == nullptr;
+    const bool fz_route = !fz_old && std::getenv("IK2_HIP_FUSE_ROUTE_OLD") == nullptr &&
+                          std::getenv("HY4_ROUTER_SORT") == nullptr && std::getenv("HY4_ROUTER_WARP") == nullptr;
+    const bool fz_kv = !fz_old && std::getenv("IK2_HIP_FUSE_KV_OLD") == nullptr;
+    const bool fz_gemv = !fz_old && std::getenv("IK2_HIP_FUSE_GEMV_OLD") == nullptr;
+    const bool fz_attn = !fz_old && std::getenv("IK2_HIP_FUSE_ATTN_OLD") == nullptr;
+    const bool fz_plan = !fz_old && std::getenv("IK2_HIP_FUSE_PLAN_OLD") == nullptr;
+    const bool fz_lane = !fz_old && std::getenv("IK2_HIP_FUSE_LANE_OLD") == nullptr;
+    // (the router's GEMV with this many rows a block - 1, 2, 4 or 8, the same bits as hy4's 8; 0: hy4's gemv_f32w)
+    const int router_rpb = fz_old ? 0 : std::getenv("IK2_HIP_ROUTER_RPB") ? std::atoi(std::getenv("IK2_HIP_ROUTER_RPB")) : 0;
     void gemv32(Gpu& gp, const float* W, int kk, int n, const float* x, int T, float* y) {
         if ((dbg & 8) && T > 1) {
             for (int t = 0; t < T; ++t)
@@ -2220,14 +2317,16 @@ struct Model::Impl {
         }
         hk::gemv_f32w(W, (size_t) kk, kk, n, x, (size_t) kk, T, y, (size_t) n, 1.0f, gp.s);
     }
-    bool mmw(Gpu& gp, const Mat& M, const float* x, int T, float* y) {
+    // (pq / pd: x's int8 rows already made - the fused mix's; null: made here)
+    bool mmw(Gpu& gp, const Mat& M, const float* x, int T, float* y, const int8_t* pq = nullptr, const float* pd = nullptr) {
         if (M.type == kF32) {
             gemv32(gp, (const float*) M.w, M.k, M.n, x, T, y);
             return true;
         }
-        return mmw_multi(gp, {{&M, y}}, x, T);
+        return mmw_multi(gp, {{&M, y}}, x, T, pq, pd);
     }
-    bool mmw_multi(Gpu& gp, std::initializer_list<Out> outs, const float* x, int T) {
+    bool mmw_multi(Gpu& gp, std::initializer_list<Out> outs, const float* x, int T, const int8_t* pq = nullptr,
+                   const float* pd = nullptr) {
         const int kk = outs.begin()->m->k;
         if ((dbg & 1) && T > 1) {
             for (int t = 0; t < T; ++t) {
@@ -2251,7 +2350,7 @@ struct Model::Impl {
             }
             return true;
         }
-        hk::q8_rows(x, (size_t) kk, T, kk, gp.w_xq, gp.w_xd, gp.s);
+        if (!pq) hk::q8_rows(x, (size_t) kk, T, kk, gp.w_xq, gp.w_xd, gp.s);
         iq::MvJob jobs[8];
         int n = 0;
         for (const Out& o2 : outs) {
@@ -2263,8 +2362,8 @@ struct Model::Impl {
             j.k = kk;
             j.n = o2.m->n;
             j.ncol = T;
-            j.xq = gp.w_xq;
-            j.xd = gp.w_xd;
+            j.xq = pq ? const_cast<int8_t*>(pq) : gp.w_xq;
+            j.xd = pq ? const_cast<float*>(pd) : gp.w_xd;
             j.y = o2.y;
             j.ycs = (size_t) o2.m->n;
         }
@@ -2280,14 +2379,40 @@ struct Model::Impl {
         const float* src = cur;
         ph(l, gp, 0);
         const bool fused = l.il > 0;   // (the mix and the norms in a launch, a block a row)
-        if (fused) k::mix_rms_rows(blocks, ldb, nb, cur, T, E, l.attn_res, l.swa ? 1 : 3, l.swa ? l.attn_norm : l.q_norm,
-                                   l.k_norm, l.v_norm, g.eps, gp.w_xn, s);
+        // (fewer launches - IK2_HIP_FUSE_OLD=1, or per part IK2_HIP_FUSE_MIX_OLD / _ROUTE_OLD / _KV_OLD, for the launches
+        //  as before: the same bits.  mix: the residual conv before a mix in its launch - the last layer's left to this
+        //  one's - and the int8 rows the GEMVs read made by it; route: the router, the pack and the publish in one;
+        //  kv: the K / V finish and the clips in one - gemv: with the sinks' and the conv projections' GEMVs; attn: the output's int8 rows made by the attention's last launch;
+        //  plan: a token's expert plan, a window's expert groups, made by the routing's launch; lane: the experts' sum and the CPU lane's in one)
+        const bool fzm = fz_mix && !job_multi && dbg == 0, fzr = fz_route && !job_multi, fzk = fz_kv && !job_multi;
+        // (kv: the sinks' and a global layer's conv projections' F32 GEMVs in that launch too)
+        const bool fzg = fzk && fz_gemv && dbg == 0 && l.sink.type == kF32 && l.sink.n < 128 && l.sink.k % 128 == 0 &&
+                         (l.swa || (l.k_proj.type == kF32 && l.v_proj.type == kF32 && l.k_proj.n == 4 * Hkv &&
+                                    l.v_proj.n == 4 * Hkv && l.k_proj.k == E && l.v_proj.k == E));
+        const int8_t *pq0 = nullptr, *pq1 = nullptr, *pq2 = nullptr;
+        const float *pd0 = nullptr, *pd1 = nullptr, *pd2 = nullptr;
+        if (fused && fzm) {
+            k::mix_rms_rows_fused(blocks, ldb, nb, cur, T, E, l.attn_res, l.swa ? 1 : 3, l.swa ? l.attn_norm : l.q_norm,
+                                  l.k_norm, l.v_norm, g.eps, gp.w_xn, gp.pend.y, gp.pend.h0, gp.pend.h1, gp.pend.w,
+                                  nullptr, gp.w_xq3, gp.w_xd3, false, s);
+            gp.pend.y = nullptr;
+            pq0 = gp.w_xq3;
+            pq1 = pq0 + TE;
+            pq2 = pq1 + TE;
+            pd0 = gp.w_xd3;
+            pd1 = pd0 + TE / 32;
+            pd2 = pd1 + TE / 32;
+        } else if (fused) {
+            k::mix_rms_rows(blocks, ldb, nb, cur, T, E, l.attn_res, l.swa ? 1 : 3, l.swa ? l.attn_norm : l.q_norm,
+                            l.k_norm, l.v_norm, g.eps, gp.w_xn, s);
+        }
         const float *xq = gp.w_xn, *xk = gp.w_xn, *xv = gp.w_xn;
         bool ok = true;
         if (l.swa) {
             if (!fused) k::rms(src, (size_t) E, T, E, l.attn_norm, g.eps, gp.w_xn, (size_t) E, s);
             ph(l, gp, 1);
-            ok = mmw_multi(gp, {{&l.q, gp.w_q}, {&l.gate, gp.w_gate}, {&l.rel, gp.w_rel}, {&l.wk, in_k}, {&l.wv, in_v}}, xq, T);
+            ok = mmw_multi(gp, {{&l.q, gp.w_q}, {&l.gate, gp.w_gate}, {&l.rel, gp.w_rel}, {&l.wk, in_k}, {&l.wv, in_v}}, xq, T,
+                           pq0, pd0);
         } else {
             const size_t st1 = l.il > 0 ? TE : 0;
             if (!fused) {
@@ -2298,10 +2423,11 @@ struct Model::Impl {
             xk = gp.w_xn + TE;
             xv = gp.w_xn + 2 * TE;
             ph(l, gp, 1);
-            ok = mmw_multi(gp, {{&l.q, gp.w_q}, {&l.gate, gp.w_gate}, {&l.rel, gp.w_rel}}, xq, T) && mmw(gp, l.wk, xk, T, in_k) &&
-                 mmw(gp, l.wv, xv, T, in_v) && mmw(gp, l.k_proj, xk, T, gp.w_dk) && mmw(gp, l.v_proj, xv, T, gp.w_dv);
+            ok = mmw_multi(gp, {{&l.q, gp.w_q}, {&l.gate, gp.w_gate}, {&l.rel, gp.w_rel}}, xq, T, pq0, pd0) &&
+                 mmw(gp, l.wk, xk, T, in_k, pq1, pd1) && mmw(gp, l.wv, xv, T, in_v, pq2, pd2);
+            if (!fzg) ok = ok && mmw(gp, l.k_proj, xk, T, gp.w_dk) && mmw(gp, l.v_proj, xv, T, gp.w_dv);
         }
-        ok = ok && mmw(gp, l.sink, xq, T, gp.w_sink);
+        if (!fzg) ok = ok && mmw(gp, l.sink, xq, T, gp.w_sink);
         ph(l, gp, 2);
         float tau[16];
         for (int t = 0; t < T; ++t) {
@@ -2316,11 +2442,18 @@ struct Model::Impl {
                                   l.swa ? nullptr : gp.w_dv + (size_t) t * 4 * Hkv, Hkv, D, g.qk_clip, g.eps, q.K, q.V,
                                   l.ring, mrows[t].p, s);
             }
+        } else if (fzk) {
+            k::kv_clip_rows(in_k, in_v, T, l.hist_k, l.hist_v, l.alt_k, l.alt_v, l.k_conv, l.v_conv, l.swa ? nullptr : gp.w_dk,
+                            l.swa ? nullptr : gp.w_dv, Hkv, D, g.qk_clip, g.eps, l.K, l.V, l.ring, p0, gp.w_q, H, l.q_clip,
+                            g.qk_clip, gp.w_rel, g.d_rel, l.rel_clip, g.rel_clip, tau, s, fzg ? (const float*) l.sink.w : nullptr,
+                            xq, gp.w_sink, l.sink.n, l.sink.k, fzg && !l.swa ? (const float*) l.k_proj.w : nullptr,
+                            fzg && !l.swa ? (const float*) l.v_proj.w : nullptr, xk, xv, gp.w_dk, gp.w_dv);
         } else {
             k::kv_finish_rows(in_k, in_v, T, l.hist_k, l.hist_v, l.alt_k, l.alt_v, l.k_conv, l.v_conv, l.swa ? nullptr : gp.w_dk,
                               l.swa ? nullptr : gp.w_dv, Hkv, D, g.qk_clip, g.eps, l.K, l.V, l.ring, p0, s);
         }
-        k::clip2_rows(gp.w_q, T, H, D, l.q_clip, g.qk_clip, gp.w_rel, g.d_rel, l.rel_clip, g.rel_clip, tau, s);
+        if (job_multi || !fzk)
+            k::clip2_rows(gp.w_q, T, H, D, l.q_clip, g.qk_clip, gp.w_rel, g.d_rel, l.rel_clip, g.rel_clip, tau, s);
         ph(l, gp, 3);
         if (job_multi)
             for (int t = 0; t < T; ++t) {
@@ -2337,24 +2470,29 @@ struct Model::Impl {
             }
         // the rows in one pair of launches (the K / V tiles read once) - or, when the scratch does not hold that many
         // rows' parts over this many keys, a few rows a pair
+        bool ao_q8 = !job_multi && fz_attn && dbg == 0;   // (the combine's int8 rows of the output for the GEMV)
         if (!job_multi) {
             const int64_t keys = l.swa ? std::min<int64_t>(p0 + T, (int64_t) g.n_swa + T) : p0 + T;
             const int fit = std::max(1, std::min(T, k::attention_rows_fit(H, D, keys, gp.S_floats)));
+            const bool want_q8 = ao_q8;
             for (int t0 = 0; t0 < T; t0 += fit) {
+                bool done_q8 = false;
                 const int tn = std::min(fit, T - t0);
                 const int64_t pf = p0 + t0, lo = l.swa ? std::max<int64_t>(0, pf - (g.n_swa - 1)) : 0;
                 if (!attn_rows(gp.w_q + (size_t) t0 * HD, gp.w_rel + (size_t) t0 * H * g.d_rel,
                                              gp.w_sink + (size_t) t0 * H, tn, H, Hkv, D, g.d_rel, l.rel_bias,
                                              l.swa ? g.n_swa : g.rel_extent, l.K, l.V, l.ring, pf, lo, l.swa ? g.n_swa : 0,
                                              1.0f / std::sqrt((float) D), gp.S, gp.S_floats, gp.w_gate + (size_t) t0 * HD,
-                                             gp.w_ao + (size_t) t0 * HD, s)) {
+                                             gp.w_ao + (size_t) t0 * HD, s, want_q8 ? gp.w_xq + (size_t) t0 * HD : nullptr,
+                                             want_q8 ? gp.w_xd + (size_t) t0 * HD / 32 : nullptr, &done_q8)) {
                     err = "layer " + std::to_string(l.il) + ": the attention's scratch does not hold a row's tiles";
                     return false;
                 }
+                ao_q8 = ao_q8 && done_q8;
             }
         }
         ph(l, gp, 4);
-        ok = ok && mmw(gp, l.wo, gp.w_ao, T, in_a);
+        ok = ok && mmw(gp, l.wo, gp.w_ao, T, in_a, ao_q8 ? gp.w_xq : nullptr, ao_q8 ? gp.w_xd : nullptr);
         if (job_multi) {
             for (int t = 0; t < T; ++t) {
                 SeqLayer& q = seqs[(size_t) mrows[t].seq].L[(size_t) l.il];
@@ -2362,19 +2500,42 @@ struct Model::Impl {
                                  l.il % g.res_block == 0 ? blocks + (size_t) nb * ldb + (size_t) t * E : nullptr, s);
             }
             if (l.il % g.res_block == 0) ++nb;
+        } else if (fzm) {   // (the conv in the mix's launch; the experts' int8 rows from it - a window's: two a row)
+            float* blk = l.il % g.res_block == 0 ? blocks + (size_t) nb * ldb : nullptr;
+            if (blk) ++nb;
+            const bool dup = T > 1;
+            ph(l, gp, 5);
+            k::mix_rms_rows_fused(blocks, ldb, nb, cur, T, E, l.ffn_res, 1, l.ffn_norm, nullptr, nullptr, g.eps, gp.w_xf,
+                                  in_a, l.hist_a, l.alt_a, l.a_conv, blk, dup ? gp.w_x2q : gp.w_xq,
+                                  dup ? gp.w_x2d : gp.w_xd, dup, s);
         } else if (l.il % g.res_block == 0) {   // (a block's first layer: the stream saved, the attention's output a new one)
             k::conv_add_rows(in_a, T, l.hist_a, l.alt_a, l.a_conv, E, cur, blocks + (size_t) nb * ldb, s);
             ++nb;
         } else {
             k::conv_add_rows(in_a, T, l.hist_a, l.alt_a, l.a_conv, E, cur, nullptr, s);
         }
-        ph(l, gp, 5);
-        k::mix_rms_rows(blocks, ldb, nb, cur, T, E, l.ffn_res, 1, l.ffn_norm, nullptr, nullptr, g.eps, gp.w_xf, s);
-        gemv32(gp, (const float*) l.router.w, E, g.n_expert, gp.w_xf, T, gp.w_rl);
-        hk::router(gp.w_rl, T, g.n_expert, l.router_b, nu, true, g.w_scale, gp.w_ids, gp.w_rw, s);
+        if (!fzm) {
+            ph(l, gp, 5);
+            k::mix_rms_rows(blocks, ldb, nb, cur, T, E, l.ffn_res, 1, l.ffn_norm, nullptr, nullptr, g.eps, gp.w_xf, s);
+        }
+        if (!(router_rpb > 0 && dbg == 0 &&
+              k::gemv_f32_rows(router_rpb, (const float*) l.router.w, (size_t) E, E, g.n_expert, gp.w_xf, (size_t) E, T, gp.w_rl,
+                               (size_t) g.n_expert, s)))
+            gemv32(gp, (const float*) l.router.w, E, g.n_expert, gp.w_xf, T, gp.w_rl);
         // the routing out to the lane (its picks are the ones the device's map has no slot for), then this GPU's
-        hk::pack3(gp.w_xf, TE, gp.w_ids, (size_t) T * nu, gp.w_rw, (size_t) T * nu, gp.w_pub, s);
-        hk::publish(gp.w_pub, l.m_pub, TE + 2 * (size_t) T * nu, gp.cnt, f_pub + (size_t) l.il * kLine, v, s);
+        const bool fzp = fzr && fz_plan && T == 1 && dbg == 0;   // (a token's plan made by the routing's launch)
+        const bool fzq = fzr && fz_plan && T > 1 && dbg == 0 && !std::getenv("HY4_GROUP_SERIAL");   // (a window's groups)
+        if (fzr) {
+            k::route_publish(gp.w_rl, T, g.n_expert, l.router_b, nu, true, g.w_scale, gp.w_ids, gp.w_rw, gp.w_xf, TE, l.m_pub,
+                             gp.cnt, f_pub + (size_t) l.il * kLine, v, s, fzp || fzq ? l.experts : nullptr,
+                             fzp || fzq ? l.blob : 0, fzp ? gp.w_gptr : nullptr, fzp || fzq ? l.slot_d : nullptr,
+                             fzq ? gp.w_gptr : nullptr, gp.w_gstart, gp.w_gent, gp.w_ng);
+        } else {
+            hk::router(gp.w_rl, T, g.n_expert, l.router_b, nu, true, g.w_scale, gp.w_ids, gp.w_rw, s);
+            hk::pack3(gp.w_xf, TE, gp.w_ids, (size_t) T * nu, gp.w_rw, (size_t) T * nu, gp.w_pub, s);
+            hk::publish(gp.w_pub, l.m_pub, TE + 2 * (size_t) T * nu, gp.cnt, f_pub + (size_t) l.il * kLine, v, s);
+        }
+        const bool fzl = fz_lane && dbg == 0;   // (the experts' sum and the lane's in one launch)
         iq::Args a;
         a.tr[0] = l.tr[0];
         a.tr[1] = l.tr[1];
@@ -2392,23 +2553,28 @@ struct Model::Impl {
         a.hd = gp.w_ehd;
         if (T == 1 || (dbg & 2)) {   // (a token: the plan form - an entry a pick, no grouping)
             for (int t = 0; t < T; ++t) {
-                hk::plan_experts(gp.w_ids + (size_t) t * nu, nu, l.experts, l.blob, gp.w_gptr, s, l.slot_d, gp.w_rw + (size_t) t * nu);
+                if (!fzp)
+                    hk::plan_experts(gp.w_ids + (size_t) t * nu, nu, l.experts, l.blob, gp.w_gptr, s, l.slot_d,
+                                     gp.w_rw + (size_t) t * nu);
                 if (t == 0) ph(l, gp, 6);
-                hk::q8_rows(gp.w_xf + (size_t) t * E, (size_t) E, 1, E, gp.w_xq, gp.w_xd, s);
+                if (!fzm) hk::q8_rows(gp.w_xf + (size_t) t * E, (size_t) E, 1, E, gp.w_xq, gp.w_xd, s);
                 a.plan_ptr = gp.w_gptr;
                 a.xq = gp.w_xq;
                 a.xd = gp.w_xd;
                 ok = ok && iq::gate_up(a, nu, 1, s);
                 hk::q8_rows(gp.w_eh, (size_t) ff, nu, ff, gp.w_ehq, gp.w_ehd, s);
                 ok = ok && iq::down(a, nu, 1, s);
-                k::wsum(gp.w_part, nu, E, gp.w_rw + (size_t) t * nu, in_f + (size_t) t * E, s);
+                if (!fzl) k::wsum(gp.w_part, nu, E, gp.w_rw + (size_t) t * nu, in_f + (size_t) t * E, s);
             }
         } else {   // (the window's picks grouped by expert; the device's map: the RAM ones' weights zeroed, the lane's)
-            hk::group_experts(gp.w_ids, T, nu, g.n_expert, l.experts, l.blob, gp.w_gptr, gp.w_gstart, gp.w_gent, gp.w_ng, s,
-                              l.slot_d, gp.w_rw);
+            if (!fzq)
+                hk::group_experts(gp.w_ids, T, nu, g.n_expert, l.experts, l.blob, gp.w_gptr, gp.w_gstart, gp.w_gent, gp.w_ng,
+                                  s, l.slot_d, gp.w_rw);
             ph(l, gp, 6);
-            hk::q8_rows(gp.w_xf, (size_t) E, T, E, gp.w_xq, gp.w_xd, s);
-            hk::dup_rows_q8(gp.w_xq, gp.w_xd, T, E, gp.w_x2q, gp.w_x2d, s);
+            if (!fzm) {
+                hk::q8_rows(gp.w_xf, (size_t) E, T, E, gp.w_xq, gp.w_xd, s);
+                hk::dup_rows_q8(gp.w_xq, gp.w_xd, T, E, gp.w_x2q, gp.w_x2d, s);
+            }
             a.grp_ptr = gp.w_gptr;
             a.grp_start = gp.w_gstart;
             a.grp_ent = gp.w_gent;
@@ -2419,10 +2585,12 @@ struct Model::Impl {
             ok = ok && iq::gate_up(a, groups, T, s);
             hk::q8_rows(gp.w_eh, (size_t) ff, 16 * T, ff, gp.w_ehq, gp.w_ehd, s);
             ok = ok && iq::down(a, groups, T, s);
-            hk::moe_sum(gp.w_part, T, nu, E, gp.w_rw, in_f, s);
+            if (!fzl) hk::moe_sum(gp.w_part, T, nu, E, gp.w_rw, in_f, s);
         }
         ph(l, gp, 7);
-        k::lane_add_rows(f_cpu + (size_t) l.il * kLine, v, gp.w_ids, l.slot_d, nu, l.m_cpu, in_f, E, T, s);
+        if (fzl) k::moe_lane_rows(gp.w_part, T, nu, E, gp.w_rw, in_f, 16, f_cpu + (size_t) l.il * kLine, v, gp.w_ids, l.slot_d,
+                                  l.m_cpu, s);
+        else k::lane_add_rows(f_cpu + (size_t) l.il * kLine, v, gp.w_ids, l.slot_d, nu, l.m_cpu, in_f, E, T, s);
         ph(l, gp, 8);
         if (job_multi) {
             for (int t = 0; t < T; ++t) {
@@ -2433,6 +2601,11 @@ struct Model::Impl {
                 std::swap(q.hist_a, q.alt_a);
                 std::swap(q.hist_f, q.alt_f);
             }
+        } else if (fzm && (l.il + 1 < gp.l1 || &gp == &G.back()) && !(taps_on && tap_of[(size_t) l.il] >= 0)) {
+            gp.pend.y = in_f;   // (the next layer's mix does it first - the last's, the head's: nothing reads the stream before)
+            gp.pend.h0 = l.hist_f;
+            gp.pend.h1 = l.alt_f;
+            gp.pend.w = l.f_conv;
         } else {
             k::conv_add_rows(in_f, T, l.hist_f, l.alt_f, l.f_conv, E, cur, nullptr, s);
         }
@@ -2472,15 +2645,31 @@ struct Model::Impl {
         } else {
             hk::wait_pull(f_hand + gi * kLine, v, gp.w_cb, gp.m_hand, (size_t) (1 + nb) * ldb, gp.s);
         }
+        gp.pend.y = nullptr;
         for (int il = gp.l0; il < gp.l1; ++il)
             if (!layer_win(L[(size_t) il], gp, T, job_p, nb, v, err)) return false;
+        if (gp.pend.y && gi + 1 < G.size()) {   // (never left over: a hand-off's last layer's conv is not deferred)
+            err = "a deferred residual conv was left over";
+            return false;
+        }
         if (gi + 1 < G.size()) {
             hk::publish(gp.w_cb, G[gi + 1].m_hand, (size_t) (1 + nb) * ldb, gp.cnt, f_hand + (gi + 1) * kLine, v, gp.s);
             return true;
         }
         // the head over the rows: each row's logits, its argmax
-        k::mix_rms_rows(gp.w_cb + ldb, ldb, nb, gp.w_cb, T, (int) E, out_res, 1, out_norm, nullptr, nullptr, g.eps, gp.w_xf,
-                        gp.s);
+        const bool fzh = fz_mix && !job_multi && dbg == 0;   // (the last layer's conv and the head's int8 rows in its mix)
+        if (fzh) {
+            k::mix_rms_rows_fused(gp.w_cb + ldb, ldb, nb, gp.w_cb, T, (int) E, out_res, 1, out_norm, nullptr, nullptr, g.eps,
+                                  gp.w_xf, gp.pend.y, gp.pend.h0, gp.pend.h1, gp.pend.w, nullptr, gp.w_xq, gp.w_xd, false, gp.s);
+            gp.pend.y = nullptr;
+        } else {
+            if (gp.pend.y) {
+                err = "a deferred residual conv was left over";
+                return false;
+            }
+            k::mix_rms_rows(gp.w_cb + ldb, ldb, nb, gp.w_cb, T, (int) E, out_res, 1, out_norm, nullptr, nullptr, g.eps,
+                            gp.w_xf, gp.s);
+        }
         if (taps_on) {   // (the drafter's rows: the other GPUs' taps from the host memory, this GPU's, the head's input)
             const int nt = (int) tap_layers.size(), last = (int) G.size() - 1;
             const float* srcs[8];
@@ -2497,7 +2686,7 @@ struct Model::Impl {
             if (tn.tap_event) CK(cudaStreamWaitEvent(gp.s, gp.ev_tap[tap_buf], 0));
             k::taps_gather(srcs, 0u, nt, T, (int) E, gp.d_taps[tap_buf], (size_t) nt * E, gp.s);
         }
-        if (!mmw(gp, head, gp.w_xf, T, gp.w_logits)) {
+        if (!mmw(gp, head, gp.w_xf, T, gp.w_logits, fzh ? gp.w_xq : nullptr, fzh ? gp.w_xd : nullptr)) {
             err = "the output head's GEMV did not take its shapes";
             return false;
         }
@@ -2514,6 +2703,22 @@ struct Model::Impl {
                             sizeof(float) * (size_t) g.n_vocab_unpadded);
         }
         top_id = win_tops[T - 1];
+        if (step_hash) {   // (tests, IK2_HIP_STEP_HASH=1: each row's argmax and its logit to the bit, a running FNV-1a hash
+                           //  - 2: every logit of each row)
+            if (step_hash == 2) {
+                std::vector<float> lg((size_t) T * g.n_vocab);
+                CK(cudaMemcpy(lg.data(), gp.w_logits, sizeof(float) * lg.size(), cudaMemcpyDeviceToHost));
+                for (int t = 0; t < T; ++t) {
+                    const uint8_t* b = (const uint8_t*) (lg.data() + (size_t) t * g.n_vocab);
+                    for (size_t i = 0; i < sizeof(float) * (size_t) g.n_vocab_unpadded; ++i) step_h = (step_h ^ b[i]) * 1099511628211ull;
+                }
+            } else {
+                const uint8_t* b = (const uint8_t*) h_wtop;
+                for (size_t i = 0; i < sizeof(float) * 2 * (size_t) T; ++i) step_h = (step_h ^ b[i]) * 1099511628211ull;
+            }
+            std::fprintf(stderr, "maya-ik2: step hash %016llx (from %lld, %d rows, top %d)\n", (unsigned long long) step_h,
+                         (long long) job_p, T, win_tops[T - 1]);
+        }
         if (k::errors() || hk::errors()) {
             err = "a kernel launch failed";
             return false;

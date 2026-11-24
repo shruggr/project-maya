@@ -67,7 +67,7 @@ bool attention_split_rows(const float* q, const float* rel, const float* sink, i
 bool attention_chunk_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
                           const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
                           int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
-                          cudaStream_t s);
+                          cudaStream_t s, int8_t* q8 = nullptr, float* d8 = nullptr);   // (q8 / d8: q8_rows of out too)
 int attention_chunk_keys();
 
 /// x *= sigmoid(g), n values
@@ -203,6 +203,38 @@ bool moe_sort_bits(const int* ids, int T, int nu, const int* slot, int n_slots, 
 void scatter_set_rows(const float* y, const int* ent_of, int n_rows, int E, float* ent, cudaStream_t s);
 
 /// Launch failures since the last call (each printed); 0 none
+// the window step in fewer launches (own runtime, 2026-11-24), the same bits as the launches each replaces:
+// mix_rms_rows after conv_add_rows(cy, T, ch0, ch1, cw, E, cur, cblk) (cy null: none) and with q8_rows of each query's
+// output into q / d ([nq][T] rows; dup: dup_rows_q8's [2 T] rows, one query)
+void mix_rms_rows_fused(const float* blocks, size_t ldb, int nb, float* cur, int T, int E, const float* query, int nq,
+                        const float* g0, const float* g1, const float* g2, float eps, float* out, const float* cy,
+                        const float* ch0, float* ch1, const float* cw, float* cblk, int8_t* q, float* d, bool dup,
+                        cudaStream_t s);
+// hy4::k::router (its bitonic form) + pack3 (x [n], the picks, the weights) + publish to dst; with plan (T 1),
+// hy4::k::plan_experts(ids, n_used, base, stride, plan, s, slot, w) too
+void route_publish(const float* logits, int T, int n_exp, const float* bias, int n_used, bool norm, float scale, int* ids,
+                   float* w, const float* x, size_t n, float* dst, unsigned* counter, unsigned* flag, unsigned v,
+                   cudaStream_t s, const uint8_t* base = nullptr, size_t stride = 0, unsigned long long* plan = nullptr,
+                   const int* slot = nullptr, unsigned long long* grp_ptr = nullptr, int* grp_start = nullptr,
+                   int* grp_ent = nullptr, int* n_groups = nullptr);   // (grp_ptr: hy4::k::group_experts too, slot form)
+// hy4::k::moe_sum (stride16 16; a token's k::wsum: T 1, stride16 0 - the same sums) + lane_add_rows
+void moe_lane_rows(const float* part, int T, int n_used, int n, const float* w, float* out, int stride16,
+                   const unsigned* flag, unsigned v, const int* ids, const int* slot, const float* src, cudaStream_t s);
+// kv_finish_rows + clip2_rows; with sink_w, also hy4::k::gemv_f32w(sink_w, k, k, ns, sink_x, k, T, sink_y, ns, 1) (its
+// few-rows form: ns < 128); with kp_w, the conv projections' GEMVs (4 Hkv rows each, the same form) into dk_out / dv_out
+// (= dk / dv) before they are read
+void kv_clip_rows(const float* in_k, const float* in_v, int T, const float* hk0, const float* hv0, float* hk1, float* hv1,
+                  const float* k_conv, const float* v_conv, const float* dk, const float* dv, int Hkv, int D, float thr,
+                  float eps, uint16_t* K, uint16_t* V, int ring, int64_t p0, float* q, int H, const float* qs,
+                  float qthr, float* rel, int n_rel, const float* rs, float rthr, const float* mul, cudaStream_t s,
+                  const float* sink_w = nullptr, const float* sink_x = nullptr, float* sink_y = nullptr, int ns = 0,
+                  int k = 0, const float* kp_w = nullptr, const float* vp_w = nullptr, const float* kp_x = nullptr,
+                  const float* vp_x = nullptr, float* dk_out = nullptr, float* dv_out = nullptr);
+
+// hy4::k::gemv_f32w (alpha 1, its 16-byte forms; T columns, at most 16) with rpb (1, 2, 4, 8) rows a block: the same
+// bits; false: the shapes are not its (nothing launched)
+bool gemv_f32_rows(int rpb, const float* W, size_t ld, int k, int n, const float* x, size_t ldx, int T, float* y, size_t ldy,
+                   cudaStream_t s);
 int errors();
 
 }  // namespace ik2hip::k
