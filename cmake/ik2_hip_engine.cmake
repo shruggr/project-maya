@@ -10,7 +10,7 @@ add_executable(maya-ik2 src/ik2/hip/ik2_hip_main.cpp src/ik2/hip/ik2_hip_model.c
                         src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
 target_include_directories(maya-ik2 PRIVATE ${_strata_gpu_include_directories} include src/ik2/hip src/hy4
                                             src/mm3 third_party/ggml)
-target_link_libraries(maya-ik2 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target}
+target_link_libraries(maya-ik2 PRIVATE strata_kernels_cpu strata_spec ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target}
                                        Threads::Threads)
 target_compile_definitions(maya-ik2 PRIVATE MAYA_DS4_IQ_ONLY)
 # (the routed experts' SITU activation in ds4_iq's own kernels, once src/ds4/ds4_iq.cuh has it: until then the engine

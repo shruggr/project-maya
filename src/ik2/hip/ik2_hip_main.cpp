@@ -13,6 +13,7 @@
 
 #include "mm3_os.hpp"
 #include "mm3_sample.hpp"
+#include "strata/spec/suffix_drafter.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -27,6 +28,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -311,16 +313,45 @@ struct Drafting {
     // max(0, p - q) (speculative sampling: the answer is distributed as the target's own draws).  0: argmax drafts, each
     // standing with probability p(d) (the rule before)
     bool draw = env_d("IK2_HIP_DRAFT_DRAW", 0) != 0;
+    // IK2_HIP_DRAFT_CAL=1: the window's probabilities calibrated against the verdicts, a scale on their misses a mode
+    // (0 greedy, 1 sampled with argmax drafts, 2 drawn drafts): p' = 1 - m (1 - p), m = observed misses / predicted
+    // ((1 - p) summed) over the drafts reached, both decayed by cal_ema a draft (IK2_HIP_DRAFT_CAL_EMA, 0.995), m within
+    // [0.25, 4].  0 (the default): the drafter's own probabilities as before
+    bool cal = env_d("IK2_HIP_DRAFT_CAL", 0) != 0;
+    double cal_ema = env_d("IK2_HIP_DRAFT_CAL_EMA", 0.995);
+    double cal_pm[4] = {20, 20, 20, 20}, cal_om[4] = {20, 20, 20, 20};   // (a prior of 20 misses predicted and seen: m = 1)
+    int mode = 0;                                                // (the round's: draft_round sets it; 3 prompt lookup)
+    double miss_scale() const {
+        return cal || mode == 3 ? std::min(4.0, std::max(0.25, cal_om[mode] / cal_pm[mode])) : 1.0;
+    }
+    // IK2_HIP_DRAFT_LOOKUP=N (N >= 1): prompt lookup first - when the context's last N+ tokens occurred before
+    // (strata::spec::SuffixDrafter over the prompt and the answer), what followed them is the round's drafts (up to the
+    // window's 8) and the drafter is not asked; each such draft's probability IK2_HIP_DRAFT_LOOKUP_P (0.7) under the
+    // lookup's own calibration (mode 3, always on).  0 (the default): no lookup
+    int lookup_min = (int) env_d("IK2_HIP_DRAFT_LOOKUP", 0);
+    float lookup_p = (float) env_d("IK2_HIP_DRAFT_LOOKUP_P", 0.7);
+    std::shared_ptr<strata::spec::SuffixDrafter> sdp = std::make_shared<strata::spec::SuffixDrafter>(3, 64);   // (shared: a Drafting's copy is cheap)
+    bool sd_fresh = true;
+    long long looked = 0, look_off = 0, look_kept = 0;
+    void cal_observe(const std::vector<float>& p, int k, int kept) {
+        for (int i = 0; i < k && i <= kept; ++i) {
+            cal_pm[mode] = cal_ema * cal_pm[mode] + (1.0 - std::min(1.0, std::max(0.0, (double) p[(size_t) i])));
+            cal_om[mode] = cal_ema * cal_om[mode] + (i == kept ? 1.0 : 0.0);
+        }
+    }
 
     double cost(int T) const { return a + b * (T - 1); }
-    int choose(const std::vector<float>& p, int n) const {
+    int choose(const std::vector<float>& p, int n, double td = -1) const {
         if (fixed_k > 0) return std::min(fixed_k, n);
+        if (td < 0) td = t_draft;
         int best = 0;
-        double cum = 1.0, exp_tok = 1.0, best_rate = 1.0 / (cost(1) + t_draft);
+        double cum = 1.0, exp_tok = 1.0, best_rate = 1.0 / (cost(1) + td);
+        const double ms = miss_scale();
         for (int k = 1; k <= n; ++k) {
-            cum *= std::min(1.0, std::max(0.0, (double) p[(size_t) k - 1]));
+            const double pk = std::min(1.0, std::max(0.0, (double) p[(size_t) k - 1]));
+            cum *= cal ? std::max(0.0, 1.0 - ms * (1.0 - pk)) : pk;
             exp_tok += cum;
-            const double rate = exp_tok / (cost(k + 1) + t_draft);
+            const double rate = exp_tok / (cost(k + 1) + td);
             if (rate > best_rate) {
                 best_rate = rate;
                 best = k;
@@ -352,6 +383,7 @@ struct Drafting {
         }
     }
     void start() {   // (a request's first round: no rest left over from the last one)
+        sd_fresh = true;
         rest = 0;
         rest_len = rest_len0;
         n_d = 0;
@@ -507,7 +539,31 @@ bool draft_round(ik2hip::Model& m, Drafting& dr, int tok, const mm3::sample::Req
     bool was_drafted = false;
     const bool drawn = dr.draw && r.temperature > 0.0f;
     const long long ctx_room = m.max_ctx() - m.end();
-    if (spec && dr.on && room > 1 && ctx_room > 2) {
+    bool looked = false;
+    if (spec && dr.on && room > 1 && ctx_room > 2 && dr.lookup_min > 0) {
+        if (dr.sd_fresh || hist.size() < dr.sdp->size()) {
+            dr.sdp->reset();
+            dr.sdp->append(hist.data(), hist.size());
+            dr.sd_fresh = false;
+        } else if (hist.size() > dr.sdp->size()) {
+            dr.sdp->append(hist.data() + dr.sdp->size(), hist.size() - dr.sdp->size());
+        }
+        int lk[16];
+        const int max_l = (int) std::min<long long>({8, room - 1, (long long) m.window_max() - 1, ctx_room - 1});
+        const int nl = dr.sdp->propose(max_l, lk);
+        if (nl > 0 && dr.sdp->last_match() >= dr.lookup_min) {
+            toks.assign(lk, lk + nl);
+            probs.assign((size_t) nl, dr.lookup_p);
+            dr.mode = 3;
+            k = dr.choose(probs, nl, 0.0);
+            looked = k > 0;
+            if (!looked) {
+                toks.clear();
+                probs.clear();
+            }
+        }
+    }
+    if (!looked && spec && dr.on && room > 1 && ctx_room > 2) {
         if (dr.rest > 0) {
             --dr.rest;
         } else {
@@ -520,6 +576,7 @@ bool draft_round(ik2hip::Model& m, Drafting& dr, int tok, const mm3::sample::Req
             dr.draft_ms += td;
             ++dr.drafted;
             was_drafted = true;
+            dr.mode = drawn ? 2 : sampled ? 1 : 0;
             k = dr.choose(probs, (int) toks.size());
             if (k == 0) dr.rest = std::max(dr.rest, dr.rest0);   // (no draft worth a window here: likely none at the next token)
         }
@@ -584,6 +641,12 @@ bool draft_round(ik2hip::Model& m, Drafting& dr, int tok, const mm3::sample::Req
     dr.accepted += acc;
     ++dr.khist[std::min(k, 7)];
     dr.observe_round(was_drafted, k, acc, (t1 - t0) * 1e3);
+    if ((was_drafted && dr.cal) || looked) dr.cal_observe(probs, k, acc);
+    if (looked) {
+        ++dr.looked;
+        dr.look_off += k;
+        dr.look_kept += acc;
+    }
     if (dr.log) {
         std::fprintf(stderr, "ROUND pos %lld made %zu k %d kept %d draft %.1f ms pass %.1f ms p", (long long) m.end(), toks.size(),
                      k, acc, was_drafted ? (t1 - t0) * 1e3 : 0.0, tv);
@@ -718,7 +781,7 @@ int serve(ik2hip::Model& m, const std::vector<int>& stops, int short_n, bool spe
         dr.start();
         const Drafting d0 = dr;
         const bool spec = dr.on && (r.spec < 0 ? spec_default : r.spec != 0);
-        if (dr.on) m.set_draft_cum(dr.fixed_k > 0 ? 0.0f : cum);
+        if (dr.on) m.set_draft_cum(dr.fixed_k > 0 ? 0.0f : dr.cal ? cum * cum : cum);   // (calibrated: the window decides past a lower floor)
         // the answer's first token from the prompt's last row; then rounds: the token in hand read (with drafts, when
         // the drafter has some worth a window), the tokens after it given out
         int tok = want_lg ? sample(lg.data(), m.vocab(), r, held, rng) : m.top();
@@ -808,6 +871,10 @@ int serve(ik2hip::Model& m, const std::vector<int>& stops, int short_n, bool spe
             std::fprintf(stderr, "; draft %.1f ms a round, a pass %.1f + %.1f ms a row, rests %lld", dr.t_draft, dr.a, dr.b,
                          dr.rested - d0.rested);
             if (dr.pos_log) {
+                if (dr.cal) std::fprintf(stderr, "; miss scale %.2f / %.2f / %.2f", dr.cal_om[0] / dr.cal_pm[0], dr.cal_om[1] / dr.cal_pm[1], dr.cal_om[2] / dr.cal_pm[2]);
+                if (dr.lookup_min > 0)
+                    std::fprintf(stderr, "; lookup %lld rounds, %lld of %lld kept, miss scale %.2f", dr.looked - d0.looked,
+                                 dr.look_kept - d0.look_kept, dr.look_off - d0.look_off, dr.cal_om[3] / dr.cal_pm[3]);
                 std::fprintf(stderr, "; by place kept/reached");
                 for (int i = 0; i < 7; ++i) std::fprintf(stderr, " %lld/%lld", dr.kept_at[i] - d0.kept_at[i], dr.reach[i] - d0.reach[i]);
                 if (dr.drafted > d0.drafted)

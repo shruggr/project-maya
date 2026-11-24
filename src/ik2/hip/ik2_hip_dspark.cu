@@ -442,6 +442,85 @@ __global__ void pick_kernel(const float* __restrict__ bmax, const int* __restric
     }
 }
 
+// ---- the block's fused row kernels (IK2_HIP_DSPARK_FUSE, on by default; 0: the separate launches) -----------------
+__device__ __forceinline__ float warp_max32(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+// block r (256 threads): x[r] += ob[r] (ob null: nothing), then y = rms(x[r]) gain (into yo too when not null) as int8
+// blocks of 32 with a scale each (hy4's q8_rows layout: q [rows][E], d [rows][E / 32])
+__global__ void add_rms_q8_kernel(float* __restrict__ x, const float* __restrict__ ob, const float* __restrict__ gain,
+                                  float eps, int E, float* __restrict__ yo, int8_t* __restrict__ q, float* __restrict__ d) {
+    __shared__ float sh[256];
+    __shared__ float inv_s;
+    float* xr = x + (size_t) blockIdx.x * E;
+    const float* br = ob ? ob + (size_t) blockIdx.x * E : nullptr;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < E; i += blockDim.x) {
+        float v = xr[i];
+        if (br) xr[i] = v = v + br[i];
+        ss += v * v;
+    }
+    sh[threadIdx.x] = ss;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) sh[threadIdx.x] += sh[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) inv_s = rsqrtf(sh[0] / (float) E + eps);
+    __syncthreads();
+    const float inv = inv_s;
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5, nb = E / 32;
+    for (int b = wid; b < nb; b += nw) {
+        const int i = b * 32 + lane;
+        const float v = xr[i] * inv * gain[i];
+        if (yo) yo[(size_t) blockIdx.x * E + i] = v;
+        const float am = warp_max32(fabsf(v));
+        const float sc = am / 127.0f;
+        q[(size_t) blockIdx.x * E + i] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+        if (lane == 0) d[(size_t) blockIdx.x * nb + b] = sc;
+    }
+}
+// block = one head of one row (D / 2 threads, a rotary pair each): rms over its D values with the gain (one vector
+// for every head), then NEOX RoPE at pos0 + row; heads [rows][Hq] of q, then [rows][Hk] of k
+__global__ void qk_norm_rope_kernel(float* __restrict__ q, float* __restrict__ k, int rows, int Hq, int Hk, int D,
+                                    const float* __restrict__ gq, const float* __restrict__ gk, float eps, long long pos0,
+                                    double log_base) {
+    __shared__ float sh[64];
+    const int nq = rows * Hq, bi = blockIdx.x, half = D / 2, j = threadIdx.x;
+    const bool isq = bi < nq;
+    const int hb = isq ? bi : bi - nq, H = isq ? Hq : Hk, t = hb / H;
+    float* v = (isq ? q : k) + (size_t) hb * D;
+    const float* g = isq ? gq : gk;
+    const float a = v[j], b = v[j + half];
+    sh[j] = a * a + b * b;
+    __syncthreads();
+    for (int o = half / 2; o > 0; o >>= 1) {
+        if (j < o) sh[j] += sh[j + o];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(sh[0] / (float) D + eps);
+    const float an = a * inv * g[j], bn = b * inv * g[j + half];
+    const double th = (double) (pos0 + t) * exp(-(double) j / (double) half * log_base);
+    const float c = (float) cos(th), sn = (float) sin(th);
+    v[j] = an * c - bn * sn;
+    v[j + half] = an * sn + bn * c;
+}
+// block (y = row): h = silu(g) u for 8 blocks of 32 (a warp each) straight to int8 + scales (q8_rows' layout)
+__global__ void swiglu_q8_kernel(const float* __restrict__ g, const float* __restrict__ u, int F,
+                                 int8_t* __restrict__ q, float* __restrict__ d) {
+    const int r = blockIdx.y, b = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (b * 32 >= F) return;
+    const size_t i = (size_t) r * F + (size_t) b * 32 + lane;
+    const float gv = g[i];
+    const float v = gv / (1.0f + expf(-gv)) * u[i];
+    const float am = warp_max32(fabsf(v));
+    const float sc = am / 127.0f;
+    q[i] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+    if (lane == 0) d[(size_t) r * (F / 32) + b] = sc;
+}
+
 // ---- drawn drafts (Dspark::draft with a temperature: speculative sampling's q, IK2_HIP_DRAFT_DRAW) -------------------
 // a Gumbel(0, 1) value from (seed, v): splitmix64, the top 24 bits as a uniform in (0, 1)
 __device__ __forceinline__ float gumbel01(unsigned long long seed, unsigned v) {
@@ -764,6 +843,7 @@ struct Dspark::Impl {
     std::vector<float> h_x;
     int64_t end = 0, hi = -1;   // the context's end; the furthest position ever fed (what the rings have overwritten)
     float cum_min = 0.5f;
+    bool fuse = !(std::getenv("IK2_HIP_DSPARK_FUSE") && std::atoi(std::getenv("IK2_HIP_DSPARK_FUSE")) == 0);
     // (--parallel) a conversation's state each: every layer's K / V rows, the context ring, end and hi - the bound
     // one's in the fields above, the others' here (state 0's too while another is bound)
     struct State {
@@ -1377,17 +1457,29 @@ struct Dspark::Impl {
         if (!phase(st.embed_ms)) return false;
         // ---- the layers
         const float scale = 1.0f / std::sqrt((float) D);
+        const bool fz8 = fuse && E % 32 == 0 && FF % 256 == 0 && D <= 128 && (D / 2 & (D / 2 - 1)) == 0;
+        const float* pend = nullptr;   // (fused: the last FFN's output, added at the next norm)
         for (int il = 0; il < NL; ++il) {
             DLayer& l = L[(size_t) il];
-            ik2hip::k::rms(x, (size_t) E, B, E, l.attn_norm, eps, a, (size_t) E, s);
-            hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
+            if (fz8) {
+                add_rms_q8_kernel<<<(unsigned) B, 256, 0, s>>>(x, pend, l.attn_norm, eps, E, nullptr, xq, xd);
+                pend = nullptr;
+            } else {
+                ik2hip::k::rms(x, (size_t) E, B, E, l.attn_norm, eps, a, (size_t) E, s);
+                hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
+            }
             if (!mv8({job(l.q, xq, xd, B, qv, (size_t) HD), job(l.kk, xq, xd, B, kv, (size_t) KD),
                      job(l.v, xq, xd, B, vv, (size_t) KD)}, err))
                 return false;
-            ik2hip::k::rms(qv, (size_t) D, B * H, D, l.qn, eps, qv, (size_t) D, s);
-            ik2hip::k::rms(kv, (size_t) D, B * Hkv, D, l.kn, eps, kv, (size_t) D, s);
-            rope_neox_kernel<<<blocks_of((size_t) B * H * D / 2), 256, 0, s>>>(qv, B, H, D, (long long) n, log_base);
-            rope_neox_kernel<<<blocks_of((size_t) B * Hkv * D / 2), 256, 0, s>>>(kv, B, Hkv, D, (long long) n, log_base);
+            if (fz8) {
+                qk_norm_rope_kernel<<<(unsigned) (B * (H + Hkv)), (unsigned) (D / 2), 0, s>>>(qv, kv, B, H, Hkv, D, l.qn, l.kn, eps,
+                                                                                          (long long) n, log_base);
+            } else {
+                ik2hip::k::rms(qv, (size_t) D, B * H, D, l.qn, eps, qv, (size_t) D, s);
+                ik2hip::k::rms(kv, (size_t) D, B * Hkv, D, l.kn, eps, kv, (size_t) D, s);
+                rope_neox_kernel<<<blocks_of((size_t) B * H * D / 2), 256, 0, s>>>(qv, B, H, D, (long long) n, log_base);
+                rope_neox_kernel<<<blocks_of((size_t) B * Hkv * D / 2), 256, 0, s>>>(kv, B, Hkv, D, (long long) n, log_base);
+            }
             if (!phase(st.qkv_ms)) return false;
             const int64_t lo = l.swa ? lo_swa : 0;
             const int nctx = (int) (n - lo);
@@ -1410,24 +1502,39 @@ struct Dspark::Impl {
             if (!phase(st.attn_ms)) return false;
             hk::q8_rows(ao, (size_t) HD, B, HD, xq, xd, s);
             if (!mv8({job(l.o, xq, xd, B, ob, (size_t) E)}, err)) return false;
-            ik2hip::k::add(x, ob, (size_t) B * E, s);
-            if (!phase(st.o_ms)) return false;
-            ik2hip::k::rms(x, (size_t) E, B, E, l.ffn_norm, eps, a, (size_t) E, s);
-            hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
+            if (fz8) {
+                add_rms_q8_kernel<<<(unsigned) B, 256, 0, s>>>(x, ob, l.ffn_norm, eps, E, nullptr, xq, xd);
+                if (!phase(st.o_ms)) return false;
+            } else {
+                ik2hip::k::add(x, ob, (size_t) B * E, s);
+                if (!phase(st.o_ms)) return false;
+                ik2hip::k::rms(x, (size_t) E, B, E, l.ffn_norm, eps, a, (size_t) E, s);
+                hk::q8_rows(a, (size_t) E, B, E, xq, xd, s);
+            }
             if (!mv8({job(l.gate, xq, xd, B, gu, (size_t) FF), job(l.up, xq, xd, B, gu + (size_t) B * FF, (size_t) FF)}, err))
                 return false;
-            hk::swiglu(gu, gu + (size_t) B * FF, (size_t) FF, B, FF, hh, (size_t) FF, s);
-            hk::q8_rows(hh, (size_t) FF, B, FF, xq, xd, s);
+            if (fz8) {
+                swiglu_q8_kernel<<<dim3((unsigned) (FF / 256), (unsigned) B), 256, 0, s>>>(gu, gu + (size_t) B * FF, FF, xq, xd);
+            } else {
+                hk::swiglu(gu, gu + (size_t) B * FF, (size_t) FF, B, FF, hh, (size_t) FF, s);
+                hk::q8_rows(hh, (size_t) FF, B, FF, xq, xd, s);
+            }
             if (!mv8({job(l.down, xq, xd, B, ob, (size_t) E)}, err)) return false;
-            ik2hip::k::add(x, ob, (size_t) B * E, s);
+            if (fz8) pend = ob;
+            else ik2hip::k::add(x, ob, (size_t) B * E, s);
             if (!phase(st.ffn_ms)) return false;
         }
-        ik2hip::k::rms(x, (size_t) E, B, E, out_norm, eps, hN, (size_t) E, s);
+        if (fz8) add_rms_q8_kernel<<<(unsigned) B, 256, 0, s>>>(x, pend, out_norm, eps, E, hN, xq, xd);
+        else ik2hip::k::rms(x, (size_t) E, B, E, out_norm, eps, hN, (size_t) E, s);
         if (!phase(st.norm_ms)) return false;
         if (o.profile) st.layers_ms = st.qkv_ms + st.attn_ms + st.o_ms + st.ffn_ms + st.norm_ms;
         // ---- the base logits of the draft rows (the target's output matrix, read once)
-        hk::q8_rows(hN + (size_t) E, (size_t) E, max_n, E, xq, xd, s);
-        if (!mv({job(out, xq, xd, max_n, base, (size_t) Vp)}, err)) return false;
+        if (fz8) {   // (the final norm's kernel made every row's int8 form: rows 1 .. max_n are the drafts')
+            if (!mv({job(out, xq + (size_t) E, xd + (size_t) E / 32, max_n, base, (size_t) Vp)}, err)) return false;
+        } else {
+            hk::q8_rows(hN + (size_t) E, (size_t) E, max_n, E, xq, xd, s);
+            if (!mv({job(out, xq, xd, max_n, base, (size_t) Vp)}, err)) return false;
+        }
         if (!phase(st.base_ms)) return false;
         // ---- the markov head, a step a draft: all on the device
         for (int i = 1; i <= max_n; ++i) {
@@ -1491,6 +1598,39 @@ bool Dspark::feed_dev(const float* d_taps, size_t ld, int n, int64_t pos0, std::
     return true;
 }
 bool Dspark::draft(int anchor, int max_n, std::vector<int>& toks, std::vector<float>& probs, std::string& err) {
+    static const bool check = std::getenv("IK2_HIP_DSPARK_FUSE_CHECK") != nullptr;   // (tests: fused against separate)
+    if (check && m->fuse) {
+        std::vector<int> t0;
+        std::vector<float> p0;
+        m->fuse = false;
+        const float c = m->cum_min;
+        m->cum_min = 0.0f;
+        const bool ok = m->draft(anchor, max_n, 0.0f, 0, t0, p0, nullptr, err);
+        m->fuse = true;
+        if (!ok || !m->draft(anchor, max_n, 0.0f, 0, toks, probs, nullptr, err)) return false;
+        m->cum_min = c;
+        static long long n = 0, same = 0, first_same = 0, cmp = 0;
+        static double worst = 0;
+        ++n;
+        bool all = toks.size() == t0.size();
+        for (size_t i = 0; i < std::min(toks.size(), t0.size()); ++i) {
+            all = all && toks[i] == t0[i];
+            worst = std::max(worst, (double) std::fabs(probs[i] - p0[i]));
+            ++cmp;
+        }
+        same += all;
+        first_same += !toks.empty() && !t0.empty() && toks[0] == t0[0];
+        if (n % 100 == 0)
+            std::fprintf(stderr, "DSPARK FUSE CHECK %lld drafts: all 7 the same %lld, the first the same %lld; worst prob "
+                                 "difference %.2e over %lld\n", n, same, first_same, worst, cmp);
+        // (the window's cut as the request's, on the fused drafts)
+        float cum = 1.0f;
+        size_t keep = 0;
+        while (keep < toks.size() && (cum *= probs[keep]) >= c) ++keep;
+        toks.resize(keep);
+        probs.resize(keep);
+        return true;
+    }
     return m->draft(anchor, max_n, 0.0f, 0, toks, probs, nullptr, err);
 }
 bool Dspark::draft_drawn(int anchor, int max_n, float temp, unsigned long long seed, std::vector<int>& toks,
