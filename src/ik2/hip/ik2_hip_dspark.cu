@@ -1894,6 +1894,18 @@ struct Dspark::Impl {
             if (l.swa && lo_swa <= hi - l.ring) return true;
         const double t0 = now_ms();
         double tp0 = t0;
+        // IK2_HIP_DSPARK_WALL=1 (measurements): events at the first and the last of a draft's GPU work - a line every 200
+        // drafts: the wall time a draft, the GPU's span, the host's time before its first enqueue and after the GPU's end
+        static const bool wall = std::getenv("IK2_HIP_DSPARK_WALL") != nullptr;
+        static cudaEvent_t w0 = nullptr, w1 = nullptr;
+        static double w_wall = 0, w_gpu = 0, w_pre = 0;
+        static long long w_n = 0;
+        double t_pre = 0;
+        if (wall && w0 == nullptr) {
+            (void) cudaSetDevice(dev);
+            (void) cudaEventCreate(&w0);
+            (void) cudaEventCreate(&w1);
+        }
         auto phase = [&](double& acc) -> bool {
             if (!o.profile) return true;
             if (!sync(err)) return false;
@@ -1911,6 +1923,10 @@ struct Dspark::Impl {
             if (tok_type == kQ5K) dequantize_row_q5_K(row, h_x.data(), E);
             else if (tok_type == iq::kQ6_K) dequantize_row_q6_K(row, h_x.data(), E);
             else std::memcpy(h_x.data(), row, (size_t) E * 4);
+            if (wall) {
+                t_pre = now_ms() - t0;
+                CK(cudaEventRecord(w0, s));
+            }
             CK(cudaMemcpyAsync(emb, h_x.data(), (size_t) E * 4, cudaMemcpyHostToDevice, s));
             CK(cudaMemcpyAsync(x, x0, (size_t) B * E * 4, cudaMemcpyDeviceToDevice, s));
             ik2hip::k::rms(emb, (size_t) E, 1, E, tok_norm, eps, x, (size_t) E, s);
@@ -2023,8 +2039,22 @@ struct Dspark::Impl {
         CK(cudaMemcpyAsync(h_tok, tok, sizeof(int) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_prob, prob, sizeof(float) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
         if (drawn) CK(cudaMemcpyAsync(h_qd, qdd, sizeof(float) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
+        if (wall) CK(cudaEventRecord(w1, s));
         if (!sync(err)) return false;
         if (o.profile) st.head_ms += now_ms() - tp0;
+        if (wall) {
+            float g = 0;
+            (void) cudaEventElapsedTime(&g, w0, w1);
+            const double tw = now_ms() - t0;
+            w_wall += tw;
+            w_gpu += g;
+            w_pre += t_pre;
+            ++w_n;
+            if (w_n % 200 == 0)
+                std::fprintf(stderr, "DSPARK WALL %lld drafts: a draft %.3f ms wall, GPU %.3f (first to last enqueued op), host "
+                                     "before the first %.3f, the rest (launches ahead of the GPU, copies, sync) %.3f\n",
+                             w_n, w_wall / w_n, w_gpu / w_n, w_pre / w_n, (w_wall - w_gpu - w_pre) / w_n);
+        }
         float cum = 1.0f;
         for (int i = 1; i <= max_n; ++i) {
             cum *= h_prob[i];
