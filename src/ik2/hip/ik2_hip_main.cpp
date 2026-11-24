@@ -512,6 +512,16 @@ struct Drafting {
     // own) - one stalled pass (measured: 3.5 s once, through the server) had put b at 360 ms a row, after which no
     // window was ever chosen again, so b was never measured again: drafting stayed off until a restart
     bool clamp = env_d("IK2_HIP_DRAFT_CLAMP", 1) != 0;
+    // IK2_HIP_DRAFT_REST_RULE=1: the rest judged once a block of IK2_HIP_DRAFT_REST_BLOCK (16) drafted rounds, on the
+    // block's gains alone: rest when their mean + IK2_HIP_DRAFT_REST_Z (0.5) standard errors is under 0 - drafting shown
+    // to lose, not a dip of a running average.  0 (the default): the 0.9 average tested against 0.1 a every drafted round
+    // after the first 8, as before.  (Measured, 2026-11-24: a drafted round's gain has an SD of ~30 ms against a mean of
+    // +6..8 ms on prose, and one 8-round block's mean barely predicts the next's - the average dips under the bar where
+    // drafting pays, and the rests double to 32)
+    int rest_rule = (int) env_d("IK2_HIP_DRAFT_REST_RULE", 0), rest_block = (int) env_d("IK2_HIP_DRAFT_REST_BLOCK", 16);
+    double rest_z = env_d("IK2_HIP_DRAFT_REST_Z", 0.5);
+    double bs = 0.0, bs2 = 0.0;
+    int bn = 0;
     void observe_pass(int T, double ms) {
         if (T == 1) a = ema * a + (1 - ema) * (clamp ? std::min(ms, 3 * a) : ms);
         else {
@@ -528,6 +538,23 @@ struct Drafting {
         if (fixed_k > 0) return;   // (no rests)
         const double g = kept * a - (t_draft_ms + k * b);
         gain = n_d > 0 ? ema * gain + (1 - ema) * g : g;
+        if (rest_rule == 1) {   // (blocks: judged once a block, on the block's own mean and spread)
+            bs += g;
+            bs2 += g * g;
+            if (++bn < rest_block) return;
+            const double m = bs / bn, sd = std::sqrt(std::max(0.0, bs2 / bn - m * m));
+            const bool loses = m + rest_z * sd / std::sqrt((double) bn) < 0.0;
+            bs = bs2 = 0.0;
+            bn = 0;
+            if (loses) {
+                rest = rest_len;
+                rest_len = std::min(rest_max, rest_len * 2);
+                ++rested;
+            } else {
+                rest_len = rest_len0;
+            }
+            return;
+        }
         if (++n_d < warm) return;
         if (gain < rest_gain * a) {   // drafting does not pay here: rest, longer each time in a row
             rest = rest_len;
@@ -547,6 +574,8 @@ struct Drafting {
         rest = 0;
         rest_len = rest_len0;
         n_d = 0;
+        bs = bs2 = 0.0;
+        bn = 0;
     }
 };
 
