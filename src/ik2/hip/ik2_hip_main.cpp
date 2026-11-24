@@ -390,8 +390,9 @@ int sample(const float* row, int V, const mm3::sample::Req& r, const std::vector
 // this PC's time of a pass of T rows - a line a + b (T - 1) fitted as it decodes (a: the token steps, b: the windows),
 // from the measured table's values at 3k context - and t_draft the draft's measured time.  k 0: a plain token step.
 // The drafter's own cut on the running product of the probabilities (Options::dspark_cum, 0.5) is the floor under it.
-// Rest: a drafted round gains (kept drafts) x a - (t_draft + k b) milliseconds over plain steps; when that, averaged
-// over the last drafted rounds, is under a tenth of a token step (terse thinking text: half of 1.5 drafts kept), the
+// Rest: a drafted round gains (kept drafts) x a - (t_draft + k b) milliseconds over plain steps; when a block of 16
+// drafted rounds shows that under 0 (its mean + half a standard error: IK2_HIP_DRAFT_REST_RULE, below; the rule before
+// it, IK2_HIP_DRAFT_REST_RULE=0: averaged over the last drafted rounds, under a tenth of a token step), the
 // drafter is not asked for a while (the tokens' taps still reach it: Model::window feeds them), then tried again -
 // 8 rounds, doubling to 32 while it keeps not paying, from 8 again with every request.  (Short on purpose: a rest costs
 // little where drafts are break-even and much where the text turns to code or prose - measured through the server:
@@ -512,13 +513,15 @@ struct Drafting {
     // own) - one stalled pass (measured: 3.5 s once, through the server) had put b at 360 ms a row, after which no
     // window was ever chosen again, so b was never measured again: drafting stayed off until a restart
     bool clamp = env_d("IK2_HIP_DRAFT_CLAMP", 1) != 0;
-    // IK2_HIP_DRAFT_REST_RULE=1: the rest judged once a block of IK2_HIP_DRAFT_REST_BLOCK (16) drafted rounds, on the
-    // block's gains alone: rest when their mean + IK2_HIP_DRAFT_REST_Z (0.5) standard errors is under 0 - drafting shown
-    // to lose, not a dip of a running average.  0 (the default): the 0.9 average tested against 0.1 a every drafted round
-    // after the first 8, as before.  (Measured, 2026-11-24: a drafted round's gain has an SD of ~30 ms against a mean of
-    // +6..8 ms on prose, and one 8-round block's mean barely predicts the next's - the average dips under the bar where
-    // drafting pays, and the rests double to 32)
-    int rest_rule = (int) env_d("IK2_HIP_DRAFT_REST_RULE", 0), rest_block = (int) env_d("IK2_HIP_DRAFT_REST_BLOCK", 16);
+    // IK2_HIP_DRAFT_REST_RULE=1 (the default): the rest judged once a block of IK2_HIP_DRAFT_REST_BLOCK (16) drafted
+    // rounds, on the block's gains alone: rest when their mean + IK2_HIP_DRAFT_REST_Z (0.5) standard errors is under 0 -
+    // drafting shown to lose, not a dip of a running average.  0: the 0.9 average tested against 0.1 a every drafted
+    // round after the first 8 (IK2_HIP_DRAFT_WARM, _REST_GAIN, _RESET_GAIN), as before.  (Measured, 2026-11-24: a drafted
+    // round's gain has an SD of ~30 ms against a mean of +6..8 ms on prose, and one 8-round block's mean barely predicts
+    // the next's - the average dipped under the bar where drafting pays and the rests doubled to 32: 13K / 30K prompts
+    // 40.8 / 38.2 tok/s against 44.2 / 42.0 with blocks, short 46.5 / 48.6, the seven-prompt geomean +3.1%, random
+    // -1.5% - medians of 6 requests each with the expert cache on; docs/INKLING2_AMD.md E31b)
+    int rest_rule = (int) env_d("IK2_HIP_DRAFT_REST_RULE", 1), rest_block = (int) env_d("IK2_HIP_DRAFT_REST_BLOCK", 16);
     double rest_z = env_d("IK2_HIP_DRAFT_REST_Z", 0.5);
     double bs = 0.0, bs2 = 0.0;
     int bn = 0;

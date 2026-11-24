@@ -687,6 +687,7 @@ with where it comes from (2026-11-20). Sources:
 | E29 | Rest cap 32, doubling (IK2_HIP_DRAFT_REST_MAX) | Longest rest | MEASURED (insensitive) | 16 / 32 / 64 alike within noise (below) |
 | E30 | 8 drafted rounds before judging (IK2_HIP_DRAFT_WARM) | Warm-up of the gain average | MEASURED (insensitive) | 4 / 8 / 16 alike within noise (below) |
 | E31 | Rest when `gain < 0.1·a` (IK2_HIP_DRAFT_REST_GAIN) | When drafting rests | MEASURED (insensitive) | 0.05 / 0.1 / 0.2 alike within noise (below) |
+| E31b | Rest judged a block of 16 drafted rounds: mean gain + 0.5 SE < 0 (IK2_HIP_DRAFT_REST_RULE 1, _REST_BLOCK, _REST_Z) | When drafting rests (E30-E32 apply to rule 0 only) | MEASURED | 2026-11-24, ripper, expert cache on, medians of 6 requests: 13K / 30K prompts 40.8 / 38.2 tok/s (rule 0) -> 44.2 / 42.0, short 46.5 -> 48.6, seven-prompt geomean +3.1%, random -1.5%; rule 0 with E31 at 0: +2.4%. E31's sweep was at 2.7K context with 10 ms drafts |
 | E32 | `gain > 0.3·a` resets the rest length (IK2_HIP_DRAFT_RESET_GAIN) | Hysteresis | MEASURED (insensitive) | 0.2 / 0.3 / 0.5 alike within noise (below) |
 | E33 | EMA 0.9 / 0.1 (IK2_HIP_DRAFT_EMA) | Smoothing of a, b, gain and t_draft | MEASURED (insensitive) | 0.8 / 0.9 / 0.95 alike within noise (below) |
 | E34 | `b` floor 0.5 ms (IK2_HIP_DRAFT_B_MIN) | Lower bound on the fitted row cost | MEASURED (insensitive) | 0.25 / 0.5 / 1 alike within noise (below) |
