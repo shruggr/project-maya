@@ -442,6 +442,151 @@ __global__ void pick_kernel(const float* __restrict__ bmax, const int* __restric
     }
 }
 
+// ---- drawn drafts (Dspark::draft with a temperature: speculative sampling's q, IK2_HIP_DRAFT_DRAW) -------------------
+// a Gumbel(0, 1) value from (seed, v): splitmix64, the top 24 bits as a uniform in (0, 1)
+__device__ __forceinline__ float gumbel01(unsigned long long seed, unsigned v) {
+    unsigned long long z = seed + (unsigned long long) (v + 1) * 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    const float u = ((float) (z >> 40) + 0.5f) * (1.0f / 16777216.0f);
+    return -logf(-logf(u));
+}
+// logits_kernel's logits, and over s = lg / temp: each block's largest s (bmax, where: bidx), sum exp(s - bmax) (bsum),
+// and its largest s + Gumbel noise (where: gidx, that token's s: gval) - the draw from softmax(s) by the Gumbel-max rule
+__global__ void logits_draw_kernel(const float* __restrict__ base, const int8_t* __restrict__ Mq, const float* __restrict__ sc,
+                                   const float* __restrict__ m0, const float* __restrict__ z, int R, int V, int Vs, float cap,
+                                   float itemp, unsigned long long seed, float* __restrict__ lg, float* __restrict__ bmax,
+                                   int* __restrict__ bidx, float* __restrict__ bsum, float* __restrict__ gmax,
+                                   int* __restrict__ gidx, float* __restrict__ gval, const float* __restrict__ cum, float cmin) {
+    if (*cum < cmin) return;
+    __shared__ int us[256];
+    __shared__ float sv[256], sg[256], sgv[256];
+    __shared__ int si[256], sgi[256];
+    for (int i = threadIdx.x; i < R; i += blockDim.x) us[i] = (int) lrintf(tanhf(z[2 * R + i]) * 32767.0f);
+    __syncthreads();
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    float val = -INFINITY, nz = -INFINITY;
+    if (v < V) {
+        const uint32_t* mw = (const uint32_t*) Mq;
+        int acc = 0;
+        for (int c = 0; c < R / 4; ++c) {
+            const uint32_t w = mw[(size_t) c * Vs + v];
+            acc += (int) (int8_t) (w & 255) * us[4 * c] + (int) (int8_t) ((w >> 8) & 255) * us[4 * c + 1] +
+                   (int) (int8_t) ((w >> 16) & 255) * us[4 * c + 2] + (int) (int8_t) (w >> 24) * us[4 * c + 3];
+        }
+        const float l = cap * tanhf((base[v] + (float) acc * (sc[v] * (1.0f / 32767.0f)) + m0[v]) / cap);
+        lg[v] = l;
+        val = l * itemp;
+        nz = val + gumbel01(seed, (unsigned) v);
+    }
+    sv[threadIdx.x] = val;
+    si[threadIdx.x] = v;
+    sg[threadIdx.x] = nz;
+    sgi[threadIdx.x] = v;
+    sgv[threadIdx.x] = val;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) {
+            const int t = threadIdx.x, u = t + o;
+            if (sv[u] > sv[t] || (sv[u] == sv[t] && si[u] < si[t])) {
+                sv[t] = sv[u];
+                si[t] = si[u];
+            }
+            if (sg[u] > sg[t] || (sg[u] == sg[t] && sgi[u] < sgi[t])) {
+                sg[t] = sg[u];
+                sgi[t] = sgi[u];
+                sgv[t] = sgv[u];
+            }
+        }
+        __syncthreads();
+    }
+    const float mx = sv[0];
+    const int at = si[0];
+    const float g0 = sg[0], gv0 = sgv[0];
+    const int gi0 = sgi[0];
+    __syncthreads();
+    sv[threadIdx.x] = v < V ? expf(val - mx) : 0.0f;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) sv[threadIdx.x] += sv[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        bmax[blockIdx.x] = mx;
+        bidx[blockIdx.x] = at;
+        bsum[blockIdx.x] = sv[0];
+        gmax[blockIdx.x] = g0;
+        gidx[blockIdx.x] = gi0;
+        gval[blockIdx.x] = gv0;
+    }
+}
+// pick_kernel for a drawn draft: *tok = the Gumbel-max token, *prob = the largest probability of softmax(s) (the
+// window's confidence, as the argmax draft's), *qd = the drawn token's probability (the verdict's q(d)); the state update
+__global__ void pick_draw_kernel(const float* __restrict__ bmax, const float* __restrict__ bsum, const float* __restrict__ gmax,
+                                 const int* __restrict__ gidx, const float* __restrict__ gval, int nb, int* __restrict__ tok,
+                                 float* __restrict__ prob, float* __restrict__ qd, const float* __restrict__ z, int R,
+                                 float* __restrict__ state, float* __restrict__ cum, float cmin) {
+    if (*cum < cmin) {
+        if (threadIdx.x == 0) {
+            *tok = -1;
+            *prob = 0.0f;
+            *qd = 0.0f;
+        }
+        return;
+    }
+    for (int i = threadIdx.x; i < R; i += blockDim.x) {
+        const float gt = 1.0f / (1.0f + expf(-z[i])), c = tanhf(z[R + i]);
+        state[i] = c + gt * (state[i] - c);
+    }
+    __shared__ float bv[1024], gv[1024], gs[1024];
+    __shared__ int gi[1024];
+    float m = -INFINITY, g = -INFINITY, gsv = -INFINITY;
+    int at = 0x7fffffff;
+    for (int i = threadIdx.x; i < nb; i += blockDim.x) {
+        m = fmaxf(m, bmax[i]);
+        if (gmax[i] > g || (gmax[i] == g && gidx[i] < at)) {
+            g = gmax[i];
+            at = gidx[i];
+            gsv = gval[i];
+        }
+    }
+    bv[threadIdx.x] = m;
+    gv[threadIdx.x] = g;
+    gi[threadIdx.x] = at;
+    gs[threadIdx.x] = gsv;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) {
+            const int t = threadIdx.x, u = t + o;
+            bv[t] = fmaxf(bv[t], bv[u]);
+            if (gv[u] > gv[t] || (gv[u] == gv[t] && gi[u] < gi[t])) {
+                gv[t] = gv[u];
+                gi[t] = gi[u];
+                gs[t] = gs[u];
+            }
+        }
+        __syncthreads();
+    }
+    const float mx = bv[0], dval = gs[0];
+    const int best = gi[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < nb; i += blockDim.x) sum += bsum[i] * expf(bmax[i] - mx);
+    bv[threadIdx.x] = sum;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) bv[threadIdx.x] += bv[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *tok = best;
+        *prob = 1.0f / bv[0];
+        *qd = expf(dval - mx) / bv[0];
+        *cum *= 1.0f / bv[0];
+    }
+}
+
 float half_to_float(uint16_t h) {
     const uint32_t s = (uint32_t) (h >> 15) << 31, e = (h >> 10) & 31, f = h & 1023;
     uint32_t u;
@@ -606,6 +751,8 @@ struct Dspark::Impl {
     int8_t* xq = nullptr;
     int *tok = nullptr, *bidx = nullptr;
     float *bmax = nullptr, *bsum = nullptr, *x0 = nullptr, *cumd = nullptr;
+    float *gmax = nullptr, *gval = nullptr, *qdd = nullptr;   // (drawn drafts: the blocks' Gumbel maxima, the drawn q(d))
+    int* gidx = nullptr;
     int max_tiles = 0, tile = 16;
     cublasHandle_t blas = nullptr;
     float *Sg = nullptr, *qp = nullptr, *op = nullptr;
@@ -1006,11 +1153,13 @@ struct Dspark::Impl {
             !alloc(ao, (size_t) B * HD, err) || !alloc(ob, (size_t) B * E, err) || !alloc(gu, (size_t) 2 * B * FF, err) ||
             !alloc(hh, (size_t) B * FF, err) || !alloc(ast, (size_t) B * H * max_tiles * 2, err) ||
             !alloc(apart, (size_t) B * H * max_tiles * D, err) || !alloc(hN, (size_t) B * E, err) ||
-            !alloc(base, (size_t) (B - 1) * Vp, err) || !alloc(lg, (size_t) Vp, err) || !alloc(z, (size_t) 3 * R, err) ||
+            !alloc(base, (size_t) (B - 1) * Vp, err) || !alloc(lg, (size_t) B * Vp, err) || !alloc(z, (size_t) 3 * R, err) ||
             !alloc(state, (size_t) R, err) || !alloc(ctx, (size_t) E, err) ||
             !alloc(prob, (size_t) B, err) || !alloc(tok, (size_t) B, err) ||
             !alloc(bmax, (size_t) blocks_of((size_t) Vp), err) || !alloc(bidx, (size_t) blocks_of((size_t) Vp), err) ||
             !alloc(bsum, (size_t) blocks_of((size_t) Vp), err) || !alloc(x0, (size_t) B * E, err) || !alloc(cumd, 4, err) ||
+            !alloc(gmax, (size_t) blocks_of((size_t) Vp), err) || !alloc(gidx, (size_t) blocks_of((size_t) Vp), err) ||
+            !alloc(gval, (size_t) blocks_of((size_t) Vp), err) || !alloc(qdd, (size_t) B, err) ||
             !alloc(taps, (size_t) kFeed * NT * E, err) || !alloc(fz, (size_t) (NL + 1) * kFeed * E, err) ||
             !alloc(kc, (size_t) kFeed * KD, err) || !alloc(vc, (size_t) kFeed * KD, err) ||
             !alloc(xq, (size_t) kFeed * qk, err) || !alloc(xd, (size_t) kFeed * qk / 32, err))
@@ -1183,9 +1332,12 @@ struct Dspark::Impl {
         return true;
     }
 
-    bool draft(int anchor, int max_n, std::vector<int>& toks, std::vector<float>& probs, std::string& err) {
+    bool draft(int anchor, int max_n, float temp, unsigned long long seed, std::vector<int>& toks, std::vector<float>& probs,
+               std::vector<float>* qds, std::string& err) {
         toks.clear();
         probs.clear();
+        if (qds) qds->clear();
+        const bool drawn = temp > 0.0f && qds != nullptr;
         const int64_t n = end;
         max_n = std::min(max_n, B - 1);
         if (max_n < 1 || n < 1 || n + B > o.max_ctx || anchor < 0 || anchor >= Vu) return true;
@@ -1271,8 +1423,8 @@ struct Dspark::Impl {
             if (!phase(st.ffn_ms)) return false;
         }
         ik2hip::k::rms(x, (size_t) E, B, E, out_norm, eps, hN, (size_t) E, s);
-        if (!phase(st.layers_ms)) return false;
-        if (o.profile) st.layers_ms = st.qkv_ms + st.attn_ms + st.o_ms + st.ffn_ms;
+        if (!phase(st.norm_ms)) return false;
+        if (o.profile) st.layers_ms = st.qkv_ms + st.attn_ms + st.o_ms + st.ffn_ms + st.norm_ms;
         // ---- the base logits of the draft rows (the target's output matrix, read once)
         hk::q8_rows(hN + (size_t) E, (size_t) E, max_n, E, xq, xd, s);
         if (!mv({job(out, xq, xd, max_n, base, (size_t) Vp)}, err)) return false;
@@ -1281,16 +1433,26 @@ struct Dspark::Impl {
         for (int i = 1; i <= max_n; ++i) {
             joint_kernel<<<(unsigned) (3 * R), 256, 0, s>>>((const __half*) Wj, bj, state, (const __half*) w1, tok + (i - 1),
                                                         hN + (size_t) i * E, ctx, R, E, z, cumd, cum_min);
-            logits_kernel<<<blocks_of((size_t) Vu), 256, 0, s>>>(base + (size_t) (i - 1) * Vp, Mq, msc, m0, z, R, Vu, Vp, cap, lg,
-                                                              bmax, bidx, bsum, cumd, cum_min);
-            pick_kernel<<<1, 1024, 0, s>>>(bmax, bidx, bsum, (int) blocks_of((size_t) Vu), tok + i, prob + i, z, R, state, cumd,
-                                           cum_min);
+            float* lgi = lg + (size_t) (i - 1) * Vp;   // (each draft's logits kept: a drawn draft's q for the verdict)
+            if (!drawn) {
+                logits_kernel<<<blocks_of((size_t) Vu), 256, 0, s>>>(base + (size_t) (i - 1) * Vp, Mq, msc, m0, z, R, Vu, Vp, cap,
+                                                                  lgi, bmax, bidx, bsum, cumd, cum_min);
+                pick_kernel<<<1, 1024, 0, s>>>(bmax, bidx, bsum, (int) blocks_of((size_t) Vu), tok + i, prob + i, z, R, state,
+                                               cumd, cum_min);
+            } else {
+                logits_draw_kernel<<<blocks_of((size_t) Vu), 256, 0, s>>>(
+                    base + (size_t) (i - 1) * Vp, Mq, msc, m0, z, R, Vu, Vp, cap, 1.0f / temp,
+                    seed ^ (0xD1B54A32D192ED03ull * (unsigned long long) i), lgi, bmax, bidx, bsum, gmax, gidx, gval, cumd, cum_min);
+                pick_draw_kernel<<<1, 1024, 0, s>>>(bmax, bsum, gmax, gidx, gval, (int) blocks_of((size_t) Vu), tok + i, prob + i,
+                                                    qdd + i, z, R, state, cumd, cum_min);
+            }
         }
         check("head");
         int h_tok[Dspark::kBlock];
-        float h_prob[Dspark::kBlock];
+        float h_prob[Dspark::kBlock], h_qd[Dspark::kBlock];
         CK(cudaMemcpyAsync(h_tok, tok, sizeof(int) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_prob, prob, sizeof(float) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
+        if (drawn) CK(cudaMemcpyAsync(h_qd, qdd, sizeof(float) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
         if (!sync(err)) return false;
         if (o.profile) st.head_ms += now_ms() - tp0;
         float cum = 1.0f;
@@ -1299,9 +1461,17 @@ struct Dspark::Impl {
             if (h_tok[i] < 0 || cum < cum_min) break;
             toks.push_back(h_tok[i]);
             probs.push_back(h_prob[i]);
+            if (drawn) qds->push_back(h_qd[i]);
         }
         ++st.drafts;
         st.draft_ms += now_ms() - t0;
+        if (o.profile && st.drafts % 100 == 0) {   // (IK2_HIP_DSPARK_PROFILE=1: a line every 100 drafts, ms a draft)
+            const double nd = (double) st.drafts;
+            std::fprintf(stderr, "DSPARK PROFILE %lld drafts at %lld positions: a draft %.2f ms = embed %.2f + layers %.2f "
+                                 "(qkv %.2f attn %.2f o %.2f ffn %.2f) + base %.2f + head %.2f\n",
+                         (long long) st.drafts, (long long) n, st.draft_ms / nd, st.embed_ms / nd, st.layers_ms / nd,
+                         st.qkv_ms / nd, st.attn_ms / nd, st.o_ms / nd, st.ffn_ms / nd, st.base_ms / nd, st.head_ms / nd);
+        }
         return true;
     }
 };
@@ -1321,7 +1491,25 @@ bool Dspark::feed_dev(const float* d_taps, size_t ld, int n, int64_t pos0, std::
     return true;
 }
 bool Dspark::draft(int anchor, int max_n, std::vector<int>& toks, std::vector<float>& probs, std::string& err) {
-    return m->draft(anchor, max_n, toks, probs, err);
+    return m->draft(anchor, max_n, 0.0f, 0, toks, probs, nullptr, err);
+}
+bool Dspark::draft_drawn(int anchor, int max_n, float temp, unsigned long long seed, std::vector<int>& toks,
+                         std::vector<float>& probs, std::vector<float>& qd, std::string& err) {
+    return m->draft(anchor, max_n, temp, seed, toks, probs, &qd, err);
+}
+bool Dspark::draft_logits(int i, float* out, std::string& err) {
+    std::string& e = err;
+    if (i < 1 || i >= kBlock) {
+        e = "dspark: no draft " + std::to_string(i);
+        return false;
+    }
+    if (cudaSetDevice(m->dev) != cudaSuccess ||
+        cudaMemcpyAsync(out, m->lg + (size_t) (i - 1) * m->Vp, (size_t) m->Vu * 4, cudaMemcpyDeviceToHost, m->s) != cudaSuccess ||
+        cudaStreamSynchronize(m->s) != cudaSuccess) {
+        e = std::string("dspark: a draft's logits: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
 }
 void Dspark::rollback(int64_t pos) { m->end = std::max<int64_t>(0, std::min(m->end, pos)); }
 bool Dspark::add_states(int n, std::string& err) { return m->add_states(n, err); }

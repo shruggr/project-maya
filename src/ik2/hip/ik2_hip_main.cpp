@@ -298,9 +298,23 @@ struct Drafting {
     // IK2_HIP_MARGIN_LOG=1 (tests): a line a greedy token - the gap between the row's two largest logits (a near-tie
     // is where two runs whose experts sit differently may part)
     bool margins = std::getenv("IK2_HIP_MARGIN_LOG") != nullptr;
+    // IK2_HIP_DRAFT_FIXED_K=N (measurements): every round offers min(N, drafts made) drafts - no window choice, no cut on
+    // the drafts' running probability (the drafter makes all 7), no rests - as vLLM's fixed num_speculative_tokens, so its
+    // "acceptance length" (1 + kept / drafted rounds) can be read off.  0 (the default): the adaptive window as before
+    int fixed_k = (int) env_d("IK2_HIP_DRAFT_FIXED_K", 0);
+    // the drafts by their place in the round: reached (offered, every one before it kept) and kept; printed with the
+    // request's drafts line when IK2_HIP_DRAFT_POS=1 or a fixed k
+    long long reach[8] = {0, 0, 0, 0, 0, 0, 0, 0}, kept_at[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    bool pos_log = fixed_k > 0 || std::getenv("IK2_HIP_DRAFT_POS") != nullptr;
+    // IK2_HIP_DRAFT_DRAW=1: a sampled request (temperature > 0) gets drawn drafts - each a draw from the drafter's own
+    // softmax(logits / temperature), standing with probability min(1, p(d) / q(d)), else the token a draw from
+    // max(0, p - q) (speculative sampling: the answer is distributed as the target's own draws).  0: argmax drafts, each
+    // standing with probability p(d) (the rule before)
+    bool draw = env_d("IK2_HIP_DRAFT_DRAW", 0) != 0;
 
     double cost(int T) const { return a + b * (T - 1); }
     int choose(const std::vector<float>& p, int n) const {
+        if (fixed_k > 0) return std::min(fixed_k, n);
         int best = 0;
         double cum = 1.0, exp_tok = 1.0, best_rate = 1.0 / (cost(1) + t_draft);
         for (int k = 1; k <= n; ++k) {
@@ -320,6 +334,11 @@ struct Drafting {
     }
     void observe_round(bool was_drafted, int k, int kept, double t_draft_ms) {
         if (!was_drafted) return;
+        for (int i = 0; i < k && i < 8; ++i) {
+            if (i <= kept) ++reach[i];
+            if (i < kept) ++kept_at[i];
+        }
+        if (fixed_k > 0) return;   // (no rests)
         const double g = kept * a - (t_draft_ms + k * b);
         gain = n_d > 0 ? ema * gain + (1 - ema) * g : g;
         if (++n_d < warm) return;
@@ -400,6 +419,76 @@ bool verdict(const float* row, int V, const mm3::sample::Req& r, const std::vect
     return false;
 }
 
+// The request's distribution at a row of logits (mm3's chain: penalties, temperature, top_k, top_p, min_p) as
+// (token, probability) pairs - over the tokens within 40 temperature-nats of the top when nothing else cuts it (verdict's
+// plain path), sampled requests only
+std::vector<std::pair<int, double>> target_dist(const float* row, int V, const mm3::sample::Req& r, const std::vector<int>& hist) {
+    if (mm3::sample::penalised(r)) return mm3::sample::dist(row, V, r, hist);
+    int b = 0;
+    for (int i = 1; i < V; ++i)
+        if (row[i] > row[b]) b = i;
+    const float cut = row[b] - 40.0f * r.temperature;
+    if (!(r.top_k > 0) && !(r.top_p < 1.0f) && !(r.min_p > 0.0f)) {
+        std::vector<std::pair<int, double>> p;
+        const float it = 1.0f / r.temperature, mx = row[b];
+        double z = 0;
+        for (int i = 0; i < V; ++i)
+            if (row[i] >= cut) {
+                const double w = std::exp((double) ((row[i] - mx) * it));
+                p.push_back({i, w});
+                z += w;
+            }
+        for (auto& e : p) e.second /= z;
+        return p;
+    }
+    std::vector<std::pair<int, float>> c;
+    for (int i = 0; i < V; ++i)
+        if (row[i] >= cut) c.push_back({i, row[i]});
+    return mm3::sample::dist_c(std::move(c), {}, {}, r, hist);
+}
+
+// The verdict on a drawn draft d (draft number i, 1 ..) with q(d) = qd: it stands with probability min(1, p(d) / q(d));
+// else `next` is a draw from max(0, p - q) renormalised, q the drafter's softmax(lg_i / temperature) over the whole
+// vocabulary (its logits fetched for that row only).  -1: an error
+int verdict_drawn(ik2hip::Model& m, const float* row, int V, const mm3::sample::Req& r, const std::vector<int>& hist,
+                  std::mt19937_64& rng, int d, float qd, int i, int& next, std::string& err) {
+    const std::vector<std::pair<int, double>> p = target_dist(row, V, r, hist);
+    double pd = 0;
+    for (const auto& [t, q] : p)
+        if (t == d) pd = q;
+    const double a = qd > 0.0f ? std::min(1.0, pd / (double) qd) : 0.0;
+    static const bool check = std::getenv("IK2_HIP_DRAW_CHECK") != nullptr;   // (tests: q(d) on the host against the device's)
+    const bool stand = std::uniform_real_distribution<double>(0.0, 1.0)(rng) < a;
+    if (stand && !check) return 1;
+    static thread_local std::vector<float> ql;
+    ql.resize((size_t) V);
+    if (!m.draft_logits(i, ql.data(), err)) return -1;
+    float mx = ql[0];
+    for (int v = 1; v < V; ++v) mx = std::max(mx, ql[(size_t) v]);
+    const double it = 1.0 / (double) r.temperature;
+    double z = 0;
+    for (int v = 0; v < V; ++v) z += std::exp(((double) ql[(size_t) v] - mx) * it);
+    if (check) {
+        static double worst = 0, sum_q = 0, sum_p = 0;
+        static long long n = 0;
+        const double qh = std::exp(((double) ql[(size_t) d] - mx) * it) / z;
+        worst = std::max(worst, std::fabs(qh - qd) / std::max(1e-12, qh));
+        sum_q += qh;
+        sum_p += pd;
+        if (++n % 200 == 0)
+            std::fprintf(stderr, "DRAW CHECK %lld drafts: q(d) host vs device worst relative difference %.2e; mean q(d) %.3f, "
+                                 "mean p(d) %.3f\n", n, worst, sum_q / (double) n, sum_p / (double) n);
+    }
+    if (stand) return 1;
+    std::vector<std::pair<int, double>> res;
+    for (const auto& [t, pt] : p) {
+        const double qt = std::exp(((double) ql[(size_t) t] - mx) * it) / z;
+        if (pt > qt) res.push_back({t, pt - qt});
+    }
+    next = res.empty() ? mm3::sample::draw(p, rng) : mm3::sample::draw(res, rng);
+    return 0;
+}
+
 // One round after `tok`, the token at m.end() (given out, not read yet).  hist: the tokens before tok and tok (the
 // penalties' history).  room: the tokens the request may still give out (>= 1).  out: the tokens after tok - the drafts
 // that stood, then the model's next - the last of them the next round's tok; `read`: the rows the context took (tok and
@@ -413,16 +502,19 @@ bool draft_round(ik2hip::Model& m, Drafting& dr, int tok, const mm3::sample::Req
     const bool want_lg = sampled || dr.margins;
     const double t0 = now_s();
     std::vector<int> toks;
-    std::vector<float> probs;
+    std::vector<float> probs, qds;
     int k = 0;
     bool was_drafted = false;
+    const bool drawn = dr.draw && r.temperature > 0.0f;
     const long long ctx_room = m.max_ctx() - m.end();
     if (spec && dr.on && room > 1 && ctx_room > 2) {
         if (dr.rest > 0) {
             --dr.rest;
         } else {
             const int max_n = (int) std::min<long long>({7, room - 1, (long long) m.window_max() - 1, ctx_room - 1});
-            if (!m.draft(tok, max_n, toks, probs, err)) return false;
+            if (drawn ? !m.draft_drawn(tok, max_n, r.temperature, rng(), toks, probs, qds, err)
+                      : !m.draft(tok, max_n, toks, probs, err))
+                return false;
             const double td = (now_s() - t0) * 1e3;
             dr.t_draft = dr.ema * dr.t_draft + (1 - dr.ema) * td;
             dr.draft_ms += td;
@@ -451,6 +543,10 @@ bool draft_round(ik2hip::Model& m, Drafting& dr, int tok, const mm3::sample::Req
         if (!sampled) {
             ok = tops[i] == d;
             next = tops[i];
+        } else if (drawn && i < (int) qds.size()) {
+            const int v = verdict_drawn(m, lg.data() + (size_t) i * V, V, r, h2, rng, d, qds[(size_t) i], i + 1, next, err);
+            if (v < 0) return false;
+            ok = v == 1;
         } else {
             ok = verdict(lg.data() + (size_t) i * V, V, r, h2, rng, d, next);
         }
@@ -523,6 +619,7 @@ int serve(ik2hip::Model& m, const std::vector<int>& stops, int short_n, bool spe
     std::vector<float> lg((size_t) m.vocab());
     unsigned long long counter = 0;
     std::string err;
+    const bool gen_log = std::getenv("IK2_HIP_GEN_LOG") != nullptr;
     auto is_stop = [&](int t) { return std::find(stops.begin(), stops.end(), t) != stops.end(); };
     for (std::string line; lines.next(line);) {
         if (line == "QUIT") break;
@@ -543,6 +640,12 @@ int serve(ik2hip::Model& m, const std::vector<int>& stops, int short_n, bool spe
             continue;
         }
         const size_t n = r.ids.size();
+        if (gen_log) {   // (IK2_HIP_GEN_LOG=1: the request's keys as they came, and as read - the tokens left out)
+            const size_t sp = line.find_last_of(' ');
+            std::fprintf(stderr, "maya ik2 serve: GEN%s -> temperature %g top_p %g top_k %d min_p %g penalised %d seed %llu, %zu prompt tokens\n",
+                         sp != std::string::npos && sp > 3 ? line.substr(3, sp - 3).c_str() : "", r.temperature, r.top_p, r.top_k,
+                         r.min_p, mm3::sample::penalised(r) ? 1 : 0, (unsigned long long) r.seed, n);
+        }
         bool bad = false;
         for (int t : r.ids) bad = bad || t < 0 || t >= m.vocab();
         if (bad || (long long) n + std::max(0ll, r.max_new) > m.max_ctx()) {
@@ -615,7 +718,7 @@ int serve(ik2hip::Model& m, const std::vector<int>& stops, int short_n, bool spe
         dr.start();
         const Drafting d0 = dr;
         const bool spec = dr.on && (r.spec < 0 ? spec_default : r.spec != 0);
-        if (dr.on) m.set_draft_cum(cum);
+        if (dr.on) m.set_draft_cum(dr.fixed_k > 0 ? 0.0f : cum);
         // the answer's first token from the prompt's last row; then rounds: the token in hand read (with drafts, when
         // the drafter has some worth a window), the tokens after it given out
         int tok = want_lg ? sample(lg.data(), m.vocab(), r, held, rng) : m.top();
@@ -702,8 +805,16 @@ int serve(ik2hip::Model& m, const std::vector<int>& stops, int short_n, bool spe
                                  "k histogram", dr.accepted - d0.accepted, dr.offered - d0.offered, dr.drafted - d0.drafted,
                          dr.rounds - d0.rounds, (double) (dr.tokens - d0.tokens) / (double) std::max(1ll, dr.passes - d0.passes));
             for (int k = 0; k < 8; ++k) std::fprintf(stderr, " %lld", dr.khist[k] - d0.khist[k]);
-            std::fprintf(stderr, "; draft %.1f ms a round, a pass %.1f + %.1f ms a row, rests %lld\n", dr.t_draft, dr.a, dr.b,
+            std::fprintf(stderr, "; draft %.1f ms a round, a pass %.1f + %.1f ms a row, rests %lld", dr.t_draft, dr.a, dr.b,
                          dr.rested - d0.rested);
+            if (dr.pos_log) {
+                std::fprintf(stderr, "; by place kept/reached");
+                for (int i = 0; i < 7; ++i) std::fprintf(stderr, " %lld/%lld", dr.kept_at[i] - d0.kept_at[i], dr.reach[i] - d0.reach[i]);
+                if (dr.drafted > d0.drafted)
+                    std::fprintf(stderr, "; acceptance length %.2f (1 + kept a drafted round)",
+                                 1.0 + (double) (dr.accepted - d0.accepted) / (double) (dr.drafted - d0.drafted));
+            }
+            std::fprintf(stderr, "\n");
         }
         if (!m.save_profile(err)) std::fprintf(stderr, "ik2: the expert profile: %s\n", err.c_str());
     }

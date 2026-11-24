@@ -129,6 +129,11 @@ public:
     /// drafter's probability for each, cut where their running product falls under the cum floor.  None (true) when
     /// there is no drafter, or it does not hold the context's rows (a step with a tap or a pick hook ran).
     bool draft(int anchor, int max_n, std::vector<int>& toks, std::vector<float>& probs, std::string& err);
+    /// drawn drafts (Dspark::draft_drawn): each a draw from the drafter's softmax(lg / temp), qd its probability there;
+    /// draft_logits(i, out): draft i's logits (vocab() floats) for the verdict's residual
+    bool draft_drawn(int anchor, int max_n, float temp, unsigned long long seed, std::vector<int>& toks,
+                     std::vector<float>& probs, std::vector<float>& qd, std::string& err);
+    bool draft_logits(int i, float* out, std::string& err);
     void set_draft_cum(float c);
     double dspark_vram_gb() const;
     /// Back to an empty context (position 0)
