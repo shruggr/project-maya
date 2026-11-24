@@ -318,6 +318,21 @@ struct Drafting {
     // ((1 - p) summed) over the drafts reached, both decayed by cal_ema a draft (IK2_HIP_DRAFT_CAL_EMA, 0.995), m within
     // [0.25, 4].  0 (the default): the drafter's own probabilities as before
     bool cal = env_d("IK2_HIP_DRAFT_CAL", 0) != 0;
+    // IK2_HIP_DRAFT_CAL=2: the scale a cell - mode x draft place (0..7) x the draft's probability in tenths - each with a
+    // prior of cal_prior misses predicted and seen (IK2_HIP_DRAFT_CAL_PRIOR, 2) and decayed by cal_ema an observation of
+    // the cell; a draft's p' = 1 - m_cell (1 - p).  (CAL=1's one scale a mode made temperature 1 slower: drawn drafts
+    // settled at 4.2, which no draft's p survives)
+    bool cal_bins = env_d("IK2_HIP_DRAFT_CAL", 0) == 2;
+    double cal_prior = env_d("IK2_HIP_DRAFT_CAL_PRIOR", 2.0);
+    double cb_pm[3][8][10], cb_om[3][8][10];
+    long long cb_n[3][8][10] = {};
+    static int cbin(double p) { return std::min(9, std::max(0, (int) (p * 10.0))); }
+    double cal_p(int i, double p) const {   // (the calibrated probability of the round's draft at place i)
+        if (!cal_bins || mode > 2) return std::max(0.0, 1.0 - miss_scale() * (1.0 - p));
+        const int b = cbin(p), at = std::min(i, 7);
+        const double m = std::min(20.0, std::max(0.05, cb_om[mode][at][b] / cb_pm[mode][at][b]));
+        return std::min(1.0, std::max(0.0, 1.0 - m * (1.0 - p)));
+    }
     double cal_ema = env_d("IK2_HIP_DRAFT_CAL_EMA", 0.995);
     double cal_pm[4] = {20, 20, 20, 4}, cal_om[4] = {20, 20, 20, 4};   // (a prior of 20 misses predicted and seen: m = 1; lookup 4)
     int mode = 0;                                                // (the round's: draft_round sets it; 3 prompt lookup)
@@ -336,6 +351,14 @@ struct Drafting {
     long long looked = 0, look_off = 0, look_kept = 0;
     void cal_observe(const std::vector<float>& p, int k, int kept) {
         const double e = mode == 3 ? look_ema : cal_ema;
+        if (cal_bins && mode <= 2)
+            for (int i = 0; i < k && i <= kept; ++i) {
+                const double pi = std::min(1.0, std::max(0.0, (double) p[(size_t) i]));
+                const int b = cbin(pi), at = std::min(i, 7);
+                cb_pm[mode][at][b] = e * cb_pm[mode][at][b] + (1.0 - pi);
+                cb_om[mode][at][b] = e * cb_om[mode][at][b] + (i == kept ? 1.0 : 0.0);
+                ++cb_n[mode][at][b];
+            }
         for (int i = 0; i < k && i <= kept; ++i) {
             cal_pm[mode] = e * cal_pm[mode] + (1.0 - std::min(1.0, std::max(0.0, (double) p[(size_t) i])));
             cal_om[mode] = e * cal_om[mode] + (i == kept ? 1.0 : 0.0);
@@ -348,10 +371,9 @@ struct Drafting {
         if (td < 0) td = t_draft;
         int best = 0;
         double cum = 1.0, exp_tok = 1.0, best_rate = 1.0 / (cost(1) + td);
-        const double ms = miss_scale();
         for (int k = 1; k <= n; ++k) {
             const double pk = std::min(1.0, std::max(0.0, (double) p[(size_t) k - 1]));
-            cum *= cal || mode == 3 ? std::max(0.0, 1.0 - ms * (1.0 - pk)) : pk;
+            cum *= cal || mode == 3 ? cal_p(k - 1, pk) : pk;
             exp_tok += cum;
             const double rate = exp_tok / (cost(k + 1) + td);
             if (rate > best_rate) {
@@ -390,6 +412,10 @@ struct Drafting {
         } else if (gain > reset_gain * a) {
             rest_len = rest_len0;
         }
+    }
+    Drafting() {
+        for (auto& a3 : cb_pm) for (auto& a2 : a3) for (double& v : a2) v = cal_prior;   // (the prior: m = 1)
+        for (auto& a3 : cb_om) for (auto& a2 : a3) for (double& v : a2) v = cal_prior;
     }
     void start() {   // (a request's first round: no rest left over from the last one)
         sd_fresh = true;
@@ -880,6 +906,17 @@ int serve(ik2hip::Model& m, const std::vector<int>& stops, int short_n, bool spe
             std::fprintf(stderr, "; draft %.1f ms a round, a pass %.1f + %.1f ms a row, rests %lld", dr.t_draft, dr.a, dr.b,
                          dr.rested - d0.rested);
             if (dr.pos_log) {
+                // (the request's own mean draft time - "draft ... a round" above is the running estimate at its end)
+                if (dr.drafted > d0.drafted)
+                    std::fprintf(stderr, "; draft mean %.2f ms", (dr.draft_ms - d0.draft_ms) / (double) (dr.drafted - d0.drafted));
+                if (dr.cal_bins)
+                    for (int md = 0; md < 3; ++md) {
+                        long long nn = 0;
+                        for (int b = 0; b < 10; ++b) nn += dr.cb_n[md][0][b];
+                        if (nn == 0) continue;
+                        std::fprintf(stderr, "; cal mode %d place 1 m by tenth", md);
+                        for (int b = 0; b < 10; ++b) std::fprintf(stderr, " %.2f", dr.cb_om[md][0][b] / dr.cb_pm[md][0][b]);
+                    }
                 if (dr.cal) std::fprintf(stderr, "; miss scale %.2f / %.2f / %.2f", dr.cal_om[0] / dr.cal_pm[0], dr.cal_om[1] / dr.cal_pm[1], dr.cal_om[2] / dr.cal_pm[2]);
                 if (dr.lookup_min > 0)
                     std::fprintf(stderr, "; lookup %lld rounds, %lld of %lld kept, miss scale %.2f", dr.looked - d0.looked,
