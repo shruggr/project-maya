@@ -2,7 +2,9 @@
 #include "ik2_hip_lane.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +30,37 @@ struct LaneProf {
     }
     double bytes_per_expert = 0;
 } g_lp;
+// The int8 rows (Q8_K: a scale and sums a 256-value block, each block its own) a few blocks a work item over the lane's
+// threads instead of a row a thread (IK2_HIP_LANE_OLD=1: as before; IK2_HIP_LANE_CHECK=1: each split row checked
+// against the whole row's, the differing rows counted at the exit)
+struct QuantCheck {
+    bool on = std::getenv("IK2_HIP_LANE_CHECK") != nullptr;
+    std::atomic<long long> rows{0}, bad{0};
+    ~QuantCheck() {
+        if (on) std::fprintf(stderr, "LANE_CHECK %lld rows split, %lld differing from the whole row's\n", rows.load(), bad.load());
+    }
+} g_qc;
+constexpr int kQuantBlocks = 3;   // (256-value blocks a work item)
+void quant_split(hy4::Lane& lane, int act, const float* const* src, void* const* dst, int nrows, int k, size_t bytes) {
+    const int nbk = k / 256, nch = (nbk + kQuantBlocks - 1) / kQuantBlocks;
+    const size_t bsz = bytes / (size_t) nbk;
+    lane.parallel_for(nrows * nch, [&](int it) {
+        const int r = it / nch, b0 = (it % nch) * kQuantBlocks, b1 = std::min(nbk, b0 + kQuantBlocks);
+        iqc::iq_cpu_quant(act, src[r] + (size_t) b0 * 256, (b1 - b0) * 256, (uint8_t*) dst[r] + (size_t) b0 * bsz);
+    });
+    if (g_qc.on) {
+        std::vector<uint8_t> whole(bytes);
+        for (int r = 0; r < nrows; ++r) {
+            iqc::iq_cpu_quant(act, src[r], k, whole.data());
+            ++g_qc.rows;
+            if (std::memcmp(whole.data(), dst[r], bytes) != 0) ++g_qc.bad;
+        }
+    }
+}
+bool quant_splits(int k, size_t bytes) {
+    static const bool old = std::getenv("IK2_HIP_LANE_OLD") != nullptr;
+    return !old && k % 256 == 0 && bytes % (size_t) (k / 256) == 0;
+}
 inline double lp_now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 constexpr int kRowChunk = 128;   // rows a work item
 struct Scratch {
@@ -178,8 +211,20 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
         bool used[64] = {};   // (at least kWin, 9 rows)
         for (const CpuRowEntry& e : entries)
             if (e.row >= 0 && e.row < 64) used[e.row] = true;
-        for (int t = 0; t < T && t < 64; ++t)
-            if (used[t]) iqc::iq_cpu_quant(f.gu_act, x + (size_t) t * E, E, sc.act.data() + (size_t) t * f.act_bytes);
+        if (quant_splits(E, f.act_bytes)) {
+            const float* src[64];
+            void* dst[64];
+            int nr = 0;
+            for (int t = 0; t < T && t < 64; ++t)
+                if (used[t]) {
+                    src[nr] = x + (size_t) t * E;
+                    dst[nr++] = sc.act.data() + (size_t) t * f.act_bytes;
+                }
+            quant_split(lane, f.gu_act, src, dst, nr, E, f.act_bytes);
+        } else {
+            for (int t = 0; t < T && t < 64; ++t)
+                if (used[t]) iqc::iq_cpu_quant(f.gu_act, x + (size_t) t * E, E, sc.act.data() + (size_t) t * f.act_bytes);
+        }
         if (g_lp.on) {
             ++g_lp.calls;
             g_lp.ents += n;
@@ -197,9 +242,19 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
         iqc::iq_cpu_gate_up(f, gate, gate + (size_t) F * f.gu_row, sc.ap.data() + q0, nt, sc.gp.data() + q0, r0, r1, 0.0f);
     });
     lap(1);
-    lane.parallel_for(n, [&](int i) {
-        iqc::iq_cpu_quant(f.d_act, sc.gu.data() + (size_t) i * 2 * F, F, sc.hq.data() + (size_t) i * f.h_bytes);
-    });
+    if (quant_splits(F, f.h_bytes) && n <= 256) {
+        const float* src[256];
+        void* dst[256];
+        for (int i = 0; i < n; ++i) {
+            src[i] = sc.gu.data() + (size_t) i * 2 * F;
+            dst[i] = sc.hq.data() + (size_t) i * f.h_bytes;
+        }
+        quant_split(lane, f.d_act, src, dst, n, F, f.h_bytes);
+    } else {
+        lane.parallel_for(n, [&](int i) {
+            iqc::iq_cpu_quant(f.d_act, sc.gu.data() + (size_t) i * 2 * F, F, sc.hq.data() + (size_t) i * f.h_bytes);
+        });
+    }
     lap(2);
     lane.parallel_for(U * dn_chunks, [&](int it) {
         const int u = it / dn_chunks, r0 = (it % dn_chunks) * kRowChunk, r1 = std::min(E, r0 + kRowChunk);

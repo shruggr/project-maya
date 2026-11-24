@@ -95,6 +95,7 @@ struct Mat {
 
 struct Layer {
     int il = 0, gpu = -1;
+    std::vector<int> lp_prev[2];   // (IK2_HIP_LANE_PROF: the RAM experts the lane computed the last two times)
     bool swa = true;
     float *attn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr, *v_norm = nullptr;
     float *attn_res = nullptr, *ffn_res = nullptr, *ffn_norm = nullptr;
@@ -412,6 +413,11 @@ struct Model::Impl {
                                  "the lane's work %.2f ms, the lane waiting for routes %.2f ms\n", 1e3 * fast_s / fast_n,
                          1e3 * fast_enq_s / fast_n / std::max<size_t>(1, G.size()), 1e3 * lane_work_s / fast_n,
                          1e3 * lane_wait_s / fast_n);
+        if (lane_prof && lp_reuse[2] > 0)
+            std::fprintf(stderr, "LANE_REUSE %lld RAM experts computed; %.1f%% of them the same layer's last time, %.1f%% "
+                                 "within its last two (the last time: %.2f a layer)\n", lp_reuse[2],
+                         100.0 * lp_reuse[0] / lp_reuse[2], 100.0 * lp_reuse[1] / lp_reuse[2],
+                         (double) lp_reuse[3] / (double) std::max<long long>(1, lp_n));
         if (phases && fast_n > 0) {
             static const char* nm[10] = {"", "mix + rms", "input projections", "convs + clips + cache rows", "attention",
                                          "gate + output + residual", "mix + rms + router + publish + plan", "GPU experts + sum",
@@ -1918,6 +1924,8 @@ struct Model::Impl {
     unsigned *f_pub = nullptr, *f_cpu = nullptr, *f_hand = nullptr;   // (mapped host memory: a line a flag)
     static constexpr int kLine = 16;   // (16 unsigned = 64 bytes, a cache line: each flag on its own line)
     double fast_s = 0, fast_enq_s = 0, lane_work_s = 0, lane_wait_s = 0;
+    const bool lane_prof = std::getenv("IK2_HIP_LANE_PROF") != nullptr;
+    long long lp_reuse[4] = {0, 0, 0, 0}, lp_n = 0;
     int64_t fast_n = 0;
     bool fast_ready = false;
     // IK2_HIP_PHASES=1 (tests): device-side marks between a layer's phases in the host-free step (events on the
@@ -2029,6 +2037,22 @@ struct Model::Impl {
                     }
                     // (the rows' RAM picks together: an expert several rows picked is read once for them)
                     n_ent = rent.size();
+                    if (lane_prof) {   // (how many of these RAM experts the lane computed at this layer the last time / two)
+                        std::vector<int> cur;
+                        for (const CpuRowEntry& e : rent)
+                            if (std::find(cur.begin(), cur.end(), e.slot) == cur.end()) cur.push_back(e.slot);
+                        for (int e : cur) {
+                            const bool h1 = std::find(l.lp_prev[0].begin(), l.lp_prev[0].end(), e) != l.lp_prev[0].end();
+                            const bool h2 = h1 || std::find(l.lp_prev[1].begin(), l.lp_prev[1].end(), e) != l.lp_prev[1].end();
+                            lp_reuse[0] += h1;
+                            lp_reuse[1] += h2;
+                        }
+                        lp_reuse[2] += (long long) cur.size();
+                        ++lp_n;
+                        lp_reuse[3] += (long long) l.lp_prev[0].size();
+                        l.lp_prev[1] = std::move(l.lp_prev[0]);
+                        l.lp_prev[0] = std::move(cur);
+                    }
                     if (rent.empty()) std::memset(l.m_cpu, 0, sizeof(float) * (size_t) E * (size_t) Tn);
                     else if (dbg & 4) {   // (tests: a row at a time)
                         std::vector<CpuRowEntry> one;
