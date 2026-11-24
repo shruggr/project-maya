@@ -3663,6 +3663,14 @@ struct Model::Impl {
             std::fprintf(stderr, "maya-ik2: prompt hash %016llx (%d tokens from %lld, top %d; prefetched experts %lld "
                          "routed to, %lld not)\n", (unsigned long long) h, n, (long long) p0, top_id, (long long) hit,
                          (long long) miss);
+            if (const char* dir = std::getenv("IK2_HIP_PROMPT_LOGITS")) {   // (tests: the logits themselves, F32)
+                static int k = 0;
+                const std::string f = std::string(dir) + "/logits-" + std::to_string(k++) + "-" + std::to_string(n) + ".f32";
+                if (FILE* fp = std::fopen(f.c_str(), "wb")) {
+                    std::fwrite(lg.data(), sizeof(float), lg.size(), fp);
+                    std::fclose(fp);
+                }
+            }
         }
         st.tokens += n;
         return true;
