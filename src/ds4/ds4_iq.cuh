@@ -176,6 +176,11 @@ struct MvJob {
     float alpha = 1.0f;
 };
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// One Q6_K or Q8_0 job of up to 8 columns as mv's (the same bits), its columns read from LDS: grid blocks of `threads`
+/// (grid <= 0: a row a warp), each copying the columns in once (mv_lds_bytes of LDS, at most 64 KiB, xq 16-byte
+/// aligned).  false: a job it does not take (nothing launched).
+size_t mv_lds_bytes(const MvJob& b);
+bool mv_lds(const MvJob& b, int grid, int threads, cudaStream_t s);
 /// H jobs alike but for their offsets, in one launch (a 3D matrix's heads): job h = b with w + h w_stride (bytes),
 /// xq + h xq_stride, xd + h xd_stride, y + h y_stride; each row's sums as mv's.  false: a type or size mv refuses.
 bool mv_heads(const MvJob& b, int H, size_t w_stride, size_t xq_stride, size_t xd_stride, size_t y_stride,
