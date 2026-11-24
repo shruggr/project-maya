@@ -981,6 +981,12 @@ struct Dspark::Impl {
     size_t tok_row = 0;
     int tok_type = 0;
     std::vector<float> h_x;
+    // IK2_HIP_DSPARK_PINNED (default 1; 0: pageable as before): a draft's host copies (the anchor's embedding row, the
+    // anchor, the running probability's 1, the picks back) through pinned buffers - pageable ones are staged by the
+    // runtime and hold the host until done
+    bool pinned_on = !(std::getenv("IK2_HIP_DSPARK_PINNED") && std::atoi(std::getenv("IK2_HIP_DSPARK_PINNED")) == 0);
+    float* pin_x = nullptr;   // E floats, then the anchor (as int bits) and 1.0f
+    int* pin_out = nullptr;   // the picks: tok [kBlock], prob [kBlock], qd [kBlock] (float bits)
     int64_t end = 0, hi = -1;   // the context's end; the furthest position ever fed (what the rings have overwritten)
     float cum_min = 0.5f;
     bool fuse = !(std::getenv("IK2_HIP_DSPARK_FUSE") && std::atoi(std::getenv("IK2_HIP_DSPARK_FUSE")) == 0);
@@ -1099,6 +1105,8 @@ struct Dspark::Impl {
         if (s != nullptr || !allocs.empty()) {
             (void) cudaSetDevice(dev);
             for (void* p : allocs) (void) cudaFree(p);
+            if (pin_x != nullptr) (void) cudaFreeHost(pin_x);
+            if (pin_out != nullptr) (void) cudaFreeHost(pin_out);
             if (blas != nullptr) (void) cublasDestroy(blas);
             if (s != nullptr) (void) cudaStreamDestroy(s);
         }
@@ -1295,6 +1303,7 @@ struct Dspark::Impl {
         q8s_lds_grid = 0;
         std::vector<float> ref, got;
         layer(L[0]);
+        CK(cudaStreamSynchronize(s));   // (the copies below are on the null stream)
         if (!grab(ref)) return false;
         double t0 = 0, best = 0;
         if (!timed(t0)) return false;
@@ -1554,6 +1563,13 @@ struct Dspark::Impl {
             tok_embd = tp.data(*t);
             tok_row = (size_t) t->bytes / (size_t) Vp;
             h_x.resize((size_t) E);
+            if (pinned_on && (cudaMallocHost((void**) &pin_x, ((size_t) E + 2) * 4) != cudaSuccess ||
+                              cudaMallocHost((void**) &pin_out, (size_t) 3 * Dspark::kBlock * 4) != cudaSuccess)) {
+                (void) cudaGetLastError();
+                if (pin_x) (void) cudaFreeHost(pin_x);
+                pin_x = nullptr;
+                pin_out = nullptr;
+            }
             if (!alloc(tok_norm, (size_t) E, err) || !h2d(tok_norm, tp.data(*tn), tn->bytes, err)) return false;
             if (o.output_dev != nullptr) {
                 out.w = o.output_dev;
@@ -1917,22 +1933,32 @@ struct Dspark::Impl {
         CK(cudaSetDevice(dev));
         const int HD = H * D, KD = Hkv * D;
         const float one = 1.0f;
+        const bool pin = pin_x != nullptr && pin_out != nullptr;
         // ---- the rows: the anchor's normed embedding, then the mask embedding
         {
             const uint8_t* row = tok_embd + (size_t) anchor * tok_row;
-            if (tok_type == kQ5K) dequantize_row_q5_K(row, h_x.data(), E);
-            else if (tok_type == iq::kQ6_K) dequantize_row_q6_K(row, h_x.data(), E);
-            else std::memcpy(h_x.data(), row, (size_t) E * 4);
+            float* hx = pin ? pin_x : h_x.data();   // (pinned: the last draft's copies are done - it synced at its end)
+            if (tok_type == kQ5K) dequantize_row_q5_K(row, hx, E);
+            else if (tok_type == iq::kQ6_K) dequantize_row_q6_K(row, hx, E);
+            else std::memcpy(hx, row, (size_t) E * 4);
             if (wall) {
                 t_pre = now_ms() - t0;
                 CK(cudaEventRecord(w0, s));
             }
-            CK(cudaMemcpyAsync(emb, h_x.data(), (size_t) E * 4, cudaMemcpyHostToDevice, s));
+            const int* h_anchor = &anchor;
+            const float* h_one = &one;
+            if (pin) {
+                std::memcpy(pin_x + E, &anchor, 4);
+                pin_x[E + 1] = 1.0f;
+                h_anchor = (const int*) (pin_x + E);
+                h_one = pin_x + E + 1;
+            }
+            CK(cudaMemcpyAsync(emb, hx, (size_t) E * 4, cudaMemcpyHostToDevice, s));
             CK(cudaMemcpyAsync(x, x0, (size_t) B * E * 4, cudaMemcpyDeviceToDevice, s));
             ik2hip::k::rms(emb, (size_t) E, 1, E, tok_norm, eps, x, (size_t) E, s);
-            CK(cudaMemcpyAsync(tok, &anchor, sizeof(int), cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(tok, h_anchor, sizeof(int), cudaMemcpyHostToDevice, s));
             CK(cudaMemsetAsync(state, 0, (size_t) R * 4, s));
-            CK(cudaMemcpyAsync(cumd, &one, 4, cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(cumd, h_one, 4, cudaMemcpyHostToDevice, s));
             half_to_float_kernel<<<blocks_of((size_t) E), 256, 0, s>>>((const __half*) fring + (size_t) ((n - 1) % FR) * E, E, ctx);
             check("ctx");
         }
@@ -2034,8 +2060,11 @@ struct Dspark::Impl {
             }
         }
         check("head");
-        int h_tok[Dspark::kBlock];
-        float h_prob[Dspark::kBlock], h_qd[Dspark::kBlock];
+        int h_tok_s[Dspark::kBlock];
+        float h_prob_s[Dspark::kBlock], h_qd_s[Dspark::kBlock];
+        int* h_tok = pin ? pin_out : h_tok_s;
+        float* h_prob = pin ? (float*) (pin_out + Dspark::kBlock) : h_prob_s;
+        float* h_qd = pin ? (float*) (pin_out + 2 * Dspark::kBlock) : h_qd_s;
         CK(cudaMemcpyAsync(h_tok, tok, sizeof(int) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_prob, prob, sizeof(float) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
         if (drawn) CK(cudaMemcpyAsync(h_qd, qdd, sizeof(float) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
