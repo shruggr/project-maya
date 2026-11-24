@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -231,11 +232,132 @@ bool parse_gen(const std::string& line, mm3::sample::Req& r, float& cum, std::ve
     return !r.ids.empty();
 }
 
+// ---- plain sampling's row work in parallel (IK2_HIP_SAMPLE_THREADS, default 8; 0 or 1: one thread as before).  A
+// sampled round's host time is mostly the vocabulary-wide loops (measured on a laptop CPU: a sample and a target
+// distribution over 200,058 logits 2.6 ms).  The row splits into kRowChunks fixed chunks: the argmax and the weights
+// are the one-thread loop's values exactly (the first of equal maxima); the total sums the chunks' sums in order, and
+// a draw finds its chunk by those sums and then walks the chunk - the one-thread result but for a draw landing within
+// a rounding of a chunk's edge.  The workers sleep between rows (the CPU lane's threads need the cores in a pass)
+constexpr int kRowChunks = 16;
+struct RowPool {
+    int n = 0;
+    std::vector<std::thread> th;
+    std::mutex mu;
+    std::condition_variable cv, done_cv;
+    const std::function<void(int)>* job = nullptr;
+    std::atomic<int> next{0};
+    int done = 0;
+    long long gen = 0;
+    bool quit = false;
+    explicit RowPool(int threads) : n(threads) {
+        for (int t = 1; t < n; ++t)
+            th.emplace_back([this] {
+                long long seen = 0;
+                for (;;) {
+                    const std::function<void(int)>* f;
+                    {
+                        std::unique_lock<std::mutex> lk(mu);
+                        cv.wait(lk, [&] { return quit || gen != seen; });
+                        if (quit) return;
+                        seen = gen;
+                        f = job;
+                    }
+                    for (int c; (c = next.fetch_add(1)) < kRowChunks;) (*f)(c);
+                    std::lock_guard<std::mutex> lk(mu);
+                    if (++done == n - 1) done_cv.notify_one();
+                }
+            });
+    }
+    ~RowPool() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            quit = true;
+        }
+        cv.notify_all();
+        for (auto& t : th) t.join();
+    }
+    void run(const std::function<void(int)>& f) {   // f(chunk) for every chunk, this thread working too
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            job = &f;
+            next = 0;
+            done = 0;
+            ++gen;
+        }
+        cv.notify_all();
+        for (int c; (c = next.fetch_add(1)) < kRowChunks;) f(c);
+        std::unique_lock<std::mutex> lk(mu);
+        done_cv.wait(lk, [&] { return done == n - 1; });
+    }
+};
+RowPool* row_pool() {
+    static const int nt = std::getenv("IK2_HIP_SAMPLE_THREADS") ? std::atoi(std::getenv("IK2_HIP_SAMPLE_THREADS")) : 8;
+    static RowPool* p = nt > 1 ? new RowPool(nt) : nullptr;
+    return p;
+}
+// the row's argmax (the first of equal maxima), the weights w[i] = exp((row[i] - mx) / T) at or above the cut (else 0),
+// each chunk's sum and the total (the chunks' sums in order); false: no pool (the caller's one-thread loops)
+bool row_soft(const float* row, int V, float temperature, std::vector<float>& w, int& b, double* cs, double& z) {
+    RowPool* pool = row_pool();
+    if (pool == nullptr) return false;
+    w.resize((size_t) V);
+    const int per = (V + kRowChunks - 1) / kRowChunks;
+    int cb[kRowChunks];
+    pool->run([&](int c) {
+        const int i0 = c * per, i1 = std::min(V, i0 + per);
+        int bb = i0;
+        for (int i = i0 + 1; i < i1; ++i)
+            if (row[i] > row[bb]) bb = i;
+        cb[c] = bb;
+    });
+    b = cb[0];
+    for (int c = 1; c < kRowChunks && c * per < V; ++c)
+        if (row[cb[c]] > row[b]) b = cb[c];
+    const float it = 1.0f / temperature, mx = row[b], cut = row[b] - 40.0f * temperature;
+    pool->run([&](int c) {
+        const int i0 = c * per, i1 = std::min(V, i0 + per);
+        double zc = 0;
+        for (int i = i0; i < i1; ++i) zc += (w[(size_t) i] = row[i] >= cut ? std::exp((row[i] - mx) * it) : 0.0f);
+        cs[c] = zc;
+    });
+    z = 0;
+    for (int c = 0; c < kRowChunks; ++c) z += (c * per < V ? cs[c] : (cs[c] = 0.0));
+    return true;
+}
+// a draw by u in [0, total): the first i (not `skip`) whose running sum of w reaches u, the chunks' sums skipping the
+// chunks before it; -1: none
+int row_draw(const std::vector<float>& w, int V, const double* cs, double u, int skip) {
+    const int per = (V + kRowChunks - 1) / kRowChunks;
+    int c = 0;
+    for (; c < kRowChunks - 1; ++c) {
+        const double sc = cs[c] - (skip >= c * per && skip < (c + 1) * per ? (double) w[(size_t) skip] : 0.0);
+        if (u - sc <= 0) break;
+        u -= sc;
+    }
+    int last = -1;
+    for (int i = c * per; i < V; ++i) {
+        if (i == skip || !(w[(size_t) i] > 0)) continue;
+        last = i;
+        u -= w[(size_t) i];
+        if (u <= 0) return i;
+    }
+    return last;
+}
+
 // The next token from a row of logits (the padded vocabulary rows are not in it): greedy without a temperature; else
 // mm3's distribution (temperature, top_k, top_p, min_p, the penalties) over the tokens within 40 temperature-nats of
 // the top - the rest hold under 1e-12 of the mass - or over the whole row when a penalty may move any of them
 int sample(const float* row, int V, const mm3::sample::Req& r, const std::vector<int>& hist, std::mt19937_64& rng) {
     if (mm3::sample::penalised(r)) return mm3::sample::draw(mm3::sample::dist(row, V, r, hist), rng);
+    if (r.temperature > 0.0f && !(r.top_k > 0) && !(r.top_p < 1.0f) && !(r.min_p > 0.0f)) {   // (the pool's loops)
+        static thread_local std::vector<float> wp;
+        double cs[kRowChunks], z = 0;
+        int b = 0;
+        if (row_soft(row, V, r.temperature, wp, b, cs, z)) {
+            const int t = row_draw(wp, V, cs, std::uniform_real_distribution<double>(0.0, z)(rng), -1);
+            return t >= 0 ? t : b;
+        }
+    }
     int b = 0;
     for (int i = 1; i < V; ++i)
         if (row[i] > row[b]) b = i;
@@ -296,6 +418,7 @@ struct Drafting {
     long long rounds = 0, drafted = 0, offered = 0, accepted = 0, passes = 0, tokens = 0, khist[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     long long rested = 0;
     double draft_ms = 0, verify_ms = 0;
+    double host_ms = 0;   // (a round's wall time less its draft and its pass: the verdicts, sampling, the bookkeeping)
     bool log = std::getenv("IK2_HIP_ROUND_LOG") != nullptr;
     // IK2_HIP_MARGIN_LOG=1 (tests): a line a greedy token - the gap between the row's two largest logits (a near-tie
     // is where two runs whose experts sit differently may part)
@@ -441,6 +564,18 @@ bool verdict(const float* row, int V, const mm3::sample::Req& r, const std::vect
         return next == d;
     }
     if (!pen && !(r.top_k > 0) && !(r.top_p < 1.0f) && !(r.min_p > 0.0f)) {   // (plain sampling: the softmax itself)
+        {
+            static thread_local std::vector<float> wp;
+            double cs[kRowChunks], z = 0;
+            int b = 0;
+            if (row_soft(row, V, r.temperature, wp, b, cs, z)) {   // (the pool's loops: the same draws as below)
+                const double wd = d >= 0 && d < V ? (double) wp[(size_t) d] : 0.0;
+                if (std::uniform_real_distribution<double>(0.0, 1.0)(rng) < wd / z) return true;
+                const int t = row_draw(wp, V, cs, std::uniform_real_distribution<double>(0.0, z - wd)(rng), d);
+                next = t >= 0 ? t : b;
+                return false;
+            }
+        }
         int b = 0;
         for (int i = 1; i < V; ++i)
             if (row[i] > row[b]) b = i;
@@ -669,6 +804,7 @@ bool draft_round(ik2hip::Model& m, Drafting& dr, int tok, const mm3::sample::Req
     if (acc < k && !m.keep(acc + 1, err)) return false;
     for (int i = 0; i < acc; ++i) out.push_back(toks[(size_t) i]);
     out.push_back(next);
+    dr.host_ms += (now_s() - t0) * 1e3 - (t1 - t0) * 1e3 - tv;
     ++dr.rounds;
     ++dr.passes;
     dr.tokens += acc + 1;
@@ -909,6 +1045,8 @@ int serve(ik2hip::Model& m, const std::vector<int>& stops, int short_n, bool spe
                 // (the request's own mean draft time - "draft ... a round" above is the running estimate at its end)
                 if (dr.drafted > d0.drafted)
                     std::fprintf(stderr, "; draft mean %.2f ms", (dr.draft_ms - d0.draft_ms) / (double) (dr.drafted - d0.drafted));
+                if (dr.rounds > d0.rounds)
+                    std::fprintf(stderr, "; host %.2f ms a round", (dr.host_ms - d0.host_ms) / (double) (dr.rounds - d0.rounds));
                 if (dr.cal_bins)
                     for (int md = 0; md < 3; ++md) {
                         long long nn = 0;
