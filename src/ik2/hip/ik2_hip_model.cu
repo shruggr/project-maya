@@ -347,6 +347,8 @@ struct Model::Impl {
         bool pf_split = true;
         int pf_part_expert = 16;
         int pf_prefetch = 24;   // (prefetch: RAM experts a layer copied ahead, IK2_HIP_PF_PREFETCH; 0: none)
+        int pf_small_chunk = 0;           // (prompt: the chunk below pf_small_until, IK2_HIP_PF_SMALL_CHUNK; 0: none)
+        int64_t pf_small_until = 8192;    // (IK2_HIP_PF_SMALL_UNTIL)
     } tn;
     void retune() {
         tn.cache_decay = env_d("IK2_HIP_CACHE_DECAY", 0.9, 0.0, 1.0);
@@ -367,6 +369,8 @@ struct Model::Impl {
         tn.pf_split = std::getenv("IK2_HIP_PF_SPLIT_OLD") == nullptr;
         tn.pf_part_expert = (int) env_d("IK2_HIP_PF_PART_EXPERT", 16, 0, 1 << 20);
         tn.pf_prefetch = (int) env_d("IK2_HIP_PF_PREFETCH", 24, 0, 384);
+        tn.pf_small_chunk = (int) env_d("IK2_HIP_PF_SMALL_CHUNK", 0, 0, 1 << 20);
+        tn.pf_small_until = (int64_t) env_d("IK2_HIP_PF_SMALL_UNTIL", 8192, 0, 1e12);
     }
     // streamed experts a pass, in two buffers: one is copied while the other's experts run - fewer passes against
     // 2 x kStage blobs of VRAM (IK2_HIP_STAGE).  Measured, 2048-token chunks, tok/s at 24 / 48 / 64 / 96: a 20K prompt
@@ -1078,6 +1082,12 @@ struct Model::Impl {
     // sets) pays seconds more, here and not in the first prompt
     bool warm_up(std::string& err, bool dummy = true) {
         if (Tc <= 1 || std::getenv("IK2_HIP_NO_WARMUP")) return true;
+        struct Keep {   // (the warm-up's prompts in whole chunks of Tc: IK2_HIP_PF_SMALL_CHUNK set aside)
+            int& r;
+            int v;
+            ~Keep() { r = v; }
+        } keep_sc{tn.pf_small_chunk, tn.pf_small_chunk};
+        tn.pf_small_chunk = 0;
         const double t0 = now_s();
         if (!dummy) {
             const std::vector<uint32_t> keep = prof_cnt;
@@ -3576,9 +3586,16 @@ struct Model::Impl {
         const int tc = run_chunk > 0 ? std::min(run_chunk, Tc) : Tc;
         // the chunks end at the multiples of tc from position 0, wherever the prompt starts: a prompt read on from a
         // saved chunk start takes the chunks - and so the arithmetic, to the bit - of the same prompt read from 0
+        // (IK2_HIP_PF_SMALL_CHUNK=s with a larger chunk: the positions below IK2_HIP_PF_SMALL_UNTIL - rounded up to a
+        //  multiple of tc - in chunks of s, those after it of tc: the chunks still a matter of the positions alone, so
+        //  a prompt read on from a saved chunk start takes the same ones; a short prompt reads as with chunks of s)
+        const int sc = tn.pf_small_chunk > 0 && tn.pf_small_chunk < tc ? tn.pf_small_chunk : 0;
+        const int64_t s_end = sc > 0 ? (tn.pf_small_until + tc - 1) / tc * tc : 0;
         std::vector<std::pair<int, int>> ch;
         for (int a = 0; a < n;) {
-            const int e = (int) std::min<int64_t>(n, ((p0 + a) / tc + 1) * tc - p0);
+            const int64_t p = p0 + a;
+            const int t = p < s_end ? sc : tc;
+            const int e = (int) std::min<int64_t>(n, (p / t + 1) * t - p0);
             ch.push_back({a, e - a});
             a = e;
         }
