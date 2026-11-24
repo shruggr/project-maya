@@ -168,6 +168,7 @@ struct Gpu {
     // (pinned host memory of its own: the stages run on a thread a GPU)
     float *hc_rw = nullptr, *hc_rl = nullptr, *hc_in = nullptr;
     int *hc_ids = nullptr, *hc_pmap = nullptr;
+    int *vmap = nullptr, *hc_vmap = nullptr;   // (the VRAM experts' parts' maps, a part's each: experts_rows)
     int64_t n_streamed = 0, n_experts = 0;
     // the expert cache's move in hand (one a GPU, its own thread and stream): expert `hot` from its RAM slot rs into
     // the layer's spare VRAM slot, expert `cold`'s blob from its VRAM slot out to RAM slot rs.  The decode thread
@@ -333,6 +334,12 @@ struct Model::Impl {
         //  IK2_HIP_TS_USE tokens an attention pass, IK2_HIP_S_USE_MI Mi score floats; 0: all of it)
         int stage_use = 0, ts_use = 0;
         size_t s_use = 0;
+        // the prompt path's VRAM experts in parts between the streamed passes (experts_rows), so that each pass runs
+        // as soon as its copy is in and the copies follow one another; a part's work counted as its entries + this
+        // much an expert (IK2_HIP_PF_PART_EXPERT).  IK2_HIP_PF_SPLIT_OLD: the VRAM experts in one set before the
+        // passes, as before (the copy of the third pass then waited for the first's, behind all the VRAM experts)
+        bool pf_split = true;
+        int pf_part_expert = 16;
     } tn;
     void retune() {
         tn.cache_decay = env_d("IK2_HIP_CACHE_DECAY", 0.9, 0.0, 1.0);
@@ -350,6 +357,8 @@ struct Model::Impl {
         tn.stage_use = (int) env_d("IK2_HIP_STAGE_USE", 0, 0, 384);
         tn.ts_use = (int) env_d("IK2_HIP_TS_USE", 0, 0, 1 << 16);
         tn.s_use = (size_t) env_d("IK2_HIP_S_USE_MI", 0, 0, 1 << 16) << 20;
+        tn.pf_split = std::getenv("IK2_HIP_PF_SPLIT_OLD") == nullptr;
+        tn.pf_part_expert = (int) env_d("IK2_HIP_PF_PART_EXPERT", 16, 0, 1 << 20);
     }
     // streamed experts a pass, in two buffers: one is copied while the other's experts run - fewer passes against
     // 2 x kStage blobs of VRAM (IK2_HIP_STAGE).  Measured, 2048-token chunks, tok/s at 24 / 48 / 64 / 96: a 20K prompt
@@ -547,7 +556,9 @@ struct Model::Impl {
         CK(cudaMallocHost((void**) &gp.hc_rw, T * nu * 4));
         CK(cudaMallocHost((void**) &gp.hc_rl, T * (size_t) g.n_expert * 4));
         CK(cudaMallocHost((void**) &gp.hc_pmap, (size_t) g.n_expert * g.n_expert * 4));   // (a pass's map each: one expert a pass at most)
-        return gp.alloc(gp.c_cur, T * E, err) && gp.alloc(gp.c_blocks, (size_t) n_states() * T * E, err) &&
+        CK(cudaMallocHost((void**) &gp.hc_vmap, (size_t) g.n_expert * g.n_expert * 4));   // (a part a pass at most)
+        return gp.alloc(gp.vmap, (size_t) g.n_expert * g.n_expert, err) && gp.alloc(gp.c_cur, T * E, err) &&
+               gp.alloc(gp.c_blocks, (size_t) n_states() * T * E, err) &&
                gp.alloc(gp.c_mixo, 3 * T * E, err) && gp.alloc(gp.c_xn, 3 * T * E, err) &&
                gp.alloc(gp.c_stat, 4 * k::kMaxStates * T, err) && gp.alloc(gp.c_q, T * HD, err) &&
                gp.alloc(gp.c_gate, T * HD, err) && gp.alloc(gp.c_ao, T * HD, err) && gp.alloc(gp.c_qp, T * HD, err) &&
@@ -2807,8 +2818,34 @@ struct Model::Impl {
             if (l.slot_of[(size_t) e] >= 0) mr = std::max(mr, cnt[(size_t) e]);
             else if (cnt[(size_t) e] > 0) u.push_back(e);
         }
-        if (!sets(l, gp, T, l.slot_d, l.experts, l.n_res + 1, mr, false, err)) return false;
         const size_t stg = (size_t) (tn.stage_use > 0 ? std::min(tn.stage_use, kStage) : kStage);
+        // the VRAM experts: one set before the streamed passes, or (two passes and more) in as many parts, part p
+        // before pass p - the stream then runs each pass when its copy is in, and the copy of pass p + 2 (into the
+        // buffer of pass p) need not wait for all the VRAM experts.  Each expert's rows the same sums whichever set
+        // takes it (each entry's output its own: scatter_rows; light or tiles by its own rows): the same bits
+        const int n_pass = (int) ((u.size() + stg - 1) / stg);
+        const bool split = tn.pf_split && n_pass >= 2;
+        std::vector<int> part_mr;
+        if (!split) {
+            if (!sets(l, gp, T, l.slot_d, l.experts, l.n_res + 1, mr, false, err)) return false;
+        } else {
+            int64_t all = 0;
+            for (int e = 0; e < ne; ++e)
+                if (l.slot_of[(size_t) e] >= 0 && cnt[(size_t) e] > 0) all += cnt[(size_t) e] + tn.pf_part_expert;
+            part_mr.assign((size_t) n_pass, 0);
+            int* vm = gp.hc_vmap;
+            for (size_t i = 0; i < (size_t) n_pass * ne; ++i) vm[i] = -1;
+            int64_t at = 0;
+            for (int e = 0; e < ne; ++e) {   // (in the experts' order, a part each n_pass-th of the work)
+                const int c = cnt[(size_t) e];
+                if (l.slot_of[(size_t) e] < 0 || c == 0) continue;
+                const int p = (int) std::min<int64_t>(n_pass - 1, all > 0 ? (at * n_pass) / all : 0);
+                vm[(size_t) p * ne + e] = l.slot_of[(size_t) e];
+                part_mr[(size_t) p] = std::max(part_mr[(size_t) p], c);
+                at += c + tn.pf_part_expert;
+            }
+            CK(cudaMemcpyAsync(gp.vmap, vm, sizeof(int) * (size_t) n_pass * ne, cudaMemcpyHostToDevice, s));
+        }
         for (size_t q0 = 0, pass = 0; q0 < u.size(); q0 += stg, ++pass) {
             const int np = (int) std::min(u.size() - q0, stg), b = (int) (pass & 1);
             int* pm = gp.hc_pmap + pass * (size_t) ne;
@@ -2851,6 +2888,9 @@ struct Model::Impl {
             }
             CK(cudaMemcpyAsync(gp.pmap[b], pm, sizeof(int) * ne, cudaMemcpyHostToDevice, gp.s2));
             CK(cudaEventRecord(gp.ev_copy[b], gp.s2));
+            if (split && part_mr[pass] > 0 &&
+                !sets(l, gp, T, gp.vmap + pass * (size_t) ne, l.experts, l.n_res + 1, part_mr[pass], false, err))
+                return false;
             CK(cudaStreamWaitEvent(s, gp.ev_copy[b], 0));
             if (!sets(l, gp, T, gp.pmap[b], gp.xstage[b], np, pmr, true, err)) return false;
             CK(cudaEventRecord(gp.ev_done[b], s));
@@ -3516,6 +3556,15 @@ struct Model::Impl {
         tap_T = 1;
         CK(cudaSetDevice(G.back().dev));
         if (!head_out(last_nb, logits_out, err)) return false;
+        if (std::getenv("IK2_HIP_PROMPT_HASH")) {   // (tests: the prompt's last logits to the bit, an FNV-1a hash)
+            std::vector<float> lg((size_t) g.n_vocab_unpadded);
+            CK(cudaMemcpy(lg.data(), G.back().logits, sizeof(float) * lg.size(), cudaMemcpyDeviceToHost));
+            uint64_t h = 1469598103934665603ull;
+            const uint8_t* b = (const uint8_t*) lg.data();
+            for (size_t i = 0; i < lg.size() * sizeof(float); ++i) h = (h ^ b[i]) * 1099511628211ull;
+            std::fprintf(stderr, "maya-ik2: prompt hash %016llx (%d tokens from %lld, top %d)\n", (unsigned long long) h, n,
+                         (long long) p0, top_id);
+        }
         st.tokens += n;
         return true;
     }
