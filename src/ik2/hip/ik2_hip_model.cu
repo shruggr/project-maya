@@ -163,6 +163,8 @@ struct Gpu {
     float *c_dv = nullptr, *c_o = nullptr, *c_oc = nullptr, *c_xf = nullptr, *c_rl = nullptr, *c_rw = nullptr;
     float *c_y = nullptr, *c_yc = nullptr, *c_sy = nullptr, *c_S = nullptr, *c_tbl = nullptr, *c_ent = nullptr;
     int *c_ids = nullptr, *c_bounds = nullptr, *c_stok = nullptr, *c_srow = nullptr, *pmap[2] = {nullptr, nullptr};
+    unsigned* c_sbits = nullptr;                 // (moe_sort_bits: each slot's tokens, a bit each)
+    int *c_swpre = nullptr, *c_sent = nullptr;   // (... their words' prefix counts; each row's entry)
     uint16_t *xh16 = nullptr, *wband = nullptr, *c_sh16 = nullptr, *c_P16 = nullptr;
     uint8_t* xstage[2] = {nullptr, nullptr};
     size_t wband_n = 0, S_n = 0, blob_max = 0, S_floats = 0;
@@ -351,6 +353,8 @@ struct Model::Impl {
         int64_t pf_small_until = 8192;    // (IK2_HIP_PF_SMALL_UNTIL)
         bool attn_p16 = true;   // (the prompt attention's softmax writes F16 itself; IK2_HIP_ATTN_P16_OLD: + to_f16)
         bool attn_flash = false; // (the prompt attention as one flash kernel, IK2_HIP_ATTN_FLASH=1: not the same bits)
+        bool sort_old = false;   // (the expert sets' rows by hy4's moe_sort and scatter_rows over every entry,
+                                 //  IK2_HIP_SORT_OLD=1; else moe_sort_bits and the set's rows only: the same rows)
         bool attn_tbl = false;  // (... and makes its distance table itself, IK2_HIP_ATTN_OWN_TBL=1: the GEMM's bits, measured
                                 //  no faster - 1312 against 1325 tok/s at 38.9K - so off)
     } tn;
@@ -378,6 +382,7 @@ struct Model::Impl {
         tn.attn_p16 = std::getenv("IK2_HIP_ATTN_P16_OLD") == nullptr;
         tn.attn_tbl = env_d("IK2_HIP_ATTN_OWN_TBL", 0, 0, 1) != 0;
         tn.attn_flash = env_d("IK2_HIP_ATTN_FLASH", 0, 0, 1) != 0;
+        tn.sort_old = std::getenv("IK2_HIP_SORT_OLD") != nullptr;
     }
     // streamed experts a pass, in two buffers: one is copied while the other's experts run - fewer passes against
     // 2 x kStage blobs of VRAM (IK2_HIP_STAGE).  Measured, 2048-token chunks, tok/s at 24 / 48 / 64 / 96: a 20K prompt
@@ -593,6 +598,8 @@ struct Model::Impl {
                gp.alloc(gp.c_yc, T * E, err) && gp.alloc(gp.c_sy, T * nu * E, err) && gp.alloc(gp.c_ent, T * nu * E, err) &&
                gp.alloc(gp.c_sh16, T * nu * (size_t) g.n_ff_exp, err) && gp.alloc(gp.c_bounds, (size_t) g.n_expert + 4, err) &&
                gp.alloc(gp.c_stok, T * nu, err) && gp.alloc(gp.c_srow, T * nu, err) && gp.alloc(gp.xh16, T * HD, err) &&
+               gp.alloc(gp.c_sbits, ((size_t) g.n_expert + 4) * ((T + 31) / 32), err) &&
+               gp.alloc(gp.c_swpre, ((size_t) g.n_expert + 4) * ((T + 31) / 32), err) && gp.alloc(gp.c_sent, T * nu, err) &&
                gp.alloc(gp.wband, gp.wband_n, err) && gp.alloc(gp.c_S, gp.S_n, err) && gp.alloc(gp.c_P16, gp.S_n, err) &&
                gp.alloc(gp.c_tbl, (size_t) std::max(kTsMax, flash_ts) * H * (size_t) g.rel_extent, err);
     }
@@ -2754,12 +2761,16 @@ struct Model::Impl {
     }
 
     // ds4_iq's expert sets over the chunk's entries whose expert has a slot in `slot` (a device map, n_slots blobs at
-    // wbase): gp.c_y = (accumulate: +=) each token's weighted sum of them.  max_rows: the most entries an expert has.
-    bool sets(Layer& l, Gpu& gp, int T, const int* slot, const uint8_t* wbase, int n_slots, int max_rows, bool accumulate,
-              std::string& err) {
+    // wbase): gp.c_y = (accumulate: +=) each token's weighted sum of them.  max_rows: the most entries an expert has;
+    // n_rows: the set's entries (all its experts')
+    bool sets(Layer& l, Gpu& gp, int T, const int* slot, const uint8_t* wbase, int n_slots, int max_rows, int n_rows,
+              bool accumulate, std::string& err) {
         const int E = g.n_embd, ff = g.n_ff_exp, nu = g.n_used;
         cudaStream_t s = gp.s;
-        hk::moe_sort(gp.c_ids, T, nu, g.n_expert, gp.c_bounds, gp.c_stok, gp.c_srow, s, slot, nullptr, n_slots);
+        const bool bits = !tn.sort_old && n_slots <= g.n_expert + 4 &&
+                          k::moe_sort_bits(gp.c_ids, T, nu, slot, n_slots, gp.c_sbits, gp.c_swpre, gp.c_bounds, gp.c_stok,
+                                           gp.c_srow, gp.c_sent, s);
+        if (!bits) hk::moe_sort(gp.c_ids, T, nu, g.n_expert, gp.c_bounds, gp.c_stok, gp.c_srow, s, slot, nullptr, n_slots);
         (void) accumulate;
         if (n_slots == 0 || max_rows == 0) return true;
         iq::SetArgs a;
@@ -2800,7 +2811,8 @@ struct Model::Impl {
             err = "layer " + std::to_string(l.il) + ": the experts' down sets did not run";
             return false;
         }
-        k::scatter_rows(gp.c_sy, gp.c_srow, T * nu, E, gp.c_ent, s);   // (each entry's output: experts_rows sums them)
+        if (bits) k::scatter_set_rows(gp.c_sy, gp.c_sent, n_rows, E, gp.c_ent, s);   // (each entry's output: experts_rows
+        else k::scatter_rows(gp.c_sy, gp.c_srow, T * nu, E, gp.c_ent, s);           //  sums them)
         return true;
     }
 
@@ -2863,12 +2875,14 @@ struct Model::Impl {
             ++cnt[(size_t) e];
             ++prof[e];
         }
-        int mr = 0;
+        int mr = 0, vrows = 0;
         std::vector<int> u;   // (the RAM experts routed to, in their RAM slots' order)
         for (int e = 0; e < ne; ++e) l.use[(size_t) e] += (float) cnt[(size_t) e] * std::min(1.0f, tn.prompt_rows / (float) T);
         for (int e = 0; e < ne; ++e) {
-            if (l.slot_of[(size_t) e] >= 0) mr = std::max(mr, cnt[(size_t) e]);
-            else if (cnt[(size_t) e] > 0) u.push_back(e);
+            if (l.slot_of[(size_t) e] >= 0) {
+                mr = std::max(mr, cnt[(size_t) e]);
+                vrows += cnt[(size_t) e];
+            } else if (cnt[(size_t) e] > 0) u.push_back(e);
         }
         const size_t stg = (size_t) (tn.stage_use > 0 ? std::min(tn.stage_use, kStage) : kStage);
         // the streamed passes: (expert, staging slot) each, a copy for each but those already in their slot - the
@@ -2926,14 +2940,15 @@ struct Model::Impl {
         // takes it (each entry's output its own: scatter_rows; light or tiles by its own rows): the same bits
         const int n_pass = (int) passes.size();
         const bool split = tn.pf_split && n_pass >= 2;
-        std::vector<int> part_mr;
+        std::vector<int> part_mr, part_rows;
         if (!split) {
-            if (!sets(l, gp, T, l.slot_d, l.experts, l.n_res + 1, mr, false, err)) return false;
+            if (!sets(l, gp, T, l.slot_d, l.experts, l.n_res + 1, mr, vrows, false, err)) return false;
         } else {
             int64_t all = 0;
             for (int e = 0; e < ne; ++e)
                 if (l.slot_of[(size_t) e] >= 0 && cnt[(size_t) e] > 0) all += cnt[(size_t) e] + tn.pf_part_expert;
             part_mr.assign((size_t) n_pass, 0);
+            part_rows.assign((size_t) n_pass, 0);
             int* vm = gp.hc_vmap;
             for (size_t i = 0; i < (size_t) n_pass * ne; ++i) vm[i] = -1;
             int64_t at = 0;
@@ -2943,6 +2958,7 @@ struct Model::Impl {
                 const int p = (int) std::min<int64_t>(n_pass - 1, all > 0 ? (at * n_pass) / all : 0);
                 vm[(size_t) p * ne + e] = l.slot_of[(size_t) e];
                 part_mr[(size_t) p] = std::max(part_mr[(size_t) p], c);
+                part_rows[(size_t) p] += c;
                 at += c + tn.pf_part_expert;
             }
             CK(cudaMemcpyAsync(gp.vmap, vm, sizeof(int) * (size_t) n_pass * ne, cudaMemcpyHostToDevice, s));
@@ -2952,7 +2968,7 @@ struct Model::Impl {
             const int np = it.back().i + 1, b = (int) (pass & 1);
             int* pm = gp.hc_pmap + pass * (size_t) ne;
             for (int e = 0; e < ne; ++e) pm[e] = -1;
-            int pmr = 0;
+            int pmr = 0, prows = 0;
             if (pass >= 2) CK(cudaStreamWaitEvent(gp.s2, gp.ev_done[b], 0));   // (the buffer's earlier pass has run)
             std::vector<std::pair<int, uint8_t*>> fj;   // (the pass's experts in the files: gathered, then copied)
             for (size_t j = 0; j < it.size();) {   // (runs of neighbours in RAM to neighbouring slots: a copy each)
@@ -2971,6 +2987,7 @@ struct Model::Impl {
                 for (size_t r = 0; r < run; ++r) {
                     pm[it[j + r].e] = it[j + r].i;
                     pmr = std::max(pmr, cnt[(size_t) it[j + r].e]);
+                    prows += cnt[(size_t) it[j + r].e];
                 }
                 j += run;
             }
@@ -2994,10 +3011,11 @@ struct Model::Impl {
             CK(cudaMemcpyAsync(gp.pmap[b], pm, sizeof(int) * ne, cudaMemcpyHostToDevice, gp.s2));
             CK(cudaEventRecord(gp.ev_copy[b], gp.s2));
             if (split && part_mr[pass] > 0 &&
-                !sets(l, gp, T, gp.vmap + pass * (size_t) ne, l.experts, l.n_res + 1, part_mr[pass], false, err))
+                !sets(l, gp, T, gp.vmap + pass * (size_t) ne, l.experts, l.n_res + 1, part_mr[pass], part_rows[pass], false,
+                      err))
                 return false;
             CK(cudaStreamWaitEvent(s, gp.ev_copy[b], 0));
-            if (!sets(l, gp, T, gp.pmap[b], gp.xstage[b], np, pmr, true, err)) return false;
+            if (!sets(l, gp, T, gp.pmap[b], gp.xstage[b], np, pmr, prows, true, err)) return false;
             CK(cudaEventRecord(gp.ev_done[b], s));
         }
         if (u.size() > (size_t) g.n_expert) {

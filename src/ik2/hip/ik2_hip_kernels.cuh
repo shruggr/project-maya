@@ -195,6 +195,12 @@ void argmax_rows(const float* x, size_t ld, int rows, int n, float* out, cudaStr
 /// not depend on which experts were in VRAM and which pass streamed the others
 void scatter_rows(const float* y, const int* row_of, int n, int E, float* ent, cudaStream_t s);
 void combine_rows(const float* ent, const float* w, int T, int nu, int E, float* out, cudaStream_t s);
+/// the prompt's expert set's rows (hy4's moe_sort's bounds / tok / row_of, the same values) by a bitmap of each slot's
+/// tokens; ent_of [row]: its entry.  bits, wpre: n_slots x ((T + 31) / 32) each.  false: more than 1024 slots
+bool moe_sort_bits(const int* ids, int T, int nu, const int* slot, int n_slots, unsigned* bits, int* wpre, int* bounds,
+                   int* tok, int* row_of, int* ent_of, cudaStream_t s);
+/// ent [ent_of[r]][E] = y [r][E] for the set's rows r < n_rows
+void scatter_set_rows(const float* y, const int* ent_of, int n_rows, int E, float* ent, cudaStream_t s);
 
 /// Launch failures since the last call (each printed); 0 none
 int errors();

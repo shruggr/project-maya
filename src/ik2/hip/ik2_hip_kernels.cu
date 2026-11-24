@@ -1630,6 +1630,79 @@ __global__ void scatter_rows_kernel(const float* __restrict__ y, const int* __re
     const int e = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x, r = row_of[e];
     if (i < E && r >= 0) ent[(size_t) e * E + i] = y[(size_t) r * E + i];
 }
+// moe_sort_bits (the prompt's expert sets): hy4's moe_sort's rows - each slot's entries in token order - by a bitmap
+// of the slot's tokens (a token routes to an expert once) instead of its AMD rank loop (each entry counting its slot's
+// rows: the square of the counts, one block): a bit an entry (atomicOr: any order the same), each 32 tokens' word
+// prefix by a wave's scan, the slots' bounds by the block's, then each entry's row from them
+__global__ void sort_bits_set_kernel(const int* __restrict__ ids, int n_ent, int nu, const int* __restrict__ slot,
+                                     int n_slots, int W, unsigned* __restrict__ bits) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_ent) return;
+    const int s = slot ? slot[ids[i]] : ids[i];
+    if (s < 0 || s >= n_slots) return;
+    const int t = i / nu;
+    atomicOr(bits + (size_t) s * W + (t >> 5), 1u << (t & 31));
+}
+__global__ void __launch_bounds__(1024) sort_bits_rows_kernel(const int* __restrict__ ids, int n_ent, int nu,
+                                                              const int* __restrict__ slot, int n_slots, int W,
+                                                              const unsigned* __restrict__ bits, int* __restrict__ wpre,
+                                                              int* __restrict__ bounds, int* __restrict__ tok,
+                                                              int* __restrict__ row_of, int* __restrict__ ent_of) {
+    __shared__ int cnt[1024];
+    __shared__ int sc[1024];
+    const int lt = threadIdx.x, lane = lt & 31, nw = (int) (blockDim.x >> 5);
+    for (int s = lt >> 5; s < n_slots; s += nw) {   // (a wave a slot: its words' exclusive prefix, its count)
+        int carry = 0;
+        for (int w0 = 0; w0 < W; w0 += 32) {
+            const int w = w0 + lane;
+            const int c = w < W ? __popc(bits[(size_t) s * W + w]) : 0;
+            int x = c;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up(x, o, 32);
+                if (lane >= o) x += y;
+            }
+            if (w < W) wpre[(size_t) s * W + w] = carry + x - c;
+            carry += __shfl(x, 31, 32);
+        }
+        if (lane == 0) cnt[s] = carry;
+    }
+    __syncthreads();
+    const int v = lt < n_slots ? cnt[lt] : 0;
+    sc[lt] = v;
+    __syncthreads();
+    for (int o = 1; o < 1024; o <<= 1) {
+        const int y = lt >= o ? sc[lt - o] : 0;
+        __syncthreads();
+        sc[lt] += y;
+        __syncthreads();
+    }
+    if (lt < n_slots) {
+        bounds[lt] = sc[lt] - v;
+        cnt[lt] = sc[lt] - v;
+    }
+    if (lt == 1023) bounds[n_slots] = sc[lt];
+    __syncthreads();
+    for (int i = lt; i < n_ent; i += (int) blockDim.x) {
+        const int s = slot ? slot[ids[i]] : ids[i];
+        if (s < 0 || s >= n_slots) {
+            row_of[i] = -1;
+            continue;
+        }
+        const int t = i / nu, w = t >> 5;
+        const unsigned b = bits[(size_t) s * W + w];
+        const int r = cnt[s] + wpre[(size_t) s * W + w] + __popc(b & ((1u << (t & 31)) - 1u));
+        tok[r] = t;
+        row_of[i] = r;
+        ent_of[r] = i;
+    }
+}
+// a set's rows to their entries' places (scatter_rows by the set's rows, not by all the chunk's entries)
+__global__ void scatter_set_rows_kernel(const float* __restrict__ y, const int* __restrict__ ent_of, int E,
+                                        float* __restrict__ ent) {
+    const int r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < E) ent[(size_t) ent_of[r] * E + i] = y[(size_t) r * E + i];
+}
 __global__ void combine_rows_kernel(const float* __restrict__ ent, const float* __restrict__ w, int nu, int E,
                                     float* __restrict__ out) {
     const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1962,6 +2035,26 @@ void scatter_rows(const float* y, const int* row_of, int n, int E, float* ent, c
         scatter_rows_kernel<<<dim3(blocks_of((size_t) E), (unsigned) ne), 256, 0, s>>>(y, row_of + e0, E, ent + (size_t) e0 * E);
     }
     check("scatter_rows");
+}
+bool moe_sort_bits(const int* ids, int T, int nu, const int* slot, int n_slots, unsigned* bits, int* wpre, int* bounds,
+                   int* tok, int* row_of, int* ent_of, cudaStream_t s) {
+    if (n_slots < 0 || n_slots > 1024) return false;
+    const int W = (T + 31) / 32, n = T * nu;
+    if (n_slots > 0) {
+        if (cudaMemsetAsync(bits, 0, (size_t) n_slots * W * sizeof(unsigned), s) != cudaSuccess) return false;
+        if (n > 0) sort_bits_set_kernel<<<blocks_of((size_t) n), 256, 0, s>>>(ids, n, nu, slot, n_slots, W, bits);
+    }
+    sort_bits_rows_kernel<<<1, 1024, 0, s>>>(ids, n, nu, slot, n_slots, W, bits, wpre, bounds, tok, row_of, ent_of);
+    check("moe_sort_bits");
+    return true;
+}
+void scatter_set_rows(const float* y, const int* ent_of, int n_rows, int E, float* ent, cudaStream_t s) {
+    for (int r0 = 0; r0 < n_rows; r0 += 32768) {   // (a grid's rows at most)
+        const int nr = std::min(32768, n_rows - r0);
+        scatter_set_rows_kernel<<<dim3(blocks_of((size_t) E), (unsigned) nr), 256, 0, s>>>(y + (size_t) r0 * E, ent_of + r0,
+                                                                                         E, ent);
+    }
+    check("scatter_set_rows");
 }
 void combine_rows(const float* ent, const float* w, int T, int nu, int E, float* out, cudaStream_t s) {
     combine_rows_kernel<<<dim3(blocks_of((size_t) E), (unsigned) T), 256, 0, s>>>(ent, w, nu, E, out);
