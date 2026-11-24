@@ -125,6 +125,8 @@ struct Layer {
     std::vector<float> h_bias;    // (the router's selection bias on the host: a tap's scores)
     std::vector<float> use;       // each expert's decayed routings (the cache's: who is in VRAM)
     int spare = -1;               // the VRAM slot no expert is in (the cache's next arrival lands there)
+    std::vector<int> pf_pred;     // (the prompt path: the RAM experts the next chunk is guessed to route to most)
+    int64_t pf_pred_p = -1;       // (... the next chunk's start)
     int picks[16 * 16] = {};      // (the last host-free step's picks, [row][16]: counted once its rows are kept)
     size_t dense = 0;             // (the plan) its VRAM without the experts
 };
@@ -169,6 +171,10 @@ struct Gpu {
     float *hc_rw = nullptr, *hc_rl = nullptr, *hc_in = nullptr;
     int *hc_ids = nullptr, *hc_pmap = nullptr;
     int *vmap = nullptr, *hc_vmap = nullptr;   // (the VRAM experts' parts' maps, a part's each: experts_rows)
+    std::vector<int> pf_e;                      // (staging buffer 0's prefetched experts, a slot each: prefetch)
+    int pf_il = -1;                             // (... for this layer, at this chunk's start; -1: none)
+    int64_t pf_p0 = -1;
+    int64_t n_pf_hit = 0, n_pf_miss = 0;        // (prefetched experts the chunk routed to / did not)
     int64_t n_streamed = 0, n_experts = 0;
     // the expert cache's move in hand (one a GPU, its own thread and stream): expert `hot` from its RAM slot rs into
     // the layer's spare VRAM slot, expert `cold`'s blob from its VRAM slot out to RAM slot rs.  The decode thread
@@ -340,6 +346,7 @@ struct Model::Impl {
         // passes, as before (the copy of the third pass then waited for the first's, behind all the VRAM experts)
         bool pf_split = true;
         int pf_part_expert = 16;
+        int pf_prefetch = 24;   // (prefetch: RAM experts a layer copied ahead, IK2_HIP_PF_PREFETCH; 0: none)
     } tn;
     void retune() {
         tn.cache_decay = env_d("IK2_HIP_CACHE_DECAY", 0.9, 0.0, 1.0);
@@ -359,6 +366,7 @@ struct Model::Impl {
         tn.s_use = (size_t) env_d("IK2_HIP_S_USE_MI", 0, 0, 1 << 16) << 20;
         tn.pf_split = std::getenv("IK2_HIP_PF_SPLIT_OLD") == nullptr;
         tn.pf_part_expert = (int) env_d("IK2_HIP_PF_PART_EXPERT", 16, 0, 1 << 20);
+        tn.pf_prefetch = (int) env_d("IK2_HIP_PF_PREFETCH", 24, 0, 384);
     }
     // streamed experts a pass, in two buffers: one is copied while the other's experts run - fewer passes against
     // 2 x kStage blobs of VRAM (IK2_HIP_STAGE).  Measured, 2048-token chunks, tok/s at 24 / 48 / 64 / 96: a 20K prompt
@@ -2819,11 +2827,60 @@ struct Model::Impl {
             else if (cnt[(size_t) e] > 0) u.push_back(e);
         }
         const size_t stg = (size_t) (tn.stage_use > 0 ? std::min(tn.stage_use, kStage) : kStage);
+        // the streamed passes: (expert, staging slot) each, a copy for each but those already in their slot - the
+        // ones prefetch() copied into buffer 0 during the attention (the previous chunk's at this layer) that the
+        // chunk routes to stay where they are, pass 0's other slots taken by the next RAM experts
+        struct Item {
+            int e, i;
+            bool copy;
+        };
+        std::vector<std::vector<Item>> passes;
+        {
+            std::vector<char> kept((size_t) ne, 0);
+            if (gp.pf_il == l.il && gp.pf_p0 == p0) {
+                std::vector<Item> p0v;
+                std::vector<int> fill;
+                for (size_t i = 0; i < gp.pf_e.size() && i < stg; ++i) {
+                    const int e = gp.pf_e[i];
+                    if (e >= 0 && cnt[(size_t) e] > 0 && l.slot_of[(size_t) e] < 0) {
+                        p0v.push_back({e, (int) i, false});
+                        kept[(size_t) e] = 1;
+                        ++gp.n_pf_hit;
+                    } else fill.push_back((int) i);
+                    if (e >= 0 && !kept[(size_t) e]) ++gp.n_pf_miss;
+                }
+                for (size_t i = gp.pf_e.size(); i < stg; ++i) fill.push_back((int) i);
+                size_t f = 0;
+                for (int e : u)
+                    if (!kept[(size_t) e] && f < fill.size()) {
+                        p0v.push_back({e, fill[f++], true});
+                        kept[(size_t) e] = 1;
+                    }
+                std::sort(p0v.begin(), p0v.end(), [](const Item& a, const Item& b) { return a.i < b.i; });
+                if (!p0v.empty()) passes.push_back(std::move(p0v));
+            }
+            std::vector<int> rest;
+            for (int e : u)
+                if (!kept[(size_t) e]) rest.push_back(e);
+            for (size_t q0 = 0; q0 < rest.size(); q0 += stg) {
+                std::vector<Item> pv;
+                for (size_t i = 0; i < stg && q0 + i < rest.size(); ++i) pv.push_back({rest[q0 + i], (int) i, true});
+                passes.push_back(std::move(pv));
+            }
+            gp.pf_il = -1;
+            if (tn.pf_prefetch > 0) {   // (the next chunk's guess at this layer: this chunk's busiest RAM experts)
+                std::vector<int> pr(u);
+                std::stable_sort(pr.begin(), pr.end(), [&](int a, int b) { return cnt[(size_t) a] > cnt[(size_t) b]; });
+                pr.resize(std::min(pr.size(), (size_t) std::min<int>(tn.pf_prefetch, (int) stg)));
+                l.pf_pred = std::move(pr);
+                l.pf_pred_p = p0 + T;
+            }
+        }
         // the VRAM experts: one set before the streamed passes, or (two passes and more) in as many parts, part p
         // before pass p - the stream then runs each pass when its copy is in, and the copy of pass p + 2 (into the
         // buffer of pass p) need not wait for all the VRAM experts.  Each expert's rows the same sums whichever set
         // takes it (each entry's output its own: scatter_rows; light or tiles by its own rows): the same bits
-        const int n_pass = (int) ((u.size() + stg - 1) / stg);
+        const int n_pass = (int) passes.size();
         const bool split = tn.pf_split && n_pass >= 2;
         std::vector<int> part_mr;
         if (!split) {
@@ -2846,28 +2903,32 @@ struct Model::Impl {
             }
             CK(cudaMemcpyAsync(gp.vmap, vm, sizeof(int) * (size_t) n_pass * ne, cudaMemcpyHostToDevice, s));
         }
-        for (size_t q0 = 0, pass = 0; q0 < u.size(); q0 += stg, ++pass) {
-            const int np = (int) std::min(u.size() - q0, stg), b = (int) (pass & 1);
+        for (size_t pass = 0; pass < passes.size(); ++pass) {
+            const std::vector<Item>& it = passes[pass];
+            const int np = it.back().i + 1, b = (int) (pass & 1);
             int* pm = gp.hc_pmap + pass * (size_t) ne;
             for (int e = 0; e < ne; ++e) pm[e] = -1;
             int pmr = 0;
             if (pass >= 2) CK(cudaStreamWaitEvent(gp.s2, gp.ev_done[b], 0));   // (the buffer's earlier pass has run)
             std::vector<std::pair<int, uint8_t*>> fj;   // (the pass's experts in the files: gathered, then copied)
-            for (int i = 0; i < np;) {   // (runs of neighbours in RAM: a copy each)
-                const int r0 = l.ram_of[(size_t) u[q0 + i]];
-                int run = 1;
-                if (r0 < l.n_copy) {
-                    while (i + run < np && l.ram_of[(size_t) u[q0 + i + run]] == r0 + run && r0 + run < l.n_copy) ++run;
+            for (size_t j = 0; j < it.size();) {   // (runs of neighbours in RAM to neighbouring slots: a copy each)
+                const int r0 = l.ram_of[(size_t) it[j].e], i = it[j].i;
+                size_t run = 1;
+                if (!it[j].copy) {
+                } else if (r0 < l.n_copy) {
+                    while (j + run < it.size() && it[j + run].copy && it[j + run].i == i + (int) run &&
+                           l.ram_of[(size_t) it[j + run].e] == r0 + (int) run && r0 + (int) run < l.n_copy)
+                        ++run;
                     CK(cudaMemcpyAsync(gp.xstage[b] + (size_t) i * l.blob, l.ram + (size_t) r0 * l.blob,
-                                       (size_t) run * l.blob, cudaMemcpyHostToDevice, gp.s2));
+                                       run * l.blob, cudaMemcpyHostToDevice, gp.s2));
                 } else {
-                    fj.push_back({u[q0 + i], gp.h_fst + (size_t) i * l.blob});
+                    fj.push_back({it[j].e, gp.h_fst + (size_t) i * l.blob});
                 }
-                for (int r = 0; r < run; ++r) {
-                    pm[u[q0 + i + r]] = i + r;
-                    pmr = std::max(pmr, cnt[(size_t) u[q0 + i + r]]);
+                for (size_t r = 0; r < run; ++r) {
+                    pm[it[j + r].e] = it[j + r].i;
+                    pmr = std::max(pmr, cnt[(size_t) it[j + r].e]);
                 }
-                i += run;
+                j += run;
             }
             if (!fj.empty()) {
                 if (!gp.h_fst) {
@@ -2905,10 +2966,41 @@ struct Model::Impl {
         return true;
     }
 
+    // the RAM experts the chunk before routed to most at this layer, copied into staging buffer 0 while the layer's
+    // attention runs (PCIe is idle then: the layer's copies wait for its router); experts_rows keeps those the chunk
+    // routes to.  IK2_HIP_PF_PREFETCH: how many at most (0: none, as before)
+    bool prefetch(Layer& l, Gpu& gp, int64_t p0, std::string& err) {
+        gp.pf_il = -1;
+        if (tn.pf_prefetch <= 0 || l.pf_pred_p != p0 || l.pf_pred.empty() || gp.xstage[0] == nullptr) return true;
+        const size_t stg = (size_t) (tn.stage_use > 0 ? std::min(tn.stage_use, kStage) : kStage);
+        std::vector<int> pick;
+        for (int e : l.pf_pred) {
+            if (pick.size() >= stg) break;
+            const int r = l.ram_of[(size_t) e];
+            if (l.slot_of[(size_t) e] < 0 && r >= 0 && r < l.n_copy) pick.push_back(e);
+        }
+        if (pick.empty()) return true;
+        std::sort(pick.begin(), pick.end(), [&](int a, int b) { return l.ram_of[(size_t) a] < l.ram_of[(size_t) b]; });
+        CK(cudaStreamWaitEvent(gp.s2, gp.ev_done[0], 0));   // (buffer 0's last pass has run)
+        for (size_t i = 0; i < pick.size();) {
+            const int r0 = l.ram_of[(size_t) pick[i]];
+            size_t run = 1;
+            while (i + run < pick.size() && l.ram_of[(size_t) pick[i + run]] == r0 + (int) run) ++run;
+            CK(cudaMemcpyAsync(gp.xstage[0] + i * l.blob, l.ram + (size_t) r0 * l.blob, run * l.blob,
+                               cudaMemcpyHostToDevice, gp.s2));
+            i += run;
+        }
+        gp.pf_e = pick;
+        gp.pf_il = l.il;
+        gp.pf_p0 = p0;
+        return true;
+    }
+
     bool layer_rows(Layer& l, Gpu& gp, int T, int64_t p0, int& nb, std::string& err) {
         const int E = g.n_embd, H = g.n_head, Hkv = g.n_head_kv, D = g.head_dim, HD = H * D, kvd = Hkv * D;
         const size_t TE = (size_t) T * E, ldb = (size_t) Tc * E;
         cudaStream_t s = gp.s;
+        if (!prefetch(l, gp, p0, err)) return false;
         const float* src = gp.c_cur;
         if (l.il > 0) {
             k::mix_rows(gp.c_blocks, ldb, nb, gp.c_cur, T, E, l.attn_res, l.swa ? 1 : 3, 1e-6f, gp.c_stat, gp.c_mixo, s);
@@ -3562,8 +3654,15 @@ struct Model::Impl {
             uint64_t h = 1469598103934665603ull;
             const uint8_t* b = (const uint8_t*) lg.data();
             for (size_t i = 0; i < lg.size() * sizeof(float); ++i) h = (h ^ b[i]) * 1099511628211ull;
-            std::fprintf(stderr, "maya-ik2: prompt hash %016llx (%d tokens from %lld, top %d)\n", (unsigned long long) h, n,
-                         (long long) p0, top_id);
+            int64_t hit = 0, miss = 0;
+            for (Gpu& gp : G) {
+                hit += gp.n_pf_hit;
+                miss += gp.n_pf_miss;
+                gp.n_pf_hit = gp.n_pf_miss = 0;
+            }
+            std::fprintf(stderr, "maya-ik2: prompt hash %016llx (%d tokens from %lld, top %d; prefetched experts %lld "
+                         "routed to, %lld not)\n", (unsigned long long) h, n, (long long) p0, top_id, (long long) hit,
+                         (long long) miss);
         }
         st.tokens += n;
         return true;
