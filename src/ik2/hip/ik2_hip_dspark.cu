@@ -1913,14 +1913,14 @@ struct Dspark::Impl {
         // IK2_HIP_DSPARK_WALL=1 (measurements): events at the first and the last of a draft's GPU work - a line every 200
         // drafts: the wall time a draft, the GPU's span, the host's time before its first enqueue and after the GPU's end
         static const bool wall = std::getenv("IK2_HIP_DSPARK_WALL") != nullptr;
-        static cudaEvent_t w0 = nullptr, w1 = nullptr;
+        static cudaEvent_t wev0 = nullptr, wev1 = nullptr;
         static double w_wall = 0, w_gpu = 0, w_pre = 0;
         static long long w_n = 0;
         double t_pre = 0;
-        if (wall && w0 == nullptr) {
+        if (wall && wev0 == nullptr) {
             (void) cudaSetDevice(dev);
-            (void) cudaEventCreate(&w0);
-            (void) cudaEventCreate(&w1);
+            (void) cudaEventCreate(&wev0);
+            (void) cudaEventCreate(&wev1);
         }
         auto phase = [&](double& acc) -> bool {
             if (!o.profile) return true;
@@ -1943,7 +1943,7 @@ struct Dspark::Impl {
             else std::memcpy(hx, row, (size_t) E * 4);
             if (wall) {
                 t_pre = now_ms() - t0;
-                CK(cudaEventRecord(w0, s));
+                CK(cudaEventRecord(wev0, s));
             }
             const int* h_anchor = &anchor;
             const float* h_one = &one;
@@ -2068,12 +2068,12 @@ struct Dspark::Impl {
         CK(cudaMemcpyAsync(h_tok, tok, sizeof(int) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_prob, prob, sizeof(float) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
         if (drawn) CK(cudaMemcpyAsync(h_qd, qdd, sizeof(float) * (size_t) (max_n + 1), cudaMemcpyDeviceToHost, s));
-        if (wall) CK(cudaEventRecord(w1, s));
+        if (wall) CK(cudaEventRecord(wev1, s));
         if (!sync(err)) return false;
         if (o.profile) st.head_ms += now_ms() - tp0;
         if (wall) {
             float g = 0;
-            (void) cudaEventElapsedTime(&g, w0, w1);
+            (void) cudaEventElapsedTime(&g, wev0, wev1);
             const double tw = now_ms() - t0;
             w_wall += tw;
             w_gpu += g;
