@@ -135,6 +135,10 @@ void attn_softmax_rows(float* S, int T, int Hkv, int per, int nk, int64_t klo, i
 
 // ---- the verify window: T (a few) tokens a decode step ----------------------------------------------------------
 /// mix_rms for T tokens (state st of token t at blocks + st ldb + t E; out [nq][T][E]): a block a token, each the
+/// mix_rms_rows with the form chosen: 0 the barrier-per-sum kernel (before 2026-11-24), 1 the few-barrier one (the
+/// default; IK2_HIP_MIX_OLD selects 0 in mix_rms_rows)
+void mix_rms_rows_form(int form, const float* blocks, size_t ldb, int nb, const float* cur, int T, int E, const float* query,
+                       int nq, const float* g0, const float* g1, const float* g2, float eps, float* out, cudaStream_t s);
 /// one-token launch's arithmetic
 void mix_rms_rows(const float* blocks, size_t ldb, int nb, const float* cur, int T, int E, const float* query, int nq,
                   const float* g0, const float* g1, const float* g2, float eps, float* out, cudaStream_t s);

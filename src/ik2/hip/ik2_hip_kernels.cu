@@ -886,6 +886,107 @@ __global__ void mix_rms_kernel(const float* __restrict__ blocks, size_t ldb, int
         for (int i = tid; i < E && n < 8; i += blockDim.x, ++n) out[((size_t) qi * T + t) * E + i] = vv[n] * inv * (gain ? gain[i] : 1.0f);
     }
 }
+// ---- mix + norms with few barriers (own runtime, 2026-11-24): mix_rms_kernel's results (within float rounding) with the
+// sums of four states at a time in one pass over the states and one reduction (wave shuffles, then the waves' partials
+// in shared memory), and the queries' norms in one reduction - instead of a tree with barriers for every sum
+template <int NV>
+__device__ __forceinline__ void block_sum_v(float (&v)[NV], float* sh) {   // (sh: [32 waves][NV] + [NV]; every thread gets the sums)
+#pragma unroll
+    for (int o = warpSize / 2; o > 0; o >>= 1)
+#pragma unroll
+        for (int i = 0; i < NV; ++i) v[i] += __shfl_xor(v[i], o);
+    const int lane = threadIdx.x % warpSize, w = threadIdx.x / warpSize, nw = (blockDim.x + warpSize - 1) / warpSize;
+    if (lane == 0)
+#pragma unroll
+        for (int i = 0; i < NV; ++i) sh[w * NV + i] = v[i];
+    __syncthreads();
+    if ((int) threadIdx.x < NV) {
+        float s = 0.0f;
+        for (int k2 = 0; k2 < nw; ++k2) s += sh[k2 * NV + threadIdx.x];
+        sh[32 * NV + threadIdx.x] = s;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < NV; ++i) v[i] = sh[32 * NV + i];
+    __syncthreads();
+}
+__global__ void mix_rms2_kernel(const float* __restrict__ blocks, size_t ldb, int nb, const float* __restrict__ cur, int T,
+                                int E, const float* __restrict__ query, int nq, const float* __restrict__ g0,
+                                const float* __restrict__ g1, const float* __restrict__ g2, float eps,
+                                float* __restrict__ out) {
+    __shared__ float sh[33 * 16];
+    __shared__ float st[kMaxStates * 4];
+    const int ns = nb + 1, tid = threadIdx.x, t = blockIdx.x;   // (a block a token: each the one-token arithmetic)
+    const size_t to = (size_t) t * E;
+    for (int s0 = 0; s0 < ns; s0 += 4) {   // (four states a pass: their squares and their dots with the queries)
+        float a[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) a[i] = 0.0f;
+        for (int i = tid; i < E; i += blockDim.x) {
+            float qv[3];
+#pragma unroll
+            for (int qi = 0; qi < 3; ++qi) qv[qi] = qi < nq ? query[(size_t) qi * E + i] : 0.0f;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int s = s0 + u;
+                if (s < ns) {
+                    const float v = (s < nb ? blocks + (size_t) s * ldb : cur)[to + i];
+                    a[4 * u] += v * v;
+#pragma unroll
+                    for (int qi = 0; qi < 3; ++qi) a[4 * u + 1 + qi] += v * qv[qi];
+                }
+            }
+        }
+        block_sum_v<16>(a, sh);
+        if (tid == 0)
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int s = s0 + u;
+                if (s < ns) {
+                    const float inv = rsqrtf(a[4 * u] / (float) E + 1e-6f);
+                    st[4 * s] = inv;
+                    for (int qi = 0; qi < nq; ++qi) st[4 * s + 1 + qi] = a[4 * u + 1 + qi] * inv;
+                }
+            }
+    }
+    __syncthreads();
+    const float sc = rsqrtf((float) E);
+    float vv[3][8], ss[3] = {0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int qi = 0; qi < 3; ++qi) {
+        if (qi >= nq) continue;
+        float m = -INFINITY, w[kMaxStates], den = 0.0f;
+        for (int s = 0; s < ns; ++s) m = fmaxf(m, st[4 * s + 1 + qi] * sc);
+        for (int s = 0; s < ns; ++s) {
+            w[s] = expf(st[4 * s + 1 + qi] * sc - m);
+            den += w[s];
+        }
+        int n = 0;
+#pragma unroll
+        for (int k2 = 0; k2 < 8; ++k2) {
+            const int i = tid + k2 * blockDim.x;
+            vv[qi][k2] = 0.0f;
+            if (i >= E) continue;
+            float v = 0.0f;
+            for (int s = 0; s < ns; ++s) v += w[s] * st[4 * s] * (s < nb ? blocks[(size_t) s * ldb + to + i] : cur[to + i]);
+            vv[qi][k2] = v / den;
+            ss[qi] += vv[qi][k2] * vv[qi][k2];
+            ++n;
+        }
+    }
+    block_sum_v<3>(ss, sh);
+#pragma unroll
+    for (int qi = 0; qi < 3; ++qi) {
+        if (qi >= nq) continue;
+        const float* gain = qi == 0 ? g0 : qi == 1 ? g1 : g2;
+        const float inv = rsqrtf(ss[qi] / (float) E + eps);
+#pragma unroll
+        for (int k2 = 0; k2 < 8; ++k2) {
+            const int i = tid + k2 * blockDim.x;
+            if (i < E) out[((size_t) qi * T + t) * E + i] = vv[qi][k2] * inv * (gain ? gain[i] : 1.0f);
+        }
+    }
+}
 __global__ void hist_set4_kernel(float* h0p, float* h1p, float* h2p, float* h3p, const float* s0, const float* s1,
                                  const float* s2, const float* s3, const float* i0, const float* i1, const float* i2,
                                  const float* i3, int C0, int C1, int C2, int C3, int keep) {
@@ -1428,14 +1529,20 @@ void mix_rms(const float* blocks, int nb, const float* cur, int E, const float* 
     mix_rms_kernel<<<1, 1024, 0, s>>>(blocks, (size_t) E, nb, cur, 1, E, query, nq, g0, g1, g2, eps, out);
     check("mix_rms");
 }
-void mix_rms_rows(const float* blocks, size_t ldb, int nb, const float* cur, int T, int E, const float* query, int nq,
-                  const float* g0, const float* g1, const float* g2, float eps, float* out, cudaStream_t s) {
+void mix_rms_rows_form(int form, const float* blocks, size_t ldb, int nb, const float* cur, int T, int E, const float* query,
+                       int nq, const float* g0, const float* g1, const float* g2, float eps, float* out, cudaStream_t s) {
     if (nb + 1 > kMaxStates || nq > 3 || E > 8 * 1024) {
         g_err.fetch_add(1);
         return;
     }
-    mix_rms_kernel<<<(unsigned) T, 1024, 0, s>>>(blocks, ldb, nb, cur, T, E, query, nq, g0, g1, g2, eps, out);
+    if (form == 0) mix_rms_kernel<<<(unsigned) T, 1024, 0, s>>>(blocks, ldb, nb, cur, T, E, query, nq, g0, g1, g2, eps, out);
+    else mix_rms2_kernel<<<(unsigned) T, 1024, 0, s>>>(blocks, ldb, nb, cur, T, E, query, nq, g0, g1, g2, eps, out);
     check("mix_rms_rows");
+}
+void mix_rms_rows(const float* blocks, size_t ldb, int nb, const float* cur, int T, int E, const float* query, int nq,
+                  const float* g0, const float* g1, const float* g2, float eps, float* out, cudaStream_t s) {
+    static const bool old = std::getenv("IK2_HIP_MIX_OLD") != nullptr;   // (the barrier-per-sum form, as before)
+    mix_rms_rows_form(old ? 0 : 1, blocks, ldb, nb, cur, T, E, query, nq, g0, g1, g2, eps, out, s);
 }
 void conv_rows_save(const float* y, int T, float* hist, const float* w, int C, const float* dyn, int heads, float* out,
                     float* save, cudaStream_t s) {
