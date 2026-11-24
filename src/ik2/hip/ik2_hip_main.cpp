@@ -361,9 +361,16 @@ struct Drafting {
         }
         return best;
     }
+    // IK2_HIP_DRAFT_CLAMP (default 1; 0: as before): a pass's sample counts at most 3x the current estimate (a's, b's
+    // own) - one stalled pass (measured: 3.5 s once, through the server) had put b at 360 ms a row, after which no
+    // window was ever chosen again, so b was never measured again: drafting stayed off until a restart
+    bool clamp = env_d("IK2_HIP_DRAFT_CLAMP", 1) != 0;
     void observe_pass(int T, double ms) {
-        if (T == 1) a = ema * a + (1 - ema) * ms;
-        else b = ema * b + (1 - ema) * std::max(b_min, (ms - a) / (T - 1));
+        if (T == 1) a = ema * a + (1 - ema) * (clamp ? std::min(ms, 3 * a) : ms);
+        else {
+            const double row = std::max(b_min, (ms - a) / (T - 1));
+            b = ema * b + (1 - ema) * (clamp ? std::min(row, 3 * b) : row);
+        }
     }
     void observe_round(bool was_drafted, int k, int kept, double t_draft_ms) {
         if (!was_drafted) return;
