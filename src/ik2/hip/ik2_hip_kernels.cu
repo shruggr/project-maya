@@ -1213,6 +1213,60 @@ __global__ void attn_softmax_rows_kernel(float* __restrict__ S, int T, int Hkv, 
     for (int j = threadIdx.x; j < nk; j += blockDim.x) sr[j] = j >= j0 && j <= j1 ? sr[j] * inv : 0.0f;
 }
 
+// attn_softmax_rows_kernel's probabilities straight to F16 (to_f16's __float2half_rn), S read three times and never
+// written: each pass's logit made from S by the same expression, the product rounded to F32 before its F16 - the
+// same bits (smtest: attn_softmax_rows + the conversion against this, rows of 300 / 1100 / 5000 keys).  Without the
+// barriers the compiler rounds the product straight to F16, once: other bits in about 1 value in 16,000, which the
+// model's last logits feel (KL 0.25 on a 1.7K prompt)
+// (relq non-null: the distance table made here, in LDS, instead of read from tbl - row (t, h)'s entry d the sum over
+//  i < d_rel of rel_bias[d d_rel + i] relq[(t H + h) d_rel + i] in i's order, the GEMM's own form; extent <= 1024)
+__global__ void attn_softmax_p16_kernel(float* __restrict__ S, int T, int Hkv, int per, int nk, long long klo,
+                                        long long p0, int window, int extent, const float* __restrict__ tbl,
+                                        const float* __restrict__ sink, float scale, __half* __restrict__ P,
+                                        const float* __restrict__ relq, const float* __restrict__ rel_bias, int d_rel) {
+    __shared__ float sh[256];
+    __shared__ float tsh[1024];
+    const int qi = blockIdx.x, g = qi / (T * per), t = qi % (T * per) / per, r = qi % per;
+    const int H = Hkv * per, h = g * per + r;
+    float* sr = S + (size_t) qi * nk;
+    __half* pr = P + (size_t) qi * nk;
+    const float* tb = tbl + ((size_t) t * H + h) * extent;
+    if (relq != nullptr) {
+        const float* q = relq + ((size_t) t * H + h) * d_rel;
+        for (int d = threadIdx.x; d < extent; d += blockDim.x) {
+            const float* b = rel_bias + (size_t) d * d_rel;
+            float a = 0.0f;
+            for (int i = 0; i < d_rel; ++i) a = fmaf(b[i], q[i], a);
+            tsh[d] = a;
+        }
+        __syncthreads();
+        tb = tsh;
+    }
+    const float snk = sink[(size_t) t * H + h];
+    const long long p = p0 + t;
+    long long lo = window > 0 ? p - (window - 1) : 0;
+    if (lo < klo) lo = klo;
+    const int j0 = (int) (lo - klo), j1 = (int) (p - klo);   // (inclusive)
+    auto val = [&](int j) {   // (each pass's logit from S: the same expression, kept from fusing into what follows)
+        const long long d = p - (klo + j);
+        float v = sr[j] * scale + (d < extent ? tb[d] : 0.0f) - snk;
+        asm volatile("" : "+v"(v));
+        return v;
+    };
+    float m = 0.0f;
+    for (int j = j0 + threadIdx.x; j <= j1; j += blockDim.x) m = fmaxf(m, val(j));
+    m = block_max(m, sh);
+    float sum = 0.0f;
+    for (int j = j0 + threadIdx.x; j <= j1; j += blockDim.x) sum += expf(val(j) - m);
+    sum = block_sum(sum, sh) + expf(-m);
+    const float inv = 1.0f / sum;
+    for (int j = threadIdx.x; j < nk; j += blockDim.x) {
+        float x = j >= j0 && j <= j1 ? expf(val(j) - m) * inv : 0.0f;
+        asm volatile("" : "+v"(x));   // (the F32 product first, then its F16: not one fused rounding - to_f16's bits)
+        pr[j] = __float2half_rn(x);
+    }
+}
+
 __global__ void scatter_rows_kernel(const float* __restrict__ y, const int* __restrict__ row_of, int E,
                                     float* __restrict__ ent) {
     const int e = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x, r = row_of[e];
@@ -1483,6 +1537,19 @@ void attn_softmax_rows(float* S, int T, int Hkv, int per, int nk, int64_t klo, i
     attn_softmax_rows_kernel<<<(unsigned) (T * Hkv * per), 256, 0, s>>>(S, T, Hkv, per, nk, (long long) klo, (long long) p0,
                                                                          window, extent, tbl, sink, scale);
     check("attn_softmax_rows");
+}
+void attn_softmax_p16(float* S, int T, int Hkv, int per, int nk, int64_t klo, int64_t p0, int window, int extent,
+                      const float* tbl, const float* sink, float scale, uint16_t* P, cudaStream_t s, const float* relq,
+                      const float* rel_bias, int d_rel) {
+    if (relq != nullptr && extent > 1024) {
+        std::fprintf(stderr, "maya-ik2 attn_softmax_p16: an extent of %d\n", extent);
+        g_err.fetch_add(1);
+        return;
+    }
+    attn_softmax_p16_kernel<<<(unsigned) (T * Hkv * per), 256, 0, s>>>(S, T, Hkv, per, nk, (long long) klo, (long long) p0,
+                                                                        window, extent, tbl, sink, scale, (__half*) P,
+                                                                        relq, rel_bias, d_rel);
+    check("attn_softmax_p16");
 }
 void kv_finish(float* ky, float* vy, float* hist_k, float* hist_v, const float* k_conv, const float* v_conv,
                const float* dk, const float* dv, int Hkv, int D, float thr, float eps, uint16_t* K, uint16_t* V, int ring,

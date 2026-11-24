@@ -349,6 +349,9 @@ struct Model::Impl {
         int pf_prefetch = 24;   // (prefetch: RAM experts a layer copied ahead, IK2_HIP_PF_PREFETCH; 0: none)
         int pf_small_chunk = 0;           // (prompt: the chunk below pf_small_until, IK2_HIP_PF_SMALL_CHUNK; 0: none)
         int64_t pf_small_until = 8192;    // (IK2_HIP_PF_SMALL_UNTIL)
+        bool attn_p16 = true;   // (the prompt attention's softmax writes F16 itself; IK2_HIP_ATTN_P16_OLD: + to_f16)
+        bool attn_tbl = false;  // (... and makes its distance table itself, IK2_HIP_ATTN_OWN_TBL=1: the GEMM's bits, measured
+                                //  no faster - 1312 against 1325 tok/s at 38.9K - so off)
     } tn;
     void retune() {
         tn.cache_decay = env_d("IK2_HIP_CACHE_DECAY", 0.9, 0.0, 1.0);
@@ -371,6 +374,8 @@ struct Model::Impl {
         tn.pf_prefetch = (int) env_d("IK2_HIP_PF_PREFETCH", 24, 0, 384);
         tn.pf_small_chunk = (int) env_d("IK2_HIP_PF_SMALL_CHUNK", 0, 0, 1 << 20);
         tn.pf_small_until = (int64_t) env_d("IK2_HIP_PF_SMALL_UNTIL", 8192, 0, 1e12);
+        tn.attn_p16 = std::getenv("IK2_HIP_ATTN_P16_OLD") == nullptr;
+        tn.attn_tbl = env_d("IK2_HIP_ATTN_OWN_TBL", 0, 0, 1) != 0;
     }
     // streamed experts a pass, in two buffers: one is copied while the other's experts run - fewer passes against
     // 2 x kStage blobs of VRAM (IK2_HIP_STAGE).  Measured, 2048-token chunks, tok/s at 24 / 48 / 64 / 96: a 20K prompt
@@ -2686,8 +2691,12 @@ struct Model::Impl {
             }
             const int Q = per * ts, nk = (int) nkr;
             k::perm_heads(gp.c_q + (size_t) t0 * HD, gp.c_qp, ts, Hkv, per, D, true, s);
-            bool ok = cublasSgemm(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, extent, H * ts, g.d_rel, &one, l.rel_bias, g.d_rel,
-                                  gp.c_rel + (size_t) t0 * H * g.d_rel, g.d_rel, &zero, gp.c_tbl, extent) == CUBLAS_STATUS_SUCCESS;
+            // (the distance table: the GEMM's [ts H][extent], or made by the softmax itself, row by row - IK2_HIP_ATTN_OWN_TBL;
+            //  IK2_HIP_ATTN_P16_OLD: the separate softmax and to_f16, the GEMM's table)
+            const bool own_tbl = tn.attn_p16 && tn.attn_tbl && extent <= 1024;
+            bool ok = own_tbl || cublasSgemm(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, extent, H * ts, g.d_rel, &one, l.rel_bias,
+                                             g.d_rel, gp.c_rel + (size_t) t0 * H * g.d_rel, g.d_rel, &zero, gp.c_tbl,
+                                             extent) == CUBLAS_STATUS_SUCCESS;
             const size_t slot0 = (size_t) (l.ring > 0 ? klo % l.ring : klo);
             const int n1 = l.ring > 0 ? (int) std::min<int64_t>(nk, (int64_t) l.ring - (int64_t) slot0) : nk, n2 = nk - n1;
             // (the caches hold F16: the queries and the probabilities in F16 beside them, F32 sums)
@@ -2702,9 +2711,15 @@ struct Model::Impl {
                           (long long) Q * nk);
             if (n2 > 0)
                 ok = ok && bg(CUBLAS_OP_T, n2, D, l.K, gp.xh16, D, (long long) Q * D, &zero, gp.c_S + n1, nk, (long long) Q * nk);
-            k::attn_softmax_rows(gp.c_S, ts, Hkv, per, nk, klo, pf, window, extent, gp.c_tbl, gp.c_sink + (size_t) t0 * H,
-                                 1.0f / std::sqrt((float) D), s);
-            hk::to_f16(gp.c_S, (size_t) nk, Hkv * Q, nk, gp.c_P16, (size_t) nk, s);
+            if (tn.attn_p16) {   // (the probabilities straight to F16: the same bits, S never written)
+                k::attn_softmax_p16(gp.c_S, ts, Hkv, per, nk, klo, pf, window, extent, gp.c_tbl,
+                                    gp.c_sink + (size_t) t0 * H, 1.0f / std::sqrt((float) D), gp.c_P16, s,
+                                    own_tbl ? gp.c_rel + (size_t) t0 * H * g.d_rel : nullptr, l.rel_bias, g.d_rel);
+            } else {
+                k::attn_softmax_rows(gp.c_S, ts, Hkv, per, nk, klo, pf, window, extent, gp.c_tbl,
+                                     gp.c_sink + (size_t) t0 * H, 1.0f / std::sqrt((float) D), s);
+                hk::to_f16(gp.c_S, (size_t) nk, Hkv * Q, nk, gp.c_P16, (size_t) nk, s);
+            }
             ok = ok && bg(CUBLAS_OP_N, D, n1, l.V + slot0 * kvd, gp.c_P16, nk, (long long) Q * nk, &zero, gp.c_op, D,
                           (long long) Q * D);
             if (n2 > 0)

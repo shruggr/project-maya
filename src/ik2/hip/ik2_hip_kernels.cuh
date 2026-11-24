@@ -132,6 +132,12 @@ void perm_heads(const float* src, float* dst, int T, int Hkv, int per, int D, bo
 /// tbl [T H][extent] (rel . rel_bias per distance).
 void attn_softmax_rows(float* S, int T, int Hkv, int per, int nk, int64_t klo, int64_t p0, int window, int extent,
                        const float* tbl, const float* sink, float scale, cudaStream_t s);
+/// The same probabilities written as F16 to P [Hkv][T per][nk] (as hy4's to_f16 rounds them): one kernel for
+/// attn_softmax_rows + to_f16, the same bits, S read three times and left as it was.  relq non-null: tbl not read - each
+/// row's distance table made in the kernel from relq [T H][d_rel] and rel_bias [extent][d_rel] (extent <= 1024)
+void attn_softmax_p16(float* S, int T, int Hkv, int per, int nk, int64_t klo, int64_t p0, int window, int extent,
+                      const float* tbl, const float* sink, float scale, uint16_t* P, cudaStream_t s,
+                      const float* relq = nullptr, const float* rel_bias = nullptr, int d_rel = 0);
 
 // ---- the verify window: T (a few) tokens a decode step ----------------------------------------------------------
 /// mix_rms for T tokens (state st of token t at blocks + st ldb + t E; out [nq][T][E]): a block a token, each the
