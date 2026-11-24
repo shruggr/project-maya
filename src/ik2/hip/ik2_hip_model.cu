@@ -350,6 +350,7 @@ struct Model::Impl {
         int pf_small_chunk = 0;           // (prompt: the chunk below pf_small_until, IK2_HIP_PF_SMALL_CHUNK; 0: none)
         int64_t pf_small_until = 8192;    // (IK2_HIP_PF_SMALL_UNTIL)
         bool attn_p16 = true;   // (the prompt attention's softmax writes F16 itself; IK2_HIP_ATTN_P16_OLD: + to_f16)
+        bool attn_flash = false; // (the prompt attention as one flash kernel, IK2_HIP_ATTN_FLASH=1: not the same bits)
         bool attn_tbl = false;  // (... and makes its distance table itself, IK2_HIP_ATTN_OWN_TBL=1: the GEMM's bits, measured
                                 //  no faster - 1312 against 1325 tok/s at 38.9K - so off)
     } tn;
@@ -376,6 +377,7 @@ struct Model::Impl {
         tn.pf_small_until = (int64_t) env_d("IK2_HIP_PF_SMALL_UNTIL", 8192, 0, 1e12);
         tn.attn_p16 = std::getenv("IK2_HIP_ATTN_P16_OLD") == nullptr;
         tn.attn_tbl = env_d("IK2_HIP_ATTN_OWN_TBL", 0, 0, 1) != 0;
+        tn.attn_flash = env_d("IK2_HIP_ATTN_FLASH", 0, 0, 1) != 0;
     }
     // streamed experts a pass, in two buffers: one is copied while the other's experts run - fewer passes against
     // 2 x kStage blobs of VRAM (IK2_HIP_STAGE).  Measured, 2048-token chunks, tok/s at 24 / 48 / 64 / 96: a 20K prompt
@@ -550,6 +552,9 @@ struct Model::Impl {
     // 25 MB.  Measured, 2048-token chunks, tok/s at 32 / 64 / 128 / 256 / 512: a 20K prompt 1806 / 1861 / 1875 / 1844 /
     // 1841, 80K 1483 / 1524 / 1532 / 1513 / -
     int kTsMax = 128;
+    // the flash attention's tokens a pass (IK2_HIP_ATTN_FLASH; IK2_HIP_FLASH_TS, read at the load: the distance table's
+    // rows, flash_ts x n_head x rel_extent floats); 0 without it
+    int flash_ts = 0;
     bool chunk_scratch(Gpu& gp, std::string& err) {
         if (Tc <= 0) return true;
         const size_t blob_max = gp.blob_max;
@@ -589,7 +594,7 @@ struct Model::Impl {
                gp.alloc(gp.c_sh16, T * nu * (size_t) g.n_ff_exp, err) && gp.alloc(gp.c_bounds, (size_t) g.n_expert + 4, err) &&
                gp.alloc(gp.c_stok, T * nu, err) && gp.alloc(gp.c_srow, T * nu, err) && gp.alloc(gp.xh16, T * HD, err) &&
                gp.alloc(gp.wband, gp.wband_n, err) && gp.alloc(gp.c_S, gp.S_n, err) && gp.alloc(gp.c_P16, gp.S_n, err) &&
-               gp.alloc(gp.c_tbl, (size_t) kTsMax * H * (size_t) g.rel_extent, err);
+               gp.alloc(gp.c_tbl, (size_t) std::max(kTsMax, flash_ts) * H * (size_t) g.rel_extent, err);
     }
     // a layer's VRAM without its experts: every other tensor of the block, the caches and the histories
     size_t dense_bytes(int il) const {
@@ -1183,6 +1188,7 @@ struct Model::Impl {
         retune();
         kStage = (int) env_d("IK2_HIP_STAGE", 24, 1, 384);
         kTsMax = (int) env_d("IK2_HIP_TS_MAX", 128, 16, 1 << 16);
+        flash_ts = env_d("IK2_HIP_ATTN_FLASH", 0, 0, 1) != 0 ? (int) env_d("IK2_HIP_FLASH_TS", 128, 16, 1 << 16) : 0;
         kS_n = (size_t) env_d("IK2_HIP_S_FLOOR_MI", 44, 1, 4096) << 20;
         warm_n = (int) env_d("IK2_HIP_WARM_TOKENS", 256, 2, 1 << 20);
         o.rewind = (int) std::max<int64_t>(0, std::min<int64_t>(o.rewind, o.max_ctx));
@@ -2680,12 +2686,14 @@ struct Model::Impl {
         for (int t0 = 0; t0 < T;) {
             const size_t s_n = tn.s_use > 0 ? std::min(tn.s_use, gp.S_n) : gp.S_n;
             int ts = std::min(tn.ts_use > 0 ? std::min(tn.ts_use, gp.ts_max) : gp.ts_max, T - t0);
+            if (tn.attn_flash && flash_ts > 0 && D == 128) ts = std::min(flash_ts, T - t0);   // (the table sized for it)
             int64_t pf = p0 + t0, klo = l.swa ? std::max<int64_t>(0, pf - (g.n_swa - 1)) : 0, nkr = pf + ts - klo;
-            while (ts > 1 && (size_t) H * ts * (size_t) nkr > s_n) {
+            const bool flash = tn.attn_flash && flash_ts > 0 && D == 128;   // (no scores in memory: the pass need not shrink)
+            while (!flash && ts > 1 && (size_t) H * ts * (size_t) nkr > s_n) {
                 ts /= 2;
                 nkr = pf + ts - klo;
             }
-            if ((size_t) H * ts * (size_t) nkr > s_n) {
+            if (!flash && (size_t) H * ts * (size_t) nkr > s_n) {
                 err = "layer " + std::to_string(l.il) + ": the attention's scores do not fit (" + std::to_string(nkr) + " keys)";
                 return false;
             }
@@ -2693,10 +2701,21 @@ struct Model::Impl {
             k::perm_heads(gp.c_q + (size_t) t0 * HD, gp.c_qp, ts, Hkv, per, D, true, s);
             // (the distance table: the GEMM's [ts H][extent], or made by the softmax itself, row by row - IK2_HIP_ATTN_OWN_TBL;
             //  IK2_HIP_ATTN_P16_OLD: the separate softmax and to_f16, the GEMM's table)
-            const bool own_tbl = tn.attn_p16 && tn.attn_tbl && extent <= 1024;
+            const bool own_tbl = !flash && tn.attn_p16 && tn.attn_tbl && extent <= 1024;
             bool ok = own_tbl || cublasSgemm(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, extent, H * ts, g.d_rel, &one, l.rel_bias,
                                              g.d_rel, gp.c_rel + (size_t) t0 * H * g.d_rel, g.d_rel, &zero, gp.c_tbl,
                                              extent) == CUBLAS_STATUS_SUCCESS;
+            if (flash) {   // (IK2_HIP_ATTN_FLASH: S, the softmax and O in one kernel - not the same bits)
+                hk::to_f16(gp.c_qp, (size_t) D, Hkv * Q, D, gp.xh16, (size_t) D, s);
+                if (!ok || !k::attn_flash(gp.xh16, Q, per, Hkv, D, l.K, l.V, l.ring, klo, nk, pf, window, extent, gp.c_tbl,
+                                          gp.c_sink + (size_t) t0 * H, 1.0f / std::sqrt((float) D), gp.c_op, s)) {
+                    err = "layer " + std::to_string(l.il) + ": the flash attention did not run";
+                    return false;
+                }
+                k::perm_heads(gp.c_op, gp.c_ao + (size_t) t0 * HD, ts, Hkv, per, D, false, s);
+                t0 += ts;
+                continue;
+            }
             const size_t slot0 = (size_t) (l.ring > 0 ? klo % l.ring : klo);
             const int n1 = l.ring > 0 ? (int) std::min<int64_t>(nk, (int64_t) l.ring - (int64_t) slot0) : nk, n2 = nk - n1;
             // (the caches hold F16: the queries and the probabilities in F16 beside them, F32 sums)

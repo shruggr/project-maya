@@ -135,6 +135,13 @@ void attn_softmax_rows(float* S, int T, int Hkv, int per, int nk, int64_t klo, i
 /// The same probabilities written as F16 to P [Hkv][T per][nk] (as hy4's to_f16 rounds them): one kernel for
 /// attn_softmax_rows + to_f16, the same bits, S read three times and left as it was.  relq non-null: tbl not read - each
 /// row's distance table made in the kernel from relq [T H][d_rel] and rel_bias [extent][d_rel] (extent <= 1024)
+/// The pass's attention in one kernel (flash attention, AMD's matrix cores; IK2_HIP_ATTN_FLASH): qh the queries' F16
+/// rows [Hkv][Q][D] (Q = T per, row t per + r), the keys / values at positions klo .. klo + nk - 1 in the caches (ring
+/// slots, F16 [slot][Hkv][D]), the logits as attn_softmax_rows makes them; out [Hkv][Q][D] F32 as the second GEMM's.
+/// false: not this build or head size (D 128 only)
+bool attn_flash(const uint16_t* qh, int Q, int per, int Hkv, int D, const uint16_t* K, const uint16_t* V, int ring,
+                int64_t klo, int nk, int64_t pf, int window, int extent, const float* tbl, const float* sink, float scale,
+                float* out, cudaStream_t s);
 void attn_softmax_p16(float* S, int T, int Hkv, int per, int nk, int64_t klo, int64_t p0, int window, int extent,
                       const float* tbl, const float* sink, float scale, uint16_t* P, cudaStream_t s,
                       const float* relq = nullptr, const float* rel_bias = nullptr, int d_rel = 0);
