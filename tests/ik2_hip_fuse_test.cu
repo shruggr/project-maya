@@ -25,7 +25,7 @@ static void cp(void* d, const void* s, size_t b) { CK(cudaMemcpy(d, s, b, cudaMe
 static size_t ndiff(const void* a, const void* b, size_t bytes) { size_t n = 0; for (size_t i = 0; i < bytes; ++i) n += ((const unsigned char*) a)[i] != ((const unsigned char*) b)[i]; return n; }
 int main(int argc, char** argv) {
     const int reps = argc > 1 ? std::atoi(argv[1]) : 300;
-    const int E = 4608, W = 16, NB = 9, NE = 384, NU = 8, H = 48, Hkv = 8, D = 128, NR = 16, RING = 1024;
+    const int E = 4608, W = 16, NB = 16, NE = 384, NU = 8, H = 48, Hkv = 8, D = 128, NR = 16, RING = 1024;
     cudaStream_t s; CK(cudaStreamCreate(&s)); cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
     auto timeit = [&](auto&& f) { for (int i = 0; i < 20; ++i) f(); CK(cudaEventRecord(e0, s)); for (int i = 0; i < reps; ++i) f(); CK(cudaEventRecord(e1, s)); CK(cudaEventSynchronize(e1)); float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); return 1e3f * ms / reps; };
     int bad = 0;
@@ -39,7 +39,8 @@ int main(int argc, char** argv) {
             out[f] = dev<float>(3 * (size_t) W * E); q[f] = dev<int8_t>(3 * (size_t) W * E); d[f] = dev<float>(3 * (size_t) W * E / 32); }
         int8_t* xq = dev<int8_t>(3 * (size_t) W * E); float* xd = dev<float>(3 * (size_t) W * E / 32);
         std::printf("mix: %3s %3s %3s %4s %4s | %8s %8s | %s\n", "nb", "nq", "T", "conv", "dup", "old us", "new us", "bytes differing (out cur blk h1 q d)");
-        for (int nb : {1, 4, 8}) for (int nq : {1, 3}) for (int T : {1, 2, 4, 8}) for (int cv = 0; cv < 3; ++cv) for (int dup = 0; dup < 2; ++dup) {
+        for (int nb : {1, 4, 8, 15}) for (int nq : {1, 3}) for (int T : {1, 2, 4, 8}) for (int cv = 0; cv < 3; ++cv) for (int dup = 0; dup < 2; ++dup) {
+            if (nb == 15 && cv == 2) continue;
             if (dup && (nq != 1 || T == 1)) continue;
             if (cv == 0 && dup) continue;
             const size_t ldb = (size_t) T * E, TE = ldb;

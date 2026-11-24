@@ -2,13 +2,33 @@
 #include "ik2_hip_lane.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace ik2hip {
 
 namespace iqc = strata::ds4::gguf;
 
 namespace {
+// IK2_HIP_LANE_PROF=1 (measurements): cpu_experts_rows' parts summed over the run, printed at the exit
+struct LaneProf {
+    bool on = std::getenv("IK2_HIP_LANE_PROF") != nullptr;
+    long long calls = 0, ents = 0, experts = 0, rows = 0;
+    double t[5] = {0, 0, 0, 0, 0};   // the inputs' int8 rows, gate + up, h's rows, down, the weighted sum
+    ~LaneProf() {
+        if (!on || calls == 0) return;
+        const double tot = t[0] + t[1] + t[2] + t[3] + t[4];
+        std::fprintf(stderr, "LANE_PROF %lld calls (layers with RAM picks), %.2f picks, %.2f experts, %.2f rows a call; us a call: "
+                             "act %.1f, gate+up %.1f, h quant %.1f, down %.1f, sum %.1f, total %.1f; experts' bytes %.1f GB/s\n",
+                     calls, (double) ents / calls, (double) experts / calls, (double) rows / calls, 1e6 * t[0] / calls,
+                     1e6 * t[1] / calls, 1e6 * t[2] / calls, 1e6 * t[3] / calls, 1e6 * t[4] / calls, 1e6 * tot / calls,
+                     bytes_per_expert * (double) experts / std::max(1e-9, t[1] + t[3]) / 1e9);
+    }
+    double bytes_per_expert = 0;
+} g_lp;
+inline double lp_now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 constexpr int kRowChunk = 128;   // rows a work item
 struct Scratch {
     std::vector<float> gu, y;
@@ -147,13 +167,28 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
             }
     }
     sc.ustart.push_back((int) sc.uent.size());
+    double tp = g_lp.on ? lp_now() : 0.0;
+    auto lap = [&](int k) {
+        if (!g_lp.on) return;
+        const double t2 = lp_now();
+        g_lp.t[k] += t2 - tp;
+        tp = t2;
+    };
     {
         bool used[64] = {};   // (at least kWin, 9 rows)
         for (const CpuRowEntry& e : entries)
             if (e.row >= 0 && e.row < 64) used[e.row] = true;
         for (int t = 0; t < T && t < 64; ++t)
             if (used[t]) iqc::iq_cpu_quant(f.gu_act, x + (size_t) t * E, E, sc.act.data() + (size_t) t * f.act_bytes);
+        if (g_lp.on) {
+            ++g_lp.calls;
+            g_lp.ents += n;
+            g_lp.experts += U;
+            for (int t = 0; t < T && t < 64; ++t) g_lp.rows += used[t];
+            g_lp.bytes_per_expert = (double) ex.blob;
+        }
     }
+    lap(0);
     const int h_chunks = (F + kRowChunk - 1) / kRowChunk, dn_chunks = (E + kRowChunk - 1) / kRowChunk;
     lane.parallel_for(U * h_chunks, [&](int it) {
         const int u = it / h_chunks, r0 = (it % h_chunks) * kRowChunk, r1 = std::min(F, r0 + kRowChunk);
@@ -161,21 +196,25 @@ void cpu_experts_rows(hy4::Lane& lane, const CpuExperts& ex, const std::vector<C
         const uint8_t* gate = ex.gu(sc.uslot[(size_t) u]);
         iqc::iq_cpu_gate_up(f, gate, gate + (size_t) F * f.gu_row, sc.ap.data() + q0, nt, sc.gp.data() + q0, r0, r1, 0.0f);
     });
+    lap(1);
     lane.parallel_for(n, [&](int i) {
         iqc::iq_cpu_quant(f.d_act, sc.gu.data() + (size_t) i * 2 * F, F, sc.hq.data() + (size_t) i * f.h_bytes);
     });
+    lap(2);
     lane.parallel_for(U * dn_chunks, [&](int it) {
         const int u = it / dn_chunks, r0 = (it % dn_chunks) * kRowChunk, r1 = std::min(E, r0 + kRowChunk);
         const int q0 = sc.ustart[(size_t) u], nt = sc.ustart[(size_t) u + 1] - q0;
         iqc::iq_cpu_down(f, ex.dn(sc.uslot[(size_t) u]), sc.hp.data() + q0, nt,
                          sc.yp.data() + q0, r0, r1);
     });
+    lap(3);
     for (int i = 0; i < n; ++i) {   // (a row's sum in its picks' order, as the row alone)
         const float w = entries[(size_t) i].w;
         const float* y = sc.y.data() + (size_t) i * E;
         float* o = out + (size_t) entries[(size_t) i].row * E;
         for (int d = 0; d < E; ++d) o[d] += w * y[d];
     }
+    lap(4);
 #endif
 }
 
