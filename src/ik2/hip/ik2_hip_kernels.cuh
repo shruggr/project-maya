@@ -77,7 +77,8 @@ bool attention_chunk_rows(const float* q, const float* rel, const float* sink, i
 int attention_chunk_keys();
 /// attention_chunk_rows' results from the matrix cores (IK2_HIP_ATTN_MMA, own runtime 2026-11-27): the keys in splits
 /// of IK2_HIP_ATTN_MMA_SK (512) at fixed positions, 16 query rows a block, v_wmma over 64-key tiles; the same
-/// arguments, partials and combine.  Not its bits (the queries and probabilities in F16, other orders); a row's result
+/// arguments, partials and combine.  Not its bits (other orders; the queries and probabilities in two F16 halves each,
+/// IK2_HIP_ATTN_MMA_PREC=0: one); a row's result
 /// does not depend on T.  false (nothing launched): not gfx12 / HIP, D not 128, or the scratch does not hold the parts
 bool attention_mma_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
                         const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,

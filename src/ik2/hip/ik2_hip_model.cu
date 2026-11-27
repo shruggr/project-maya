@@ -413,7 +413,7 @@ struct Model::Impl {
         tn.attn_flash = env_d("IK2_HIP_ATTN_FLASH", 0, 0, 1) != 0;
         tn.kv_sim = (int) env_d("IK2_HIP_KV_SIM", 0, 0, 4);
         if (o.kv == 1) tn.kv_sim = 0;   // (the simulation rounds F16 rows: not with the 8-bit cache)
-        tn.attn_mma = env_d("IK2_HIP_ATTN_MMA", 0, 0, 2) != 0;
+        tn.attn_mma = env_d("IK2_HIP_ATTN_MMA", 0, 0, 1) != 0;
         tn.sort_old = std::getenv("IK2_HIP_SORT_OLD") != nullptr;
     }
     // streamed experts a pass, in two buffers: one is copied while the other's experts run - fewer passes against

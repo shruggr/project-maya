@@ -2295,7 +2295,8 @@ __global__ void __launch_bounds__(RPB * 32) gemv_1_rpb_kernel(const float* __res
 // splits and their tiles at fixed positions, a row's masked tiles adding exact zeros): a window's rows give the token
 // steps' bits.  Not attention_chunk_rows' bits: the queries and probabilities in F16, other orders.
 // PREC: the queries and the probabilities each in two F16 halves (x = hi + lo, two products), so the products see F32
-// inputs to ~2^-22 as the chunks do - only the order of the sums differs from theirs (IK2_HIP_ATTN_MMA=2)
+// inputs to ~2^-22 as the chunks do - only the order of the sums differs from theirs (the default;
+// IK2_HIP_ATTN_MMA_PREC=0: one F16 each)
 template <bool Q8, bool PREC>
 __global__ void __launch_bounds__(128) attn_mma_rows_kernel(const float* __restrict__ q, const float* __restrict__ rel,
                                                            const float* __restrict__ sink, int T, int H, int Hkv,
@@ -2649,9 +2650,9 @@ bool attention_mma_rows(const float* q, const float* rel, const float* sink, int
                         cudaStream_t s, int8_t* q8, float* d8, int kvq) {
 #if defined(STRATA_USE_HIP)
     if (D != fl::D || H % Hkv || (q8 && D % 32)) return false;
-    // (IK2_HIP_ATTN_MMA_PREC=1 / IK2_HIP_ATTN_MMA=2: the queries and probabilities in two F16 halves each)
-    static const bool prec = (std::getenv("IK2_HIP_ATTN_MMA_PREC") && std::atoi(std::getenv("IK2_HIP_ATTN_MMA_PREC")) != 0) ||
-                             (std::getenv("IK2_HIP_ATTN_MMA") && std::atoi(std::getenv("IK2_HIP_ATTN_MMA")) == 2);
+    // (the queries and probabilities in two F16 halves each unless IK2_HIP_ATTN_MMA_PREC=0: measured, 1-6% of the kernel
+    //  for outputs 100x closer to the chunks' - max |d| / rms ~1e-5 against 1.2e-3 - so only the sums' order differs)
+    static const bool prec = !(std::getenv("IK2_HIP_ATTN_MMA_PREC") && std::atoi(std::getenv("IK2_HIP_ATTN_MMA_PREC")) == 0);
     static const int SK = [] {   // (IK2_HIP_ATTN_MMA_SK: keys a split, a multiple of 64; 512 by default)
         int v = std::getenv("IK2_HIP_ATTN_MMA_SK") ? std::atoi(std::getenv("IK2_HIP_ATTN_MMA_SK")) : 512;
         return std::max(64, v / 64 * 64);
