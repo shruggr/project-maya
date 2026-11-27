@@ -1478,6 +1478,7 @@ int usage() {
                  "  --parity-force-picks  (parity) each reference a second time, every layer taking the reference's\n"
                  "                      picks (what is left is not the router's near-ties)\n"
                  "  --no-expert-cache   the experts stay where the load put them (no cache moves)\n"
+                 "  --kv f16|q8         the global layers' K / V cache: F16 (the default) or 8-bit (int8, a scale a row)\n"
                  "  --parallel N        (serve) N conversations at once (1 .. 8, maya-ds4's): each its own caches and\n"
                  "                      drafter state in VRAM; GEN rid=<id>, STOP <rid>\n"
                  "  --multi-check DIR   (tests, with --parallel N) N conversations of a reference's prompt decoded a token\n"
@@ -1578,6 +1579,15 @@ int main(int argc, char** argv) {
         else if (a == "--verbose") o.verbose = true;
         else if (a == "--serve") serving = true;
         else if (a == "--no-expert-cache") o.expert_cache = false;
+        else if (a == "--kv") {   // (the global layers' K / V cache: f16, the default, or q8)
+            const std::string v = val();
+            if (v == "q8") o.kv = 1;
+            else if (v == "f16") o.kv = 0;
+            else {
+                std::fprintf(stderr, "maya-ik2: --kv %s: f16 or q8\n", v.c_str());
+                return 2;
+            }
+        }
         else if (a == "--parallel") {   // (maya-ds4's: --serve, 1 .. 8 conversations at once)
             o.seqs = std::atoi(val().c_str());
             if (o.seqs < 1 || o.seqs > 8) {

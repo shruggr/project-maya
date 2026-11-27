@@ -62,6 +62,9 @@ struct Options {
     // --parallel (maya-ds4's o.seqs, 1 .. 8): conversations held at once, each its own caches, histories, saved
     // histories and drafter state in VRAM (allocated before the experts are placed: they take what is left)
     int seqs = 1;
+    // --kv (q8: 1): the global layers' K / V cache in 8 bits - int8 with an F32 scale a (position, kv head) row of
+    // head_dim values, read back as F16 (ik2_hip_kernels.cuh, kv8_row_bytes) - about half the bytes; 0: F16, as before
+    int kv = 0;
     bool verbose = false;
 };
 

@@ -13,6 +13,11 @@ namespace ik2hip::k {
 // (n_layers_per_attn_res_block 6)
 constexpr int kMaxStates = 16;
 
+/// The 8-bit cache (--kv q8, the global layers' K and V): a slot's row is the Hkv heads' D int8 values side by side,
+/// then their Hkv F32 scales (ik2_hip_kernels.cu, kv8_put: each value from its F16 rounding, max |x| / 127 a head's
+/// row, read back as F16(q sc)).  The kernels below that take a cache take `kvq` 1 for this layout (0: F16 rows)
+__host__ __device__ constexpr size_t kv8_row_bytes(int Hkv, int D) { return (size_t) Hkv * D + 4 * (size_t) Hkv; }
+
 /// The attention over the depth: the states are the nb rows of blocks [nb][E] and cur [E], each RMS-normed (no gain,
 /// eps); for each of the nq queries (query [nq][E]) w = softmax_s(S_s . q / sqrt(E)), out[q] = sum_s w_s S_s.
 /// stat: 4 kMaxStates floats of scratch.
@@ -67,7 +72,8 @@ bool attention_split_rows(const float* q, const float* rel, const float* sink, i
 bool attention_chunk_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
                           const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
                           int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
-                          cudaStream_t s, int8_t* q8 = nullptr, float* d8 = nullptr);   // (q8 / d8: q8_rows of out too)
+                          cudaStream_t s, int8_t* q8 = nullptr, float* d8 = nullptr,   // (q8 / d8: q8_rows of out too)
+                          int kvq = 0);   // (kvq 1: K / V the 8-bit cache's rows)
 int attention_chunk_keys();
 
 /// x *= sigmoid(g), n values
@@ -99,7 +105,7 @@ void lane_add(const unsigned* flag, unsigned v, const int* ids, const int* slot,
 /// left in ky / vy and stored as F16 in the caches' row p % ring (ring 0: p).  D <= 256.
 void kv_finish(float* ky, float* vy, float* hist_k, float* hist_v, const float* k_conv, const float* v_conv,
                const float* dk, const float* dv, int Hkv, int D, float thr, float eps, uint16_t* K, uint16_t* V, int ring,
-               int64_t p, cudaStream_t s);
+               int64_t p, cudaStream_t s, int kvq = 0);
 /// head_clip of q (H rows of D, scale qs, threshold qthr) and of rel (H rows of n_rel, scale rs, threshold rthr), both
 /// times mul
 void clip2(float* q, int H, int D, const float* qs, float qthr, float* rel, int n_rel, const float* rs, float rthr,
@@ -122,7 +128,8 @@ void conv_rows(const float* y, int T, float* hist, const float* w, int C, const 
 void head_clip_rows(float* x, int T, int H, int n, const float* scale, float thr, float alpha, double floor, int64_t p0,
                     cudaStream_t s);
 /// cache row (p0 + t) % ring (ring 0: p0 + t) = src[t] rounded to F16, rows of n values
-void store_rows(const float* src, int T, int n, uint16_t* cache, int ring, int64_t p0, cudaStream_t s);
+void store_rows(const float* src, int T, int n, uint16_t* cache, int ring, int64_t p0, cudaStream_t s, int kvq = 0,
+                int Hkv = 0);   // (kvq 1: the 8-bit rows, n = Hkv D)
 /// The heads of a chunk regrouped for the batched GEMMs: x [T][Hkv per][D] <-> xp [Hkv][T per][D] (to_p: x -> xp)
 void perm_heads(const float* src, float* dst, int T, int Hkv, int per, int D, bool to_p, cudaStream_t s);
 /// The chunk attention's middle step.  S [Hkv][T per][nk] holds each query's raw dots with the keys at positions
@@ -141,7 +148,10 @@ void attn_softmax_rows(float* S, int T, int Hkv, int per, int nk, int64_t klo, i
 /// false: not this build or head size (D 128 only)
 bool attn_flash(const uint16_t* qh, int Q, int per, int Hkv, int D, const uint16_t* K, const uint16_t* V, int ring,
                 int64_t klo, int nk, int64_t pf, int window, int extent, const float* tbl, const float* sink, float scale,
-                float* out, cudaStream_t s);
+                float* out, cudaStream_t s, int kvq = 0);   // (kvq 1: the 8-bit cache's rows)
+/// (--kv q8) n slots of the 8-bit cache from slot0 (no ring) as F16 rows [n][Hkv D] (the F16 cache's layout), for the
+/// prompt path's GEMMs
+void kv8_f16(const uint16_t* cache, int64_t slot0, int n, int Hkv, int D, uint16_t* out, cudaStream_t s);
 void attn_softmax_p16(float* S, int T, int Hkv, int per, int nk, int64_t klo, int64_t p0, int window, int extent,
                       const float* tbl, const float* sink, float scale, uint16_t* P, cudaStream_t s,
                       const float* relq = nullptr, const float* rel_bias = nullptr, int d_rel = 0);
@@ -174,7 +184,7 @@ int attention_rows_fit(int H, int D, int64_t keys, size_t S_floats);
 /// [T][Hkv][4] or null; the rows' K / V into the caches at p0 .. (nothing else is written)
 void kv_finish_rows(const float* in_k, const float* in_v, int T, const float* hk0, const float* hv0, float* hk1, float* hv1,
                     const float* k_conv, const float* v_conv, const float* dk, const float* dv, int Hkv, int D, float thr,
-                    float eps, uint16_t* K, uint16_t* V, int ring, int64_t p0, cudaStream_t s);
+                    float eps, uint16_t* K, uint16_t* V, int ring, int64_t p0, cudaStream_t s, int kvq = 0);
 /// clip2 for T rows (q [T][H][D], rel [T][H][n_rel]), row t times mul[t]
 void clip2_rows(float* q, int T, int H, int D, const float* qs, float qthr, float* rel, int n_rel, const float* rs,
                 float rthr, const float* mul, cudaStream_t s);
@@ -229,7 +239,7 @@ void kv_clip_rows(const float* in_k, const float* in_v, int T, const float* hk0,
                   float qthr, float* rel, int n_rel, const float* rs, float rthr, const float* mul, cudaStream_t s,
                   const float* sink_w = nullptr, const float* sink_x = nullptr, float* sink_y = nullptr, int ns = 0,
                   int k = 0, const float* kp_w = nullptr, const float* vp_w = nullptr, const float* kp_x = nullptr,
-                  const float* vp_x = nullptr, float* dk_out = nullptr, float* dv_out = nullptr);
+                  const float* vp_x = nullptr, float* dk_out = nullptr, float* dv_out = nullptr, int kvq = 0);
 
 // hy4::k::gemv_f32w (alpha 1, its 16-byte forms; T columns, at most 16) with rpb (1, 2, 4, 8) rows a block: the same
 // bits; false: the shapes are not its (nothing launched)
@@ -237,4 +247,9 @@ bool gemv_f32_rows(int rpb, const float* W, size_t ld, int k, int n, const float
                    cudaStream_t s);
 int errors();
 
+/// (tests, IK2_HIP_KV_SIM) an 8-bit cache's rounding, in place in the F16 cache rows (p0 + t) % ring (ring 0: p0 + t),
+/// t < T, of K and V [slot][Hkv][D] (D a power of two <= 256): each value as the format would give it back.  mode 1: int8,
+/// a scale a (row, kv head) of D (max |x| / 127, F32); 2: int8, an F16 scale a 32 values (Q8_0); 3: FP8 E4M3, a scale
+/// a (row, kv head) (max |x| / 448); 4: FP8 E4M3 unscaled
+void kv_sim(uint16_t* K, uint16_t* V, int ring, int64_t p0, int T, int Hkv, int D, int mode, cudaStream_t s);
 }  // namespace ik2hip::k

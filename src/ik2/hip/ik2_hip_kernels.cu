@@ -51,6 +51,42 @@ __device__ float block_max(float v, float* sh) {
     return r;
 }
 
+// ---- the 8-bit cache (--kv q8, the global layers): a slot's row is kv8_row_bytes(Hkv, D) bytes, the Hkv heads' D
+// int8 values side by side, then their Hkv F32 scales.  A value x is stored from its F16 rounding x16 (the F16 cache's
+// value): the scale of its (slot, head) row sc = max |x16| / 127, q = rint(x16 / sc) in -127 .. 127; it is read back as
+// F16(q sc), so every kernel downstream of the read sees F16 values as it does with the F16 cache (IK2_HIP_KV_SIM=1
+// rounds the F16 cache's rows the same way: the same bits) ---------------------------------------------------------
+// a block's (slot, head) row from the threads' values x (thread i < D: value i; every thread of the block calls it)
+__device__ void kv8_put(void* cache, size_t slot, int Hkv, int D, int h, float x, float* sh) {
+    const int i = threadIdx.x;
+    const float x16 = i < D ? __half2float(__float2half_rn(x)) : 0.0f;
+    const float sc = block_max(fabsf(x16), sh) / 127.0f;
+    uint8_t* row = (uint8_t*) cache + slot * kv8_row_bytes(Hkv, D);
+    if (i < D) ((int8_t*) row)[(size_t) h * D + i] = (int8_t) (sc > 0.0f ? fminf(fmaxf(rintf(x16 / sc), -127.0f), 127.0f) : 0.0f);
+    if (i == 0) ((float*) (row + (size_t) Hkv * D))[h] = sc;
+}
+__device__ __forceinline__ uint32_t kv8_h2(int a, int b, float sc) {
+    const __half2 v = __floats2half2_rn((float) a * sc, (float) b * sc);
+    return *(const uint32_t*) &v;
+}
+// values c .. c + 7 of head g's row in slot (c a multiple of 8) as eight F16s
+__device__ __forceinline__ uint4 kv8_get8(const void* cache, size_t slot, int Hkv, int D, int g, int c) {
+    const uint8_t* row = (const uint8_t*) cache + slot * kv8_row_bytes(Hkv, D);
+    const uint2 b = *(const uint2*) (row + (size_t) g * D + c);
+    const float sc = ((const float*) (row + (size_t) Hkv * D))[g];
+    auto q = [](uint32_t w, int k) { return (int) (int8_t) (uint8_t) (w >> (8 * k)); };
+    return make_uint4(kv8_h2(q(b.x, 0), q(b.x, 1), sc), kv8_h2(q(b.x, 2), q(b.x, 3), sc), kv8_h2(q(b.y, 0), q(b.y, 1), sc),
+                      kv8_h2(q(b.y, 2), q(b.y, 3), sc));
+}
+// values c .. c + 3 (c a multiple of 4) as two F16 pairs
+__device__ __forceinline__ uint2 kv8_get4(const void* cache, size_t slot, int Hkv, int D, int g, int c) {
+    const uint8_t* row = (const uint8_t*) cache + slot * kv8_row_bytes(Hkv, D);
+    const uint32_t b = *(const uint32_t*) (row + (size_t) g * D + c);
+    const float sc = ((const float*) (row + (size_t) Hkv * D))[g];
+    auto q = [](uint32_t w, int k) { return (int) (int8_t) (uint8_t) (w >> (8 * k)); };
+    return make_uint2(kv8_h2(q(b, 0), q(b, 1), sc), kv8_h2(q(b, 2), q(b, 3), sc));
+}
+
 // block s = a state: stat[4 s] = its 1 / rms, stat[4 s + 1 + q] = (state / rms) . query q
 __global__ void mix_stat_kernel(const float* __restrict__ blocks, int nb, const float* __restrict__ cur, int E,
                                 const float* __restrict__ query, int nq, float eps, float* __restrict__ stat) {
@@ -621,7 +657,7 @@ __global__ void attn_combine_seq_big_kernel(const float* __restrict__ st, const 
 // row's chunk maximum, sum and partial values in the keys' order, at chunk boundaries that are multiples of kACK
 // positions whatever the first key is: a row's result does not depend on T (the token step and a verify window give the
 // same bits). The chunks' parts go through the same combine as attention_split_rows.
-template <int CK, int RU>
+template <int CK, int RU, bool Q8 = false>   // (Q8: the 8-bit cache's rows, read as F16 into the same LDS)
 __global__ void attn_chunk_rows_kernel(const float* __restrict__ q, const float* __restrict__ rel,
                                        const float* __restrict__ sink, int T, int H, int Hkv, int D, int n_rel,
                                        const float* __restrict__ rel_bias, int extent, const __half* __restrict__ K,
@@ -640,6 +676,19 @@ __global__ void attn_chunk_rows_kernel(const float* __restrict__ q, const float*
         sq[i] = q[((size_t) t * H + h) * D + i % D];
     }
     const int n = min(CK, nk - j0);
+    if (Q8) {   // (four values a thread: D a multiple of 4)
+        for (int i = tid; i < CK * (D / 4); i += nt) {
+            const int jj = i / (D / 4), c = (i % (D / 4)) * 4;
+            uint2 v = make_uint2(0u, 0u);
+            if (jj < n) {
+                long long sl = base + j0 + jj;
+                if (ring > 0 && sl >= ring) sl -= ring;
+                v = kv8_get4(K, (size_t) sl, Hkv, D, g, c);
+            }
+            *(uint32_t*) (skv + (size_t) jj * DP + c) = v.x;
+            *(uint32_t*) (skv + (size_t) jj * DP + c + 2) = v.y;
+        }
+    } else
     for (int i = tid; i < CK * (D / 2); i += nt) {
         const int jj = i / (D / 2), c = (i % (D / 2)) * 2;
         __half2 v = __floats2half2_rn(0.0f, 0.0f);
@@ -687,6 +736,19 @@ __global__ void attn_chunk_rows_kernel(const float* __restrict__ q, const float*
     }
     __syncthreads();
     for (int e = tid; e < TP * CK; e += nt) sw[e] = sw[e] > -INFINITY ? expf(sw[e] - smx[e / CK]) : 0.0f;
+    if (Q8) {
+        for (int i = tid; i < CK * (D / 4); i += nt) {
+            const int jj = i / (D / 4), c = (i % (D / 4)) * 4;
+            uint2 v = make_uint2(0u, 0u);
+            if (jj < n) {
+                long long sl = base + j0 + jj;
+                if (ring > 0 && sl >= ring) sl -= ring;
+                v = kv8_get4(V, (size_t) sl, Hkv, D, g, c);
+            }
+            *(uint32_t*) (skv + (size_t) jj * DP + c) = v.x;
+            *(uint32_t*) (skv + (size_t) jj * DP + c + 2) = v.y;
+        }
+    } else
     for (int i = tid; i < CK * (D / 2); i += nt) {   // (the keys are done with: the chunk's values in their place)
         const int jj = i / (D / 2), c = (i % (D / 2)) * 2;
         __half2 v = __floats2half2_rn(0.0f, 0.0f);
@@ -728,7 +790,7 @@ __global__ void kv_finish_rows_kernel(const float* __restrict__ in_k, const floa
                                       float* __restrict__ hk1, float* __restrict__ hv1, const float* __restrict__ k_conv,
                                       const float* __restrict__ v_conv, const float* __restrict__ dk,
                                       const float* __restrict__ dv, int T, int Hkv, int D, float thr, float eps,
-                                      __half* __restrict__ K, __half* __restrict__ V, int ring, long long p0) {
+                                      __half* __restrict__ K, __half* __restrict__ V, int ring, long long p0, int kvq) {
     __shared__ float sh[256];
     const int h = blockIdx.x, isv = blockIdx.y, t = blockIdx.z, i = threadIdx.x, C = Hkv * D, c = h * D + i;
     const float* y = isv ? in_v : in_k;
@@ -758,7 +820,10 @@ __global__ void kv_finish_rows_kernel(const float* __restrict__ in_k, const floa
     }
     const float ss = block_sum(o * o, sh);
     const float f = isv ? rsqrtf(ss / (float) D + eps) : fminf(1.0f, thr / (sqrtf(ss) + 1e-6f));
-    if (i < D) {
+    if (kvq) {
+        const long long p = p0 + t;
+        kv8_put(isv ? V : K, (size_t) (ring > 0 ? p % ring : p), Hkv, D, h, o * f, sh);
+    } else if (i < D) {
         const long long p = p0 + t;
         (isv ? V : K)[(size_t) (ring > 0 ? p % ring : p) * C + c] = __float2half_rn(o * f);
     }
@@ -1053,7 +1118,7 @@ __global__ void kv_finish_kernel(float* __restrict__ ky, float* __restrict__ vy,
                                  float* __restrict__ hist_v, const float* __restrict__ k_conv,
                                  const float* __restrict__ v_conv, const float* __restrict__ dk,
                                  const float* __restrict__ dv, int Hkv, int D, float thr, float eps,
-                                 __half* __restrict__ K, __half* __restrict__ V, size_t row) {
+                                 __half* __restrict__ K, __half* __restrict__ V, size_t row, int kvq) {
     __shared__ float sh[256];
     const int h = blockIdx.x, isv = blockIdx.y, i = threadIdx.x, C = Hkv * D, c = h * D + i;
     float* y = isv ? vy : ky;
@@ -1078,8 +1143,9 @@ __global__ void kv_finish_kernel(float* __restrict__ ky, float* __restrict__ vy,
     if (i < D) {
         o *= f;
         y[c] = o;
-        (isv ? V : K)[row * C + c] = __float2half_rn(o);
+        if (!kvq) (isv ? V : K)[row * C + c] = __float2half_rn(o);
     }
+    if (kvq) kv8_put(isv ? V : K, row, Hkv, D, h, o, sh);
 }
 __global__ void clip2_kernel(float* __restrict__ q, int D, const float* __restrict__ qs, float qthr,
                              float* __restrict__ rel, int n_rel, const float* __restrict__ rs, float rthr, float mul) {
@@ -1182,6 +1248,13 @@ __global__ void head_clip_rows_kernel(float* __restrict__ x, int H, int n, const
     const float f = fminf(1.0f, thr / norm);
     const float mul = alpha != 0.0f ? 1.0f + alpha * logf(fmaxf(1.0f, (float) (p0 + t + 1) * inv_floor)) : 1.0f;
     if (i < n) xr[i] = v * f * mul;
+}
+// (--kv q8) a block a (row, head): store_rows' values as kv8_put stores them
+__global__ void store_rows8_kernel(const float* __restrict__ src, int Hkv, int D, void* cache, int ring, long long p0) {
+    __shared__ float sh[256];
+    const int h = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
+    const long long p = p0 + t;
+    kv8_put(cache, (size_t) (ring > 0 ? p % ring : p), Hkv, D, h, i < D ? src[((size_t) t * Hkv + h) * D + i] : 0.0f, sh);
 }
 __global__ void store_rows_kernel(const float* __restrict__ src, int n, __half* __restrict__ cache, int ring, long long p0) {
     const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1480,7 +1553,7 @@ __global__ void __launch_bounds__(128) attn_flash_kernel(const uint16_t* __restr
 // l % 16) and 8 keys / dimensions (rows 8 (l / 16) ..): its 8 probabilities a 16-key step are the second product's B
 // operand as they stand (no trip through LDS), the row's max and sum one shuffle across the halves, the rescale one
 // number a lane; the query's F16 values in registers; V transposed 8 x 8 in registers and stored 16 bytes at a time
-template <int NW>
+template <int NW, bool Q8 = false>   // (Q8: the 8-bit cache's rows, made F16 as they are staged)
 __global__ void __launch_bounds__(NW * 32) attn_flash2_kernel(const uint16_t* __restrict__ qh16, int Q, int per, int Hkv,
                                                           const uint16_t* __restrict__ K16, const uint16_t* __restrict__ V16,
                                                           int ring, long long klo, int nk, long long pf, int window,
@@ -1537,7 +1610,7 @@ __global__ void __launch_bounds__(NW * 32) attn_flash2_kernel(const uint16_t* __
                 if (j < j_end) {
                     const long long kp = klo + j;
                     const size_t slot = (size_t) (ring > 0 ? kp % ring : kp);
-                    kv = ((const uint4*) (K + (slot * Hkv + g) * D))[lk & 15];
+                    kv = Q8 ? kv8_get8(K16, slot, Hkv, D, g, (lk & 15) * 8) : ((const uint4*) (K + (slot * Hkv + g) * D))[lk & 15];
                 }
                 *(uint4*) (ks + rr * KS + (lk & 15) * 8) = kv;
             }
@@ -1551,7 +1624,7 @@ __global__ void __launch_bounds__(NW * 32) attn_flash2_kernel(const uint16_t* __
                 if (j < j_end) {
                     const long long kp = klo + j;
                     const size_t slot = (size_t) (ring > 0 ? kp % ring : kp);
-                    vv = ((const uint4*) (V + (slot * Hkv + g) * D))[vp];
+                    vv = Q8 ? kv8_get8(V16, slot, Hkv, D, g, vp * 8) : ((const uint4*) (V + (slot * Hkv + g) * D))[vp];
                 }
                 a[k][0] = vv.x;
                 a[k][1] = vv.y;
@@ -2052,7 +2125,7 @@ __global__ void kv_clip_rows_kernel(const float* __restrict__ in_k, const float*
                                     __half* __restrict__ K, __half* __restrict__ V, int ring, long long p0,
                                     float* __restrict__ q, int H, const float* __restrict__ qs, float qthr,
                                     float* __restrict__ rel, int n_rel, const float* __restrict__ rs, float rthr,
-                                    RowMul mul, KvProj pj) {
+                                    RowMul mul, KvProj pj, int kvq) {
     __shared__ float sh[256];
     __shared__ float dloc[4];
     const int x = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
@@ -2103,7 +2176,10 @@ __global__ void kv_clip_rows_kernel(const float* __restrict__ in_k, const float*
         }
         const float ss = block_sum(o * o, sh);
         const float f = isv ? rsqrtf(ss / (float) D + eps) : fminf(1.0f, thr / (sqrtf(ss) + 1e-6f));
-        if (i < D) {
+        if (kvq) {
+            const long long p = p0 + t;
+            kv8_put(isv ? V : K, (size_t) (ring > 0 ? p % ring : p), Hkv, D, h, o * f, sh);
+        } else if (i < D) {
             const long long p = p0 + t;
             (isv ? V : K)[(size_t) (ring > 0 ? p % ring : p) * C + c] = __float2half_rn(o * f);
         }
@@ -2349,8 +2425,9 @@ int attention_chunk_keys() {
 bool attention_chunk_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
                           const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
                           int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
-                          cudaStream_t s, int8_t* q8, float* d8) {
+                          cudaStream_t s, int8_t* q8, float* d8, int kvq) {
     if (q8 && D % 32) return false;
+    if (kvq && D % 4) return false;
     const int CK = attention_chunk_keys();
     lo0 -= lo0 % CK;
     const int nk = (int) (p0 + T - lo0), per = H / Hkv, ntile = (nk + CK - 1) / CK, TP = T * per;
@@ -2378,9 +2455,14 @@ bool attention_chunk_rows(const float* q, const float* rel, const float* sink, i
         if ((v == 1 || v == 2 || v == 3 || v == 6) && rpb % v == 0 && last % v == 0) ru = v;
     }
 #define IK2_ATTN_CHUNK(ck, r)                                                                                           \
-    attn_chunk_rows_kernel<ck, r><<<grid, 256, shb, s>>>(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent,           \
-                                                        (const __half*) K, (const __half*) V, ring, base,               \
-                                                        (int) (p0 - lo0), window, nk, scale, rpb, S, part)
+    if (kvq)                                                                                                            \
+        attn_chunk_rows_kernel<ck, r, true><<<grid, 256, shb, s>>>(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, \
+                                                                  (const __half*) K, (const __half*) V, ring, base,     \
+                                                                  (int) (p0 - lo0), window, nk, scale, rpb, S, part);   \
+    else                                                                                                                \
+        attn_chunk_rows_kernel<ck, r><<<grid, 256, shb, s>>>(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent,       \
+                                                            (const __half*) K, (const __half*) V, ring, base,           \
+                                                            (int) (p0 - lo0), window, nk, scale, rpb, S, part)
 #define IK2_ATTN_RU(ck)                                                                                                 \
     switch (ru) {                                                                                                       \
         case 6: IK2_ATTN_CHUNK(ck, 6); break;                                                                           \
@@ -2454,7 +2536,34 @@ void head_clip_rows(float* x, int T, int H, int n, const float* scale, float thr
     head_clip_rows_kernel<<<(unsigned) (T * H), 256, 0, s>>>(x, H, n, scale, thr, alpha, (float) (1.0 / floor), (long long) p0);
     check("head_clip_rows");
 }
-void store_rows(const float* src, int T, int n, uint16_t* cache, int ring, int64_t p0, cudaStream_t s) {
+__global__ void kv8_f16_kernel(const void* cache, long long slot0, int n, int Hkv, int D, uint4* out) {
+    const int per = Hkv * D / 8;   // (eight values a thread)
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) n * per) return;
+    const int j = (int) (i / per), r = (int) (i % per), g = r / (D / 8), c = (r % (D / 8)) * 8;
+    out[i] = kv8_get8(cache, (size_t) (slot0 + j), Hkv, D, g, c);
+}
+void kv8_f16(const uint16_t* cache, int64_t slot0, int n, int Hkv, int D, uint16_t* out, cudaStream_t s) {
+    if (n <= 0) return;
+    if (D % 8) {
+        g_err.fetch_add(1);
+        return;
+    }
+    const size_t items = (size_t) n * Hkv * D / 8;
+    kv8_f16_kernel<<<(unsigned) ((items + 255) / 256), 256, 0, s>>>(cache, (long long) slot0, n, Hkv, D, (uint4*) out);
+    check("kv8_f16");
+}
+void store_rows(const float* src, int T, int n, uint16_t* cache, int ring, int64_t p0, cudaStream_t s, int kvq, int Hkv) {
+    if (kvq) {   // (n = Hkv D values a row, D <= 256)
+        const int D = n / Hkv;
+        if (D > 256 || D * Hkv != n) {
+            g_err.fetch_add(1);
+            return;
+        }
+        store_rows8_kernel<<<dim3((unsigned) Hkv, (unsigned) T), 256, 0, s>>>(src, Hkv, D, cache, ring, (long long) p0);
+        check("store_rows8");
+        return;
+    }
     store_rows_kernel<<<dim3(blocks_of((size_t) n), (unsigned) T), 256, 0, s>>>(src, n, (__half*) cache, ring, (long long) p0);
     check("store_rows");
 }
@@ -2470,11 +2579,14 @@ void attn_softmax_rows(float* S, int T, int Hkv, int per, int nk, int64_t klo, i
 }
 bool attn_flash(const uint16_t* qh, int Q, int per, int Hkv, int D, const uint16_t* K, const uint16_t* V, int ring,
                 int64_t klo, int nk, int64_t pf, int window, int extent, const float* tbl, const float* sink, float scale,
-                float* out, cudaStream_t s) {
+                float* out, cudaStream_t s, int kvq) {
 #if defined(STRATA_USE_HIP)
     if (D != fl::D) return false;
     static const int ver = std::getenv("IK2_HIP_FLASH_V") ? std::atoi(std::getenv("IK2_HIP_FLASH_V")) : 3;
-    if (ver == 2)
+    if (kvq)   // (the 8-bit cache: the 8-wave form, whatever IK2_HIP_FLASH_V says)
+        attn_flash2_kernel<8, true><<<dim3((unsigned) ((Q + 127) / 128), (unsigned) Hkv), 256, 0, s>>>(
+            qh, Q, per, Hkv, K, V, ring, (long long) klo, nk, (long long) pf, window, extent, tbl, sink, scale, out);
+    else if (ver == 2)
         attn_flash2_kernel<4><<<dim3((unsigned) ((Q + 63) / 64), (unsigned) Hkv), 128, 0, s>>>(
             qh, Q, per, Hkv, K, V, ring, (long long) klo, nk, (long long) pf, window, extent, tbl, sink, scale, out);
     else if (ver == 3)
@@ -2487,7 +2599,7 @@ bool attn_flash(const uint16_t* qh, int Q, int per, int Hkv, int D, const uint16
     return true;
 #else
     (void) qh, (void) Q, (void) per, (void) Hkv, (void) D, (void) K, (void) V, (void) ring, (void) klo, (void) nk;
-    (void) pf, (void) window, (void) extent, (void) tbl, (void) sink, (void) scale, (void) out, (void) s;
+    (void) pf, (void) window, (void) extent, (void) tbl, (void) sink, (void) scale, (void) out, (void) s, (void) kvq;
     return false;
 #endif
 }
@@ -2506,13 +2618,13 @@ void attn_softmax_p16(float* S, int T, int Hkv, int per, int nk, int64_t klo, in
 }
 void kv_finish(float* ky, float* vy, float* hist_k, float* hist_v, const float* k_conv, const float* v_conv,
                const float* dk, const float* dv, int Hkv, int D, float thr, float eps, uint16_t* K, uint16_t* V, int ring,
-               int64_t p, cudaStream_t s) {
+               int64_t p, cudaStream_t s, int kvq) {
     if (D > 256) {
         g_err.fetch_add(1);
         return;
     }
     kv_finish_kernel<<<dim3((unsigned) Hkv, 2), 256, 0, s>>>(ky, vy, hist_k, hist_v, k_conv, v_conv, dk, dv, Hkv, D, thr, eps,
-                                                             (__half*) K, (__half*) V, (size_t) (ring > 0 ? p % ring : p));
+                                                             (__half*) K, (__half*) V, (size_t) (ring > 0 ? p % ring : p), kvq);
     check("kv_finish");
 }
 void clip2(float* q, int H, int D, const float* qs, float qthr, float* rel, int n_rel, const float* rs, float rthr,
@@ -2615,14 +2727,14 @@ int attention_rows_fit(int H, int D, int64_t keys, size_t S_floats) {
 }
 void kv_finish_rows(const float* in_k, const float* in_v, int T, const float* hk0, const float* hv0, float* hk1, float* hv1,
                     const float* k_conv, const float* v_conv, const float* dk, const float* dv, int Hkv, int D, float thr,
-                    float eps, uint16_t* K, uint16_t* V, int ring, int64_t p0, cudaStream_t s) {
+                    float eps, uint16_t* K, uint16_t* V, int ring, int64_t p0, cudaStream_t s, int kvq) {
     if (D > 256) {
         g_err.fetch_add(1);
         return;
     }
     kv_finish_rows_kernel<<<dim3((unsigned) Hkv, 2, (unsigned) T), 256, 0, s>>>(in_k, in_v, hk0, hv0, hk1, hv1, k_conv, v_conv,
                                                                               dk, dv, T, Hkv, D, thr, eps, (__half*) K,
-                                                                              (__half*) V, ring, (long long) p0);
+                                                                              (__half*) V, ring, (long long) p0, kvq);
     check("kv_finish_rows");
 }
 void clip2_rows(float* q, int T, int H, int D, const float* qs, float qthr, float* rel, int n_rel, const float* rs,
@@ -2695,7 +2807,7 @@ void kv_clip_rows(const float* in_k, const float* in_v, int T, const float* hk0,
                   float eps, uint16_t* K, uint16_t* V, int ring, int64_t p0, float* q, int H, const float* qs,
                   float qthr, float* rel, int n_rel, const float* rs, float rthr, const float* mul, cudaStream_t s,
                   const float* sink_w, const float* sink_x, float* sink_y, int ns, int k, const float* kp_w,
-                  const float* vp_w, const float* kp_x, const float* vp_x, float* dk_out, float* dv_out) {
+                  const float* vp_w, const float* kp_x, const float* vp_x, float* dk_out, float* dv_out, int kvq) {
     if (D > 256 || n_rel > 256 || T > 16 || (kp_w && (dk == nullptr || dk != dk_out || dv != dv_out))) {
         g_err.fetch_add(1);
         return;
@@ -2705,7 +2817,7 @@ void kv_clip_rows(const float* in_k, const float* in_v, int T, const float* hk0,
     const KvProj pj{sink_w, sink_x, sink_y, sink_w ? ns : 0, k, kp_w, vp_w, kp_x, vp_x, dk_out, dv_out};
     kv_clip_rows_kernel<<<dim3((unsigned) (2 * Hkv + H + pj.ns), (unsigned) T), 256, 0, s>>>(
         in_k, in_v, hk0, hv0, hk1, hv1, k_conv, v_conv, dk, dv, T, Hkv, D, thr, eps, (__half*) K, (__half*) V, ring,
-        (long long) p0, q, H, qs, qthr, rel, n_rel, rs, rthr, m, pj);
+        (long long) p0, q, H, qs, qthr, rel, n_rel, rs, rthr, m, pj, kvq);
     check("kv_clip_rows");
 }
 void moe_lane_rows(const float* part, int T, int n_used, int n, const float* w, float* out, int stride16,
@@ -2735,4 +2847,46 @@ bool gemv_f32_rows(int rpb, const float* W, size_t ld, int k, int n, const float
 }
 int errors() { return g_err.exchange(0); }
 
+// ---- (tests, IK2_HIP_KV_SIM) an 8-bit cache's rounding in place in the F16 rows ------------------------------------
+__device__ inline float e4m3_round(float x) {   // (OCP E4M3 fn: round to nearest even, saturating at 448)
+    const float a = fabsf(x);
+    if (!(a > 0.0f)) return 0.0f;
+    int e;
+    frexpf(a, &e);   // (a = m 2^e, m in [0.5, 1): its binade 2^(e - 1); the subnormals' quantum 2^-9)
+    const float qn = ldexpf(1.0f, max(e - 1, -6) - 3);
+    return copysignf(fminf(rintf(a / qn) * qn, 448.0f), x);
+}
+__global__ void kv_sim_kernel(__half* K, __half* V, int ring, long long p0, int Hkv, int D, int mode) {
+    __shared__ float sh[256];
+    const int h = blockIdx.x, isv = blockIdx.y, t = blockIdx.z, i = threadIdx.x;
+    const long long p = p0 + t;
+    __half* row = (isv ? V : K) + (size_t) (ring > 0 ? p % ring : p) * Hkv * D + (size_t) h * D;
+    const float x = __half2float(row[i]);
+    sh[i] = fabsf(x);
+    __syncthreads();
+    const int span = mode == 2 ? 32 : D;
+    for (int st = span / 2; st > 0; st >>= 1) {
+        if (i % span < st) sh[i] = fmaxf(sh[i], sh[i + st]);
+        __syncthreads();
+    }
+    const float am = sh[i / span * span];
+    float y = x;
+    if (mode == 1 || mode == 2) {
+        float sc = am / 127.0f;
+        if (mode == 2) sc = __half2float(__float2half_rn(sc));
+        y = sc > 0.0f ? fminf(fmaxf(rintf(x / sc), -127.0f), 127.0f) * sc : 0.0f;
+    } else if (mode == 3) {
+        const float sc = am / 448.0f;
+        y = sc > 0.0f ? e4m3_round(x / sc) * sc : 0.0f;
+    } else if (mode == 4) {
+        y = e4m3_round(x);
+    }
+    row[i] = __float2half_rn(y);
+}
+void kv_sim(uint16_t* K, uint16_t* V, int ring, int64_t p0, int T, int Hkv, int D, int mode, cudaStream_t s) {
+    if (mode <= 0 || T <= 0) return;
+    kv_sim_kernel<<<dim3((unsigned) Hkv, 2, (unsigned) T), (unsigned) D, 0, s>>>((__half*) K, (__half*) V, ring, (long long) p0,
+                                                                                Hkv, D, mode);
+    check("kv_sim");
+}
 }  // namespace ik2hip::k

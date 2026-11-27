@@ -49,14 +49,16 @@ namespace ik2hip {
 static bool attn_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
                       const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
                       int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
-                      cudaStream_t s, int8_t* q8 = nullptr, float* d8 = nullptr, bool* q8_done = nullptr) {
+                      cudaStream_t s, int8_t* q8 = nullptr, float* d8 = nullptr, bool* q8_done = nullptr, int kvq = 0) {
     static const bool tiles = std::getenv("IK2_HIP_ATTN_TILES") != nullptr;
     if (q8_done) *q8_done = false;
-    if (!tiles && k::attention_chunk_rows(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, K, V, ring, p0, lo0, window,
-                                          scale, S, S_floats, gate, out, s, q8, d8)) {
+    // (the 8-bit cache, and its simulation, IK2_HIP_KV_SIM: the chunks only - the tiles do not read it)
+    if ((!tiles || kvq) && k::attention_chunk_rows(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, K, V, ring, p0, lo0,
+                                                   window, scale, S, S_floats, gate, out, s, q8, d8, kvq)) {
         if (q8_done) *q8_done = q8 != nullptr;   // (out's int8 rows made too)
         return true;
     }
+    if (kvq) return false;
     return k::attention_split_rows(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, K, V, ring, p0, lo0, window, scale,
                                    S, S_floats, gate, out, s);
 }
@@ -106,7 +108,8 @@ struct Layer {
     Mat q, gate, wk, wv, rel, sink, wo, k_proj, v_proj, router;
     // the state: the convolutions' histories [3][C] and the K / V caches [slots][Hkv][D]
     float *hist_k = nullptr, *hist_v = nullptr, *hist_a = nullptr, *hist_f = nullptr;
-    uint16_t *K = nullptr, *V = nullptr;   // (F16 rows)
+    uint16_t *K = nullptr, *V = nullptr;   // (F16 rows; kvq 1: the 8-bit cache's rows, k::kv8_row_bytes each)
+    int kvq = 0;                  // (--kv q8: 1 on the global layers - their K / V in 8 bits)
     int ring = 0;                 // the caches' rows when they are a ring (0: a row a position)
     int* slot_d = nullptr;        // (slot_of on the device: the prompt path's sets, the host-free step's plan)
     float *win_in = nullptr, *win_h0 = nullptr;   // (a step's conv inputs [K | V | attention | FFN][kWin]; the other
@@ -172,6 +175,7 @@ struct Gpu {
     unsigned* c_sbits = nullptr;                 // (moe_sort_bits: each slot's tokens, a bit each)
     int *c_swpre = nullptr, *c_sent = nullptr;   // (... their words' prefix counts; each row's entry)
     uint16_t *xh16 = nullptr, *wband = nullptr, *c_sh16 = nullptr, *c_P16 = nullptr;
+    uint16_t* c_kv16 = nullptr;   // (--kv q8: kKv16 slots of a global layer's 8-bit rows made F16, the GEMMs' passes)
     uint8_t* xstage[2] = {nullptr, nullptr};
     size_t wband_n = 0, S_n = 0, blob_max = 0, S_floats = 0;
     int ts_max = 0;
@@ -368,6 +372,7 @@ struct Model::Impl {
         int pf_small_chunk = 0;           // (prompt: the chunk below pf_small_until, IK2_HIP_PF_SMALL_CHUNK; 0: none)
         int64_t pf_small_until = 8192;    // (IK2_HIP_PF_SMALL_UNTIL)
         bool attn_p16 = true;   // (the prompt attention's softmax writes F16 itself; IK2_HIP_ATTN_P16_OLD: + to_f16)
+        int kv_sim = 0;          // (tests, IK2_HIP_KV_SIM: an 8-bit cache's rounding in the global layers' rows)
         bool attn_flash = false; // (the prompt attention as one flash kernel, IK2_HIP_ATTN_FLASH=1: not the same bits)
         bool sort_old = false;   // (the expert sets' rows by hy4's moe_sort and scatter_rows over every entry,
                                  //  IK2_HIP_SORT_OLD=1; else moe_sort_bits and the set's rows only: the same rows)
@@ -398,6 +403,8 @@ struct Model::Impl {
         tn.attn_p16 = std::getenv("IK2_HIP_ATTN_P16_OLD") == nullptr;
         tn.attn_tbl = env_d("IK2_HIP_ATTN_OWN_TBL", 0, 0, 1) != 0;
         tn.attn_flash = env_d("IK2_HIP_ATTN_FLASH", 0, 0, 1) != 0;
+        tn.kv_sim = (int) env_d("IK2_HIP_KV_SIM", 0, 0, 4);
+        if (o.kv == 1) tn.kv_sim = 0;   // (the simulation rounds F16 rows: not with the 8-bit cache)
         tn.sort_old = std::getenv("IK2_HIP_SORT_OLD") != nullptr;
     }
     // streamed experts a pass, in two buffers: one is copied while the other's experts run - fewer passes against
@@ -570,6 +577,12 @@ struct Model::Impl {
         return t ? (size_t) t->bytes * (t->type == "BF16" ? 2 : 1) : 0;
     }
     size_t cache_rows(int il) const { return g.swa[(size_t) il] ? (size_t) (g.n_swa + o.rewind + Tc) : (size_t) o.max_ctx; }
+    // a cache row's bytes (K or V): F16, or (--kv q8, the global layers) int8 with a scale a kv head
+    bool kv8(int il) const { return o.kv == 1 && !g.swa[(size_t) il]; }
+    size_t cache_row_bytes(int il) const {
+        return kv8(il) ? k::kv8_row_bytes(g.n_head_kv, g.head_dim) : (size_t) g.n_head_kv * g.head_dim * 2;
+    }
+    size_t cache_bytes(int il) const { return cache_rows(il) * cache_row_bytes(il); }   // (K's or V's)
     int n_states() const { return (g.n_layer + g.res_block - 1) / g.res_block; }
     // the attention's scores (F32, and their F16 copy beside): floats.  A pass of ts tokens over nk keys takes
     // n_head x ts x nk of them (attention_rows halves ts until it fits), so they must hold one token over every key
@@ -577,6 +590,8 @@ struct Model::Impl {
     // the passes a long prompt's chunk takes - measured, an 80K-token prompt in 2048-token chunks, tok/s at 11 / 22 /
     // 44 / 88 / 176 / 352 Mi: 853 / 1082 / 1247 / 1354 / 1409 / 1400 (20K: within 1%, 352 3% slower); 44 Mi is 264 MiB
     // a GPU (F32 + F16) - 176's 0.8 GiB more, with E9's and E44's, cost the shorter prompts and the RAM (prefill_chunk)
+    // (--kv q8) the prompt path's GEMMs read a global layer's 8-bit rows made F16 (Gpu::c_kv16) in passes of kKv16 keys
+    static constexpr int kKv16 = 8192;
     size_t kS_n = (size_t) 44 << 20;
     size_t S_n() const { return std::max(kS_n, (size_t) g.n_head * max_keys); }
     // ... and its tokens a pass at most (IK2_HIP_TS_MAX); its rel-bias table is kTsMax x n_head x rel_extent floats,
@@ -627,7 +642,8 @@ struct Model::Impl {
                gp.alloc(gp.c_sbits, ((size_t) g.n_expert + 4) * ((T + 31) / 32), err) &&
                gp.alloc(gp.c_swpre, ((size_t) g.n_expert + 4) * ((T + 31) / 32), err) && gp.alloc(gp.c_sent, T * nu, err) &&
                gp.alloc(gp.wband, gp.wband_n, err) && gp.alloc(gp.c_S, gp.S_n, err) && gp.alloc(gp.c_P16, gp.S_n, err) &&
-               gp.alloc(gp.c_tbl, (size_t) std::max(kTsMax, flash_ts) * H * (size_t) g.rel_extent, err);
+               gp.alloc(gp.c_tbl, (size_t) std::max(kTsMax, flash_ts) * H * (size_t) g.rel_extent, err) &&
+               (o.kv != 1 || gp.alloc(gp.c_kv16, (size_t) kKv16 * kvd, err));
     }
     // a layer's VRAM without its experts: every other tensor of the block, the caches and the histories
     size_t dense_bytes(int il) const {
@@ -636,7 +652,8 @@ struct Model::Impl {
         for (auto it = pk.t.lower_bound(p); it != pk.t.end() && it->first.compare(0, p.size(), p) == 0; ++it)
             if (it->first.find("_exps.") == std::string::npos) b += tensor_bytes(it->first);
         const size_t kvd = (size_t) g.n_head_kv * g.head_dim;
-        b += cache_rows(il) * kvd * 2 * 2 + (size_t) (1 + kSnaps) * hist_n() * 4;   // (the split's weights only)
+        b += 2 * cache_bytes(il) + (size_t) (1 + kSnaps) * hist_n() * 4;   // (the split's weights only)
+        (void) kvd;
         return b;
     }
     // the geometry of a layer's expert blobs (no data)
@@ -726,6 +743,7 @@ struct Model::Impl {
             l.il = il;
             l.swa = g.swa[(size_t) il] != 0;
             l.ring = l.swa ? g.n_swa + o.rewind + Tc : 0;
+            l.kvq = kv8(l.il) ? 1 : 0;
             if (!expert_geo(l, err)) return false;
             l.dense = dense_bytes(il);
             all[(size_t) il] = l.dense + l.blob * (size_t) g.n_expert;
@@ -927,7 +945,8 @@ struct Model::Impl {
         const size_t rows = cache_rows(l.il);
         if (!zeros(gp, l.hist_k, (size_t) 3 * kvd, err) || !zeros(gp, l.hist_v, (size_t) 3 * kvd, err) ||
             !zeros(gp, l.hist_a, (size_t) 3 * E, err) || !zeros(gp, l.hist_f, (size_t) 3 * E, err) ||
-            !gp.alloc(l.K, rows * kvd, err) || !gp.alloc(l.V, rows * kvd, err) || !gp.alloc(l.snap, (size_t) kSnaps * hist_n(), err))
+            !gp.alloc(l.K, cache_bytes(l.il) / 2, err) || !gp.alloc(l.V, cache_bytes(l.il) / 2, err) ||
+            !gp.alloc(l.snap, (size_t) kSnaps * hist_n(), err))
             return false;
         l.use.assign((size_t) g.n_expert, 0.0f);   // (the warm-up's routings land here: put back after it)
         return gp.alloc(l.slot_d, (size_t) g.n_expert, err) &&
@@ -1215,6 +1234,10 @@ struct Model::Impl {
         if (!pk.load(o.pack, err)) return false;
         g = pk.g;
         if (o.log_floor >= 1) g.log_floor = o.log_floor;
+        if (o.kv == 1 && (g.head_dim % 8 || g.head_dim > 256)) {
+            err = "--kv q8: a head of " + std::to_string(g.head_dim) + " values (a multiple of 8, at most 256, needed)";
+            return false;
+        }
         NL = o.layers > 0 ? std::min(o.layers, g.n_layer) : g.n_layer;
         max_keys = (size_t) std::max<int64_t>(g.n_swa, o.max_ctx);
         Tc = o.prefill_chunk > 1 ? (int) std::min<int64_t>(o.prefill_chunk, o.max_ctx) : 0;
@@ -1729,15 +1752,27 @@ struct Model::Impl {
         const float tau = l.swa ? 1.0f : 1.0f + g.log_alpha * std::log(std::max(1.0f, (float) ((double) (p + 1) / g.log_floor)));
         // (the K / V convs, K's clip, V's norm and the cache rows in a launch; the Q and R clips in another)
         k::kv_finish(gp.ky, gp.vy, l.hist_k, l.hist_v, l.k_conv, l.v_conv, l.swa ? nullptr : gp.dk, l.swa ? nullptr : gp.dv,
-                     Hkv, D, g.qk_clip, g.eps, l.K, l.V, l.ring, p, s);
+                     Hkv, D, g.qk_clip, g.eps, l.K, l.V, l.ring, p, s, l.kvq);
+        if (!l.swa) k::kv_sim(l.K, l.V, l.ring, p, 1, Hkv, D, tn.kv_sim, s);
         k::clip2(gp.q, H, D, l.q_clip, g.qk_clip, gp.rel, g.d_rel, l.rel_clip, g.rel_clip, tau, s);
         if (!tap("Qcur", l.il, gp, gp.q, (size_t) HD, err) || !tap("Kcur", l.il, gp, gp.ky, (size_t) kvd, err) ||
             !tap("Vcur", l.il, gp, gp.vy, (size_t) kvd, err) || !tap("Rcur", l.il, gp, gp.rel, (size_t) H * g.d_rel, err))
             return false;
         const int64_t lo = l.swa ? std::max<int64_t>(0, p - (g.n_swa - 1)) : 0;
         mark(gp, 1);
-        // (the keys split over tiles, the output gate in the combine: IK2_HIP_ATTN_OLD=1 for the earlier launches)
-        if (!attn_old) {
+        // (the keys split over tiles, the output gate in the combine: IK2_HIP_ATTN_OLD=1 for the earlier launches; the
+        //  8-bit cache - and IK2_HIP_KV_SIM - the global layers' through the chunks, as the host-free step's)
+        if (!l.swa && (l.kvq || tn.kv_sim)) {
+            if (!attn_rows(gp.q, gp.rel, gp.sink, 1, H, Hkv, D, g.d_rel, l.rel_bias, g.rel_extent, l.K, l.V, l.ring, p, lo, 0,
+                           1.0f / std::sqrt((float) D), gp.S, gp.S_floats, tapf ? nullptr : gp.gate, gp.ao, s, nullptr,
+                           nullptr, nullptr, l.kvq)) {
+                err = "layer " + std::to_string(l.il) + ": the attention's scratch does not hold a row's chunks";
+                return false;
+            }
+            if (!tap("kqv_out", l.il, gp, gp.ao, (size_t) HD, err)) return false;
+            mark(gp, 2);
+            if (tapf) k::sigmoid_mul(gp.ao, gp.gate, (size_t) HD, s);
+        } else if (!attn_old) {
             k::attention_split(gp.q, gp.rel, gp.sink, H, Hkv, D, g.d_rel, l.rel_bias, l.swa ? g.n_swa : g.rel_extent, l.K, l.V,
                                l.ring, p, lo, 1.0f / std::sqrt((float) D), gp.S, tapf ? nullptr : gp.gate, gp.ao, s);
             if (!tap("kqv_out", l.il, gp, gp.ao, (size_t) HD, err)) return false;
@@ -2441,18 +2476,20 @@ struct Model::Impl {
                 k::kv_finish_rows(in_k + (size_t) t * kvd, in_v + (size_t) t * kvd, 1, q.hist_k, q.hist_v, q.alt_k, q.alt_v,
                                   l.k_conv, l.v_conv, l.swa ? nullptr : gp.w_dk + (size_t) t * 4 * Hkv,
                                   l.swa ? nullptr : gp.w_dv + (size_t) t * 4 * Hkv, Hkv, D, g.qk_clip, g.eps, q.K, q.V,
-                                  l.ring, mrows[t].p, s);
+                                  l.ring, mrows[t].p, s, l.kvq);
+                if (!l.swa) k::kv_sim(q.K, q.V, l.ring, mrows[t].p, 1, Hkv, D, tn.kv_sim, s);
             }
         } else if (fzk) {
             k::kv_clip_rows(in_k, in_v, T, l.hist_k, l.hist_v, l.alt_k, l.alt_v, l.k_conv, l.v_conv, l.swa ? nullptr : gp.w_dk,
                             l.swa ? nullptr : gp.w_dv, Hkv, D, g.qk_clip, g.eps, l.K, l.V, l.ring, p0, gp.w_q, H, l.q_clip,
                             g.qk_clip, gp.w_rel, g.d_rel, l.rel_clip, g.rel_clip, tau, s, fzg ? (const float*) l.sink.w : nullptr,
                             xq, gp.w_sink, l.sink.n, l.sink.k, fzg && !l.swa ? (const float*) l.k_proj.w : nullptr,
-                            fzg && !l.swa ? (const float*) l.v_proj.w : nullptr, xk, xv, gp.w_dk, gp.w_dv);
+                            fzg && !l.swa ? (const float*) l.v_proj.w : nullptr, xk, xv, gp.w_dk, gp.w_dv, l.kvq);
         } else {
             k::kv_finish_rows(in_k, in_v, T, l.hist_k, l.hist_v, l.alt_k, l.alt_v, l.k_conv, l.v_conv, l.swa ? nullptr : gp.w_dk,
-                              l.swa ? nullptr : gp.w_dv, Hkv, D, g.qk_clip, g.eps, l.K, l.V, l.ring, p0, s);
+                              l.swa ? nullptr : gp.w_dv, Hkv, D, g.qk_clip, g.eps, l.K, l.V, l.ring, p0, s, l.kvq);
         }
+        if (!job_multi && !l.swa) k::kv_sim(l.K, l.V, l.ring, p0, T, Hkv, D, tn.kv_sim, s);
         if (job_multi || !fzk)
             k::clip2_rows(gp.w_q, T, H, D, l.q_clip, g.qk_clip, gp.w_rel, g.d_rel, l.rel_clip, g.rel_clip, tau, s);
         ph(l, gp, 3);
@@ -2464,7 +2501,7 @@ struct Model::Impl {
                                              gp.w_sink + (size_t) t * H, 1, H, Hkv, D, g.d_rel, l.rel_bias,
                                              l.swa ? g.n_swa : g.rel_extent, q.K, q.V, l.ring, pf, lo, l.swa ? g.n_swa : 0,
                                              1.0f / std::sqrt((float) D), gp.S, gp.S_floats, gp.w_gate + (size_t) t * HD,
-                                             gp.w_ao + (size_t) t * HD, s)) {
+                                             gp.w_ao + (size_t) t * HD, s, nullptr, nullptr, nullptr, l.kvq)) {
                     err = "layer " + std::to_string(l.il) + ": the attention's scratch does not hold a row's tiles";
                     return false;
                 }
@@ -2485,7 +2522,7 @@ struct Model::Impl {
                                              l.swa ? g.n_swa : g.rel_extent, l.K, l.V, l.ring, pf, lo, l.swa ? g.n_swa : 0,
                                              1.0f / std::sqrt((float) D), gp.S, gp.S_floats, gp.w_gate + (size_t) t0 * HD,
                                              gp.w_ao + (size_t) t0 * HD, s, want_q8 ? gp.w_xq + (size_t) t0 * HD : nullptr,
-                                             want_q8 ? gp.w_xd + (size_t) t0 * HD / 32 : nullptr, &done_q8)) {
+                                             want_q8 ? gp.w_xd + (size_t) t0 * HD / 32 : nullptr, &done_q8, l.kvq)) {
                     err = "layer " + std::to_string(l.il) + ": the attention's scratch does not hold a row's tiles";
                     return false;
                 }
@@ -2894,8 +2931,9 @@ struct Model::Impl {
         const int extent = l.swa ? g.n_swa : g.rel_extent, window = l.swa ? g.n_swa : 0;
         cudaStream_t s = gp.s;
         const float one = 1.0f, zero = 0.0f;
-        k::store_rows(gp.c_kc, T, kvd, l.K, l.ring, p0, s);
-        k::store_rows(gp.c_vc, T, kvd, l.V, l.ring, p0, s);
+        k::store_rows(gp.c_kc, T, kvd, l.K, l.ring, p0, s, l.kvq, Hkv);
+        k::store_rows(gp.c_vc, T, kvd, l.V, l.ring, p0, s, l.kvq, Hkv);
+        if (!l.swa) k::kv_sim(l.K, l.V, l.ring, p0, T, Hkv, D, tn.kv_sim, s);
         for (int t0 = 0; t0 < T;) {
             const size_t s_n = tn.s_use > 0 ? std::min(tn.s_use, gp.S_n) : gp.S_n;
             int ts = std::min(tn.ts_use > 0 ? std::min(tn.ts_use, gp.ts_max) : gp.ts_max, T - t0);
@@ -2921,7 +2959,7 @@ struct Model::Impl {
             if (flash) {   // (IK2_HIP_ATTN_FLASH: S, the softmax and O in one kernel - not the same bits)
                 hk::to_f16(gp.c_qp, (size_t) D, Hkv * Q, D, gp.xh16, (size_t) D, s);
                 if (!ok || !k::attn_flash(gp.xh16, Q, per, Hkv, D, l.K, l.V, l.ring, klo, nk, pf, window, extent, gp.c_tbl,
-                                          gp.c_sink + (size_t) t0 * H, 1.0f / std::sqrt((float) D), gp.c_op, s)) {
+                                          gp.c_sink + (size_t) t0 * H, 1.0f / std::sqrt((float) D), gp.c_op, s, l.kvq)) {
                     err = "layer " + std::to_string(l.il) + ": the flash attention did not run";
                     return false;
                 }
@@ -2939,6 +2977,20 @@ struct Model::Impl {
                                                   CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
             };
             hk::to_f16(gp.c_qp, (size_t) D, Hkv * Q, D, gp.xh16, (size_t) D, s);
+            // (--kv q8, and IK2_HIP_KV_SIM: a global layer's keys in passes of kKv16, the 8-bit rows made F16 first -
+            //  the simulation reads its F16 rows in the same passes, so both sum alike)
+            const bool kv_blk = !l.swa && (l.kvq || tn.kv_sim);
+            if (kv_blk) {
+                for (int j0 = 0; ok && j0 < nk; j0 += kKv16) {
+                    const int nb = std::min(kKv16, nk - j0);
+                    const uint16_t* Kb = l.K + (slot0 + (size_t) j0) * kvd;
+                    if (l.kvq) {
+                        k::kv8_f16(l.K, (int64_t) slot0 + j0, nb, Hkv, D, gp.c_kv16, s);
+                        Kb = gp.c_kv16;
+                    }
+                    ok = bg(CUBLAS_OP_T, nb, D, Kb, gp.xh16, D, (long long) Q * D, &zero, gp.c_S + j0, nk, (long long) Q * nk);
+                }
+            } else
             ok = ok && bg(CUBLAS_OP_T, n1, D, l.K + slot0 * kvd, gp.xh16, D, (long long) Q * D, &zero, gp.c_S, nk,
                           (long long) Q * nk);
             if (n2 > 0)
@@ -2952,6 +3004,18 @@ struct Model::Impl {
                                      gp.c_sink + (size_t) t0 * H, 1.0f / std::sqrt((float) D), s);
                 hk::to_f16(gp.c_S, (size_t) nk, Hkv * Q, nk, gp.c_P16, (size_t) nk, s);
             }
+            if (kv_blk) {
+                for (int j0 = 0; ok && j0 < nk; j0 += kKv16) {
+                    const int nb = std::min(kKv16, nk - j0);
+                    const uint16_t* Vb = l.V + (slot0 + (size_t) j0) * kvd;
+                    if (l.kvq) {
+                        k::kv8_f16(l.V, (int64_t) slot0 + j0, nb, Hkv, D, gp.c_kv16, s);
+                        Vb = gp.c_kv16;
+                    }
+                    ok = bg(CUBLAS_OP_N, D, nb, Vb, gp.c_P16 + j0, nk, (long long) Q * nk, j0 ? &one : &zero, gp.c_op, D,
+                            (long long) Q * D);
+                }
+            } else
             ok = ok && bg(CUBLAS_OP_N, D, n1, l.V + slot0 * kvd, gp.c_P16, nk, (long long) Q * nk, &zero, gp.c_op, D,
                           (long long) Q * D);
             if (n2 > 0)
@@ -3678,8 +3742,8 @@ struct Model::Impl {
                 SeqLayer& q = seqs[si].L[(size_t) il];
                 const size_t rows = cache_rows(il);
                 float* h = nullptr;
-                if (!zeros(gp, h, 2 * 3 * (2 * kvd + 2 * E), err) || !zeros(gp, q.K, rows * kvd, err) ||
-                    !zeros(gp, q.V, rows * kvd, err) || !gp.alloc(q.snap, (size_t) kSnaps * hist_n(), err))
+                if (!zeros(gp, h, 2 * 3 * (2 * kvd + 2 * E), err) || !zeros(gp, q.K, rows * cache_row_bytes(il) / 2, err) ||
+                    !zeros(gp, q.V, rows * cache_row_bytes(il) / 2, err) || !gp.alloc(q.snap, (size_t) kSnaps * hist_n(), err))
                     return false;
                 q.hist_k = h;
                 q.hist_v = q.hist_k + 3 * kvd;
@@ -3959,8 +4023,8 @@ struct Model::Impl {
             CK(cudaMemset(l.hist_v, 0, 3 * kvd * 4));
             CK(cudaMemset(l.hist_a, 0, 3 * E * 4));
             CK(cudaMemset(l.hist_f, 0, 3 * E * 4));
-            CK(cudaMemset(l.K, 0, cache_rows(l.il) * kvd * 2));
-            CK(cudaMemset(l.V, 0, cache_rows(l.il) * kvd * 2));
+            CK(cudaMemset(l.K, 0, cache_bytes(l.il)));
+            CK(cudaMemset(l.V, 0, cache_bytes(l.il)));
         }
         for (Gpu& gp : G) {
             CK(cudaSetDevice(gp.dev));
@@ -3988,6 +4052,17 @@ struct Model::Impl {
         std::snprintf(b, sizeof b, "maya-ik2: %d layers, %d experts a layer (top %d), context %lld, floor %.0f",
                       NL, g.n_expert, g.n_used, (long long) o.max_ctx, g.log_floor);
         v.push_back(b);
+        if (o.kv == 1) {
+            size_t kb = 0, fb = 0;
+            for (int il = 0; il < NL; ++il)
+                if (kv8(il)) {
+                    kb += 2 * cache_bytes(il);
+                    fb += 2 * cache_rows(il) * (size_t) g.n_head_kv * g.head_dim * 2;
+                }
+            std::snprintf(b, sizeof b, "maya-ik2: --kv q8: the global layers' K / V in 8 bits, %.2f GiB (F16 %.2f GiB) a "
+                          "conversation", kb / 1073741824.0, fb / 1073741824.0);
+            v.push_back(b);
+        }
         for (const Gpu& gp : G) {
             size_t dense = 0;
             for (int il = gp.l0; il < gp.l1; ++il) dense += L[(size_t) il].dense;
