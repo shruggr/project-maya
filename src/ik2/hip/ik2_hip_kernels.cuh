@@ -75,6 +75,14 @@ bool attention_chunk_rows(const float* q, const float* rel, const float* sink, i
                           cudaStream_t s, int8_t* q8 = nullptr, float* d8 = nullptr,   // (q8 / d8: q8_rows of out too)
                           int kvq = 0);   // (kvq 1: K / V the 8-bit cache's rows)
 int attention_chunk_keys();
+/// attention_chunk_rows' results from the matrix cores (IK2_HIP_ATTN_MMA, own runtime 2026-11-27): the keys in splits
+/// of IK2_HIP_ATTN_MMA_SK (512) at fixed positions, 16 query rows a block, v_wmma over 64-key tiles; the same
+/// arguments, partials and combine.  Not its bits (the queries and probabilities in F16, other orders); a row's result
+/// does not depend on T.  false (nothing launched): not gfx12 / HIP, D not 128, or the scratch does not hold the parts
+bool attention_mma_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
+                        const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
+                        int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
+                        cudaStream_t s, int8_t* q8 = nullptr, float* d8 = nullptr, int kvq = 0);
 
 /// x *= sigmoid(g), n values
 void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s);

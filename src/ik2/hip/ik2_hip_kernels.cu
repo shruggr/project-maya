@@ -2285,6 +2285,227 @@ __global__ void __launch_bounds__(RPB * 32) gemv_1_rpb_kernel(const float* __res
     const float v = fz_warp_sum(acc);
     if (lane == 0) y[row] = v;
 }
+// ---- decode attention on the matrix cores (IK2_HIP_ATTN_MMA, own runtime 2026-11-27): attn_chunk_rows_kernel's
+// partials from v_wmma_f32_16x16x16_f16, for long contexts.  Block = (a split of SK keys at positions multiple of SK,
+// kv head g, 16 of the T x per query rows): the split's 64-key tiles staged in LDS as attn_flash2_kernel stages them
+// (the 8-bit cache's rows made F16 there), wave w the tile's keys w 16 .. + 15: S^T = K Q^T (the queries F16, F32
+// sums), the logits as the chunks make them (scale, the distance bias per key under extent, the sink), an online
+// softmax a wave, O^T += V^T P^T (P in F16); the 4 waves merged at the end into the split's (max, sum, part) - the
+// combine of attention_chunk_rows takes them as they are.  A row's sums do not depend on the other rows nor on T (the
+// splits and their tiles at fixed positions, a row's masked tiles adding exact zeros): a window's rows give the token
+// steps' bits.  Not attention_chunk_rows' bits: the queries and probabilities in F16, other orders.
+// PREC: the queries and the probabilities each in two F16 halves (x = hi + lo, two products), so the products see F32
+// inputs to ~2^-22 as the chunks do - only the order of the sums differs from theirs (IK2_HIP_ATTN_MMA=2)
+template <bool Q8, bool PREC>
+__global__ void __launch_bounds__(128) attn_mma_rows_kernel(const float* __restrict__ q, const float* __restrict__ rel,
+                                                           const float* __restrict__ sink, int T, int H, int Hkv,
+                                                           int n_rel, const float* __restrict__ rel_bias, int extent,
+                                                           const uint16_t* __restrict__ K16,
+                                                           const uint16_t* __restrict__ V16, int ring, long long lo0,
+                                                           long long p0, int window, int SK, float scale,
+                                                           float* __restrict__ st, float* __restrict__ part) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX12__)
+    using h8 = _Float16 __attribute__((ext_vector_type(8)));
+    using f8 = float __attribute__((ext_vector_type(8)));
+    using fl::D;
+    using fl::KT;
+    using fl::KS;
+    using fl::VS;
+    const _Float16* K = (const _Float16*) K16;
+    const _Float16* V = (const _Float16*) V16;
+    __shared__ __align__(16) _Float16 smem[KT * KS + D * VS];   // (K's tile, V's transposed; at the end the merge's floats)
+    _Float16* ks = smem;
+    _Float16* vs = smem + KT * KS;
+    const int b = blockIdx.y, nsplit = gridDim.y, g = blockIdx.x, lt = threadIdx.x, lane = lt & 31, w = lt >> 5;
+    const int m16 = lane & 15, hi = lane >> 4, k0 = 8 * hi, per = H / Hkv, TP = T * per;
+    const int tr = blockIdx.z * 16 + m16;   // (the lane's query row: t per + r)
+    const bool qok = tr < TP;
+    const int trr = qok ? tr : TP - 1, t = trr / per, h = g * per + trr % per;
+    h8 qa[D / 16], ql[PREC ? D / 16 : 1];
+    {
+        const float* qr = q + ((size_t) t * H + h) * D;
+#pragma unroll
+        for (int kk = 0; kk < D / 16; ++kk)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float x = qok ? qr[kk * 16 + k0 + i] : 0.0f;
+                qa[kk][i] = (_Float16) x;
+                if (PREC) ql[kk][i] = (_Float16) (x - (float) qa[kk][i]);
+            }
+    }
+    const long long pf = p0 + t;   // (the row's position: it sees keys lo .. pf)
+    const long long lo = window > 0 ? (pf - (window - 1) > 0 ? pf - (window - 1) : 0) : 0;
+    const float rs = sink[(size_t) t * H + h];
+    const float* rr = rel + ((size_t) t * H + h) * n_rel;
+    // the split's keys: positions s0 .. s1 - 1, those the block's rows may see
+    const int rl = min(blockIdx.z * 16 + 15, TP - 1);
+    const long long s0 = lo0 + (long long) b * SK, p_hi = p0 + rl / per;
+    const long long s1 = min(s0 + SK, p_hi + 1);
+    float m_run = -INFINITY, den = 0.0f;
+    f8 acc[D / 16];
+#pragma unroll
+    for (int nt = 0; nt < D / 16; ++nt) acc[nt] = f8{};
+    const int vp = (lt & 127) >> 3, vk = (lt & 7) * 8;
+    // (the next tile's rows fetched into registers while this one is computed: K's 8 rows (lt / 16) + 8 k, V's keys
+    //  vk .. + 7 at dimensions vp 8 .. + 7; the 8-bit cache's raw bytes and scales, made F16 as they go to LDS)
+    uint4 kr[8], vr[8];
+    float ksc[8], vsc[8];
+    auto fetch = [&](long long j0) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const long long jk = j0 + (lt >> 4) + 8 * k, jv = j0 + vk + k;
+            kr[k] = vr[k] = make_uint4(0u, 0u, 0u, 0u);
+            ksc[k] = vsc[k] = 0.0f;
+            if (jk < s1) {
+                const size_t slot = (size_t) (ring > 0 ? jk % ring : jk);
+                if (Q8) {
+                    const uint8_t* row = (const uint8_t*) K16 + slot * kv8_row_bytes(Hkv, D);
+                    const uint2 bq = *(const uint2*) (row + (size_t) g * D + (lt & 15) * 8);
+                    kr[k].x = bq.x;
+                    kr[k].y = bq.y;
+                    ksc[k] = ((const float*) (row + (size_t) Hkv * D))[g];
+                } else {
+                    kr[k] = ((const uint4*) (K + (slot * Hkv + g) * D))[lt & 15];
+                }
+            }
+            if (jv < s1) {
+                const size_t slot = (size_t) (ring > 0 ? jv % ring : jv);
+                if (Q8) {
+                    const uint8_t* row = (const uint8_t*) V16 + slot * kv8_row_bytes(Hkv, D);
+                    const uint2 bq = *(const uint2*) (row + (size_t) g * D + vp * 8);
+                    vr[k].x = bq.x;
+                    vr[k].y = bq.y;
+                    vsc[k] = ((const float*) (row + (size_t) Hkv * D))[g];
+                } else {
+                    vr[k] = ((const uint4*) (V + (slot * Hkv + g) * D))[vp];
+                }
+            }
+        }
+    };
+    auto f16x8 = [](const uint4& b, float sc) -> uint4 {   // (8 int8 values, as kv8_get8 makes them)
+        auto qv = [](uint32_t w, int k) { return (int) (int8_t) (uint8_t) (w >> (8 * k)); };
+        return make_uint4(kv8_h2(qv(b.x, 0), qv(b.x, 1), sc), kv8_h2(qv(b.x, 2), qv(b.x, 3), sc),
+                          kv8_h2(qv(b.y, 0), qv(b.y, 1), sc), kv8_h2(qv(b.y, 2), qv(b.y, 3), sc));
+    };
+    if (s0 < s1) fetch(s0);
+    for (long long j0 = s0; j0 < s1; j0 += KT) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int r = (lt >> 4) + 8 * k;
+            *(uint4*) (ks + r * KS + (lt & 15) * 8) = Q8 ? f16x8(kr[k], ksc[k]) : kr[k];
+        }
+        {   // (V transposed in registers)
+            uint32_t a[8][4];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const uint4 vv = Q8 ? f16x8(vr[k], vsc[k]) : vr[k];
+                a[k][0] = vv.x;
+                a[k][1] = vv.y;
+                a[k][2] = vv.z;
+                a[k][3] = vv.w;
+            }
+#pragma unroll
+            for (int x = 0; x < 8; ++x) {
+                const int p = x >> 1;
+                uint32_t o[4];
+#pragma unroll
+                for (int m = 0; m < 4; ++m)
+                    o[m] = (x & 1) ? ((a[2 * m][p] >> 16) | (a[2 * m + 1][p] & 0xffff0000u))
+                                   : ((a[2 * m][p] & 0xffffu) | (a[2 * m + 1][p] << 16));
+                *(uint4*) (vs + (vp * 8 + x) * VS + vk) = make_uint4(o[0], o[1], o[2], o[3]);
+            }
+        }
+        __syncthreads();
+        if (j0 + KT < s1) fetch(j0 + KT);
+        // S^T for the wave's 16 keys (rows) and the 16 queries (columns): lane (m16, hi) gets keys w 16 + k0 + i of query m16
+        f8 s = f8{};
+#pragma unroll
+        for (int kk = 0; kk < D / 16; ++kk) {
+            const h8 ka = *(const h8*) (ks + (w * 16 + m16) * KS + kk * 16 + k0);
+            s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ka, qa[kk], s);
+            if (PREC) s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ka, ql[PREC ? kk : 0], s);
+        }
+        const long long jb = j0 + w * 16 + k0;   // (the lane's first key)
+        float mx = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const long long j = jb + i;
+            float v = -INFINITY;
+            if (qok && j < s1 && j >= lo && j <= pf) {
+                const long long d = pf - j;
+                v = __fmul_rn(s[i], scale);   // (the roundings spelled out)
+                if (d < extent) {
+                    const float* bb = rel_bias + (size_t) d * n_rel;
+                    float bs = 0.0f;
+                    for (int u = 0; u < n_rel; ++u) bs += rr[u] * bb[u];
+                    v = __fadd_rn(v, bs);
+                }
+                v = __fsub_rn(v, rs);
+            }
+            s[i] = v;
+            mx = fmaxf(mx, v);
+        }
+        mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+        // (every lane runs the WMMAs: a row with no key seen yet keeps its state exactly - factor 1, probabilities 0)
+        const float m_new = fmaxf(m_run, mx);
+        const float tsc = m_new == -INFINITY ? 1.0f : (m_run > -INFINITY ? expf(m_run - m_new) : 0.0f);
+        h8 pb, pl;
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float p = s[i] > -INFINITY ? expf(s[i] - m_new) : 0.0f;
+            sum += p;
+            pb[i] = (_Float16) p;
+            if (PREC) pl[i] = (_Float16) (p - (float) pb[i]);
+        }
+        sum += __shfl_xor(sum, 16, 32);
+        den = den * tsc + sum;
+        m_run = m_new;
+#pragma unroll
+        for (int nt = 0; nt < D / 16; ++nt) acc[nt] *= tsc;
+#pragma unroll
+        for (int nt = 0; nt < D / 16; ++nt) {
+            const h8 va = *(const h8*) (vs + (nt * 16 + m16) * VS + w * 16 + k0);
+            acc[nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(va, pb, acc[nt]);
+            if (PREC) acc[nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(va, pl, acc[nt]);
+        }
+        __syncthreads();
+    }
+    // the waves merged (wave order): M = max m_w, sum = sum den_w e^(m_w - M), part = sum acc_w e^(m_w - M)
+    float* mw = (float*) smem;   // [4 waves][16 queries] maxima, then denominators
+    float* aw = mw + 128;        // [4 waves][16 queries][D]: 8,320 floats in all, of the tiles' 8,960
+    if (hi == 0) {
+        mw[w * 16 + m16] = m_run;
+        mw[64 + w * 16 + m16] = den;
+    }
+#pragma unroll
+    for (int nt = 0; nt < D / 16; ++nt)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) aw[((size_t) w * 16 + m16) * D + nt * 16 + k0 + i] = acc[nt][i];
+    __syncthreads();
+    for (int e = lt; e < 16 * D; e += 128) {   // (a thread: a query row and a dimension)
+        const int qi = e / D, dd = e % D, row = blockIdx.z * 16 + qi;
+        if (row >= TP) continue;
+        float M = -INFINITY;
+        for (int u = 0; u < 4; ++u) M = fmaxf(M, mw[u * 16 + qi]);
+        float v = 0.0f, sm = 0.0f;
+        if (M > -INFINITY)
+            for (int u = 0; u < 4; ++u) {
+                const float mu = mw[u * 16 + qi];
+                const float f = mu > -INFINITY ? expf(mu - M) : 0.0f;
+                v += aw[((size_t) u * 16 + qi) * D + dd] * f;
+                sm += mw[64 + u * 16 + qi] * f;
+            }
+        const int tt = row / per, hh = g * per + row % per;
+        const size_t ix = ((size_t) tt * H + hh) * nsplit + b;
+        part[ix * D + dd] = v;
+        if (dd == 0) {
+            st[ix * 2] = M;
+            st[ix * 2 + 1] = sm;
+        }
+    }
+#endif
+}
 unsigned blocks_of(size_t n, int per = 256) { return (unsigned) ((n + (size_t) per - 1) / (size_t) per); }
 
 }  // namespace
@@ -2421,6 +2642,46 @@ int attention_chunk_keys() {
         return v == 32 || v == 64 || v == 128 ? v : 64;
     }();
     return ck;
+}
+bool attention_mma_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
+                        const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,
+                        int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
+                        cudaStream_t s, int8_t* q8, float* d8, int kvq) {
+#if defined(STRATA_USE_HIP)
+    if (D != fl::D || H % Hkv || (q8 && D % 32)) return false;
+    // (IK2_HIP_ATTN_MMA_PREC=1 / IK2_HIP_ATTN_MMA=2: the queries and probabilities in two F16 halves each)
+    static const bool prec = (std::getenv("IK2_HIP_ATTN_MMA_PREC") && std::atoi(std::getenv("IK2_HIP_ATTN_MMA_PREC")) != 0) ||
+                             (std::getenv("IK2_HIP_ATTN_MMA") && std::atoi(std::getenv("IK2_HIP_ATTN_MMA")) == 2);
+    static const int SK = [] {   // (IK2_HIP_ATTN_MMA_SK: keys a split, a multiple of 64; 512 by default)
+        int v = std::getenv("IK2_HIP_ATTN_MMA_SK") ? std::atoi(std::getenv("IK2_HIP_ATTN_MMA_SK")) : 512;
+        return std::max(64, v / 64 * 64);
+    }();
+    lo0 -= lo0 % SK;
+    const int nk = (int) (p0 + T - lo0), per = H / Hkv, nsplit = (nk + SK - 1) / SK, TP = T * per;
+    if ((size_t) T * H * nsplit * (size_t) (D + 2) > S_floats || nsplit > 65535) return false;
+    float* part = S + (size_t) T * H * nsplit * 2;
+    const dim3 grid((unsigned) Hkv, (unsigned) nsplit, (unsigned) ((TP + 15) / 16));   // (the heads of a split together)
+#define IK2_MMA(q8_, pr_)                                                                                               \
+    attn_mma_rows_kernel<q8_, pr_><<<grid, 128, 0, s>>>(q, rel, sink, T, H, Hkv, n_rel, rel_bias, extent, K, V, ring,     \
+                                                        (long long) lo0, (long long) p0, window, SK, scale, S, part)
+    if (kvq && prec) IK2_MMA(true, true);
+    else if (kvq) IK2_MMA(true, false);
+    else if (prec) IK2_MMA(false, true);
+    else IK2_MMA(false, false);
+#undef IK2_MMA
+    if (nsplit <= kCombTiles)
+        attn_combine_seq_kernel<<<(unsigned) (T * H), 256, (256 + (size_t) nsplit) * sizeof(float), s>>>(S, part, nsplit, D,
+                                                                                                     gate, out, q8, d8);
+    else
+        attn_combine_seq_big_kernel<<<(unsigned) (T * H), 256, 0, s>>>(S, part, nsplit, D, gate, out, q8, d8);
+    check("attention_mma_rows");
+    return true;
+#else
+    (void) q, (void) rel, (void) sink, (void) T, (void) H, (void) Hkv, (void) D, (void) n_rel, (void) rel_bias;
+    (void) extent, (void) K, (void) V, (void) ring, (void) p0, (void) lo0, (void) window, (void) scale, (void) S;
+    (void) S_floats, (void) gate, (void) out, (void) s, (void) q8, (void) d8, (void) kvq;
+    return false;
+#endif
 }
 bool attention_chunk_rows(const float* q, const float* rel, const float* sink, int T, int H, int Hkv, int D, int n_rel,
                           const float* rel_bias, int extent, const uint16_t* K, const uint16_t* V, int ring, int64_t p0,

@@ -51,7 +51,14 @@ static bool attn_rows(const float* q, const float* rel, const float* sink, int T
                       int64_t lo0, int window, float scale, float* S, size_t S_floats, const float* gate, float* out,
                       cudaStream_t s, int8_t* q8 = nullptr, float* d8 = nullptr, bool* q8_done = nullptr, int kvq = 0) {
     static const bool tiles = std::getenv("IK2_HIP_ATTN_TILES") != nullptr;
+    // (IK2_HIP_ATTN_MMA=1: the global layers' rows on the matrix cores, k::attention_mma_rows - not the same bits)
+    static const bool mma = std::getenv("IK2_HIP_ATTN_MMA") && std::atoi(std::getenv("IK2_HIP_ATTN_MMA")) != 0;
     if (q8_done) *q8_done = false;
+    if (mma && window == 0 && k::attention_mma_rows(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, K, V, ring, p0, lo0,
+                                                     window, scale, S, S_floats, gate, out, s, q8, d8, kvq)) {
+        if (q8_done) *q8_done = q8 != nullptr;
+        return true;
+    }
     // (the 8-bit cache, and its simulation, IK2_HIP_KV_SIM: the chunks only - the tiles do not read it)
     if ((!tiles || kvq) && k::attention_chunk_rows(q, rel, sink, T, H, Hkv, D, n_rel, rel_bias, extent, K, V, ring, p0, lo0,
                                                    window, scale, S, S_floats, gate, out, s, q8, d8, kvq)) {
@@ -373,6 +380,7 @@ struct Model::Impl {
         int64_t pf_small_until = 8192;    // (IK2_HIP_PF_SMALL_UNTIL)
         bool attn_p16 = true;   // (the prompt attention's softmax writes F16 itself; IK2_HIP_ATTN_P16_OLD: + to_f16)
         int kv_sim = 0;          // (tests, IK2_HIP_KV_SIM: an 8-bit cache's rounding in the global layers' rows)
+        bool attn_mma = false;   // (IK2_HIP_ATTN_MMA=1: the global layers' decode attention on the matrix cores)
         bool attn_flash = false; // (the prompt attention as one flash kernel, IK2_HIP_ATTN_FLASH=1: not the same bits)
         bool sort_old = false;   // (the expert sets' rows by hy4's moe_sort and scatter_rows over every entry,
                                  //  IK2_HIP_SORT_OLD=1; else moe_sort_bits and the set's rows only: the same rows)
@@ -405,6 +413,7 @@ struct Model::Impl {
         tn.attn_flash = env_d("IK2_HIP_ATTN_FLASH", 0, 0, 1) != 0;
         tn.kv_sim = (int) env_d("IK2_HIP_KV_SIM", 0, 0, 4);
         if (o.kv == 1) tn.kv_sim = 0;   // (the simulation rounds F16 rows: not with the 8-bit cache)
+        tn.attn_mma = env_d("IK2_HIP_ATTN_MMA", 0, 0, 2) != 0;
         tn.sort_old = std::getenv("IK2_HIP_SORT_OLD") != nullptr;
     }
     // streamed experts a pass, in two buffers: one is copied while the other's experts run - fewer passes against
@@ -1762,7 +1771,7 @@ struct Model::Impl {
         mark(gp, 1);
         // (the keys split over tiles, the output gate in the combine: IK2_HIP_ATTN_OLD=1 for the earlier launches; the
         //  8-bit cache - and IK2_HIP_KV_SIM - the global layers' through the chunks, as the host-free step's)
-        if (!l.swa && (l.kvq || tn.kv_sim)) {
+        if (!l.swa && (l.kvq || tn.kv_sim || tn.attn_mma)) {
             if (!attn_rows(gp.q, gp.rel, gp.sink, 1, H, Hkv, D, g.d_rel, l.rel_bias, g.rel_extent, l.K, l.V, l.ring, p, lo, 0,
                            1.0f / std::sqrt((float) D), gp.S, gp.S_floats, tapf ? nullptr : gp.gate, gp.ao, s, nullptr,
                            nullptr, nullptr, l.kvq)) {
@@ -2741,6 +2750,17 @@ struct Model::Impl {
                             sizeof(float) * (size_t) g.n_vocab_unpadded);
         }
         top_id = win_tops[T - 1];
+        if (const char* dir = std::getenv("IK2_HIP_STEP_LOGITS")) {   // (tests: each step's rows' logits, F32, a file a step)
+            static int ks = 0;
+            std::vector<float> lg((size_t) T * g.n_vocab);
+            CK(cudaMemcpy(lg.data(), gp.w_logits, sizeof(float) * lg.size(), cudaMemcpyDeviceToHost));
+            const std::string f = std::string(dir) + "/step-" + std::to_string(ks++) + "-" + std::to_string((long long) job_p) +
+                                  "-" + std::to_string(T) + ".f32";
+            if (FILE* fp = std::fopen(f.c_str(), "wb")) {
+                for (int t = 0; t < T; ++t) std::fwrite(lg.data() + (size_t) t * g.n_vocab, sizeof(float), (size_t) g.n_vocab_unpadded, fp);
+                std::fclose(fp);
+            }
+        }
         if (step_hash) {   // (tests, IK2_HIP_STEP_HASH=1: each row's argmax and its logit to the bit, a running FNV-1a hash
                            //  - 2: every logit of each row)
             if (step_hash == 2) {
